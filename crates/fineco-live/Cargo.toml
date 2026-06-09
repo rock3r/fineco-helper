@@ -1,0 +1,31 @@
+[package]
+name = "fineco-live"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "fineco_live"
+path = "src/lib.rs"
+
+[dependencies]
+# The credentialed-boundary protocol over `fineco-live.sock`: the no-DB private
+# worker (server) and the refresh controller's `LiveClient` (client). Orders cross
+# un-hashed (`RawOrder`) and are hashed controller-side, so the worker never holds
+# the DB key. The internet-facing gateway MUST NOT depend on this crate — a
+# compile-time barrier enforced by the gateway's architecture test.
+fineco-core = { path = "../fineco-core" }
+fineco-store = { path = "../fineco-store" }
+fineco-refresh = { path = "../fineco-refresh" }
+fineco-ipc = { path = "../fineco-ipc" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Test-only: forge a raw/oversized request frame to prove the server rejects an
+# unknown command (smuggled `url`, etc.) with a safe error rather than crashing.
+serde_json = "1"

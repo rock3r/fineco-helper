@@ -1,0 +1,29 @@
+[package]
+name = "fineco-worker"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+fineco-core = { path = "../fineco-core" }
+fineco-store = { path = "../fineco-store" }
+fineco-refresh = { path = "../fineco-refresh" }
+# Credentialed HTTP/TLS client (owner-approved: ureq + rustls). serde/serde_json
+# ride along via ureq's `json` feature and are used to parse Fineco JSON.
+ureq = { version = "3.3", default-features = false, features = ["rustls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Tests drive the worker against the SYNTHETIC mock Fineco over a real socket.
+httptiny = { path = "../../e2e/httptiny" }
+mock-fineco = { path = "../../e2e/mock-fineco" }
+
+[lib]
+name = "fineco_worker"
+path = "src/lib.rs"

@@ -1,0 +1,153 @@
+#!/usr/sbin/nft -f
+#
+# Applied inbound/egress policy for the fineco-helper LXC (deployed to
+# /etc/nftables.conf, loaded at boot by nftables.service).
+#
+# Posture (plan "LXC Hardening"): inbound deny-by-default — the gateway binds
+# loopback only and cloudflared connects *outbound*, so the CT exposes no public
+# service; egress deny-by-default allowing only the ports the gateway and
+# cloudflared actually need, plus the infrastructure traffic a DHCP host
+# requires (DHCP lease, DNS, ICMP/PMTUD/ND).
+#
+# The GATEWAY uid (`fineco-gateway`) is HOST-PINNED, not merely port-based: it can
+# read cached private data over the snapshot-query socket, so its egress is tightened
+# to a resolved `fineco_gateway_v4/v6` set (the Access JWKS host + the enrichment host
+# + the ETF CDN) — anything else is dropped+logged. The CDN-rotating-IP problem the
+# old design worried about is solved the same way the worker's is: fineco-refresh-
+# egress-set re-resolves the targets on a 5-min timer (last-known-good on a miss).
+# RESIDUAL (owner-ratified): this is IP-level, not SNI/host-level — those targets are
+# CDN-fronted, so the allowlisted edge IPs may also serve other hostnames; an L7
+# hostname proxy would be needed for airtight host-level egress. cloudflared (a
+# separate DynamicUser, NOT fineco-gateway) keeps the broad port-based egress, since
+# it reaches the whole Cloudflare edge range. The store-server has no network at all
+# (systemd PrivateNetwork=true).
+#
+# M8 — the private-fineco-worker (uid `fineco-worker`) is HOST-PINNED, not just
+# port-based: it logs in to Fineco and holds real private data, so its egress is
+# tightened to the resolved Fineco (+ later 1Password) IPs ONLY, plus the pinned
+# DNS resolver. Its targets are bank API hosts (a narrower, less-rotating IP set
+# than the gateway's CDNs), so an IP allowlist is tractable here. The
+# `fineco-refresh-egress-set.timer` resolves the fixed hostnames (root-owned,
+# never worker input) and ATOMICALLY replaces the sets below (one `nft -f`
+# transaction = `flush set` + `add element` per set), so in-flight packets never
+# see an empty set (no deny window); the per-element `timeout` is a dead-timer
+# backstop. A `meta skuid` deny+log for the worker sits BEFORE the broad tcp/443
+# rule, so the worker can never reach it; the deny is family-agnostic (no IPv6
+# escape) and its log prefix is the "egress deny from private worker" alert source
+# (plan "Observability" / the egress P0 gate).
+#
+# NOTE: `flush ruleset` empties these sets on every reload — the egress-set timer
+# (OnBootSec + after any reload) repopulates them; until the first run the worker
+# set is empty and the worker's Fineco egress is denied (fail closed).
+
+flush ruleset
+
+table inet fineco {
+    # M8 private-worker egress targets, populated by fineco-refresh-egress-set.
+    # `interval` allows ranges; `timeout` ages out rotated IPs (the timer re-adds
+    # the live ones, so there's no flush/deny window). Empty until the first run.
+    set fineco_worker_v4 {
+        type ipv4_addr
+        flags interval, timeout
+    }
+    set fineco_worker_v6 {
+        type ipv6_addr
+        flags interval, timeout
+    }
+    # The DNS resolver(s) the worker may query (the CT's configured nameservers),
+    # also populated by the timer — so worker DNS is pinned, not any-resolver.
+    set fineco_dns_v4 {
+        type ipv4_addr
+        flags interval, timeout
+    }
+    set fineco_dns_v6 {
+        type ipv6_addr
+        flags interval, timeout
+    }
+    # The GATEWAY's egress targets (CF Access JWKS host + the enrichment host + the
+    # ETF CDN images.finecobank.com), resolved by fineco-refresh-egress-set so a
+    # compromised gateway cannot exfiltrate cached private data to an arbitrary HTTPS
+    # host. Empty until the first run; the gateway unit orders After= the set.
+    set fineco_gateway_v4 {
+        type ipv4_addr
+        flags interval, timeout
+    }
+    set fineco_gateway_v6 {
+        type ipv6_addr
+        flags interval, timeout
+    }
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        meta l4proto { icmp, ipv6-icmp } accept     # PMTUD + IPv6 neighbour discovery
+        udp dport 68 accept                          # DHCP offer/ack to the client (lease renewal)
+        # Inbound SSH is DENIED by default: deploy / manage out-of-band via the
+        # Proxmox console or `pct exec`. To allow management SSH from a trusted
+        # admin subnet, uncomment the next line and set YOUR CIDR (203.0.113.0/24
+        # here is an RFC 5737 placeholder — prefer a single admin IP):
+        # ip saddr 203.0.113.0/24 tcp dport 22 accept  # admin subnet — REPLACE
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy drop;
+
+        # --- M8 private-fineco-worker egress: evaluated FIRST, before the broad
+        # loopback / established / tcp-443 rules, so the worker is FULLY governed
+        # here. The worker (uid fineco-worker) may reach ONLY the pinned resolver
+        # for DNS and the resolved Fineco/1Password IPs over HTTPS; everything else
+        # from this uid — INCLUDING any loopback listener (e.g. the gateway's
+        # 127.0.0.1 bind) — is dropped + logged (the egress-deny alert). The deny is
+        # uid-scoped and family-agnostic, so there is no IPv6 or loopback escape. ---
+        meta skuid "fineco-worker" ip daddr @fineco_dns_v4 udp dport 53 accept
+        meta skuid "fineco-worker" ip daddr @fineco_dns_v4 tcp dport 53 accept
+        meta skuid "fineco-worker" ip6 daddr @fineco_dns_v6 udp dport 53 accept
+        meta skuid "fineco-worker" ip6 daddr @fineco_dns_v6 tcp dport 53 accept
+        meta skuid "fineco-worker" ip daddr @fineco_worker_v4 tcp dport 443 accept
+        meta skuid "fineco-worker" ip6 daddr @fineco_worker_v6 tcp dport 443 accept
+        meta skuid "fineco-worker" log prefix "fineco-egress-deny private-worker " flags all counter drop
+        # --- end private-worker egress ---
+
+        # --- gateway egress: the internet-facing gateway (uid fineco-gateway) may
+        # reach ONLY the pinned resolver for DNS and its resolved targets (CF Access
+        # JWKS + the enrichment host + the ETF CDN) over HTTPS — so a compromised
+        # gateway can no longer exfiltrate the cached private data it can read to an
+        # ARBITRARY host. UNLIKE the worker, the gateway SERVES cloudflared over IP
+        # loopback (127.0.0.1 bind), so loopback is accepted FIRST (else its replies to
+        # cloudflared are dropped and the tunnel dies). NOTE: there is deliberately NO
+        # broad `ct state established accept` here — the allowed reply traffic is already
+        # covered (loopback by `oif lo`; allowlisted HTTPS by the dport-443-to-set rule,
+        # which matches established packets too), and a broad established-accept would
+        # also keep alive a connection to an IP that has since been removed from the set
+        # (CDN rotation) or a pre-lockdown connection. Evaluated before the broad rules so
+        # the gateway is fully governed here; the deny is the alert source. The set is
+        # populated by fineco-refresh-egress-set (gateway After= it).
+        meta skuid "fineco-gateway" oif "lo" accept
+        meta skuid "fineco-gateway" ct state invalid drop
+        meta skuid "fineco-gateway" ip daddr @fineco_dns_v4 udp dport 53 accept
+        meta skuid "fineco-gateway" ip daddr @fineco_dns_v4 tcp dport 53 accept
+        meta skuid "fineco-gateway" ip6 daddr @fineco_dns_v6 udp dport 53 accept
+        meta skuid "fineco-gateway" ip6 daddr @fineco_dns_v6 tcp dport 53 accept
+        meta skuid "fineco-gateway" ip daddr @fineco_gateway_v4 tcp dport 443 accept
+        meta skuid "fineco-gateway" ip6 daddr @fineco_gateway_v6 tcp dport 443 accept
+        meta skuid "fineco-gateway" log prefix "fineco-egress-deny gateway " flags all counter drop
+        # --- end gateway egress ---
+
+        oif "lo" accept                              # remaining (cloudflared/system) loopback
+        ct state established,related accept
+        ct state invalid drop
+        meta l4proto { icmp, ipv6-icmp } accept      # PMTUD + IPv6 neighbour discovery
+        udp dport 67 accept                          # DHCP discover/request/renew to the server
+        udp dport 53 accept                          # DNS (system; gateway + worker are pinned above)
+        tcp dport 53 accept
+        tcp dport 443 accept                         # HTTPS: cloudflared edge + system (gateway is pinned above)
+        tcp dport 7844 accept                        # cloudflared edge (HTTP/2)
+        udp dport 7844 accept                        # cloudflared edge (QUIC)
+    }
+}

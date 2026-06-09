@@ -1,0 +1,73 @@
+# M4 E2E topology: the two mock servers, the real product binary running as the
+# two-process boundary (store-server + loopback-only gateway over a shared
+# snapshot-query socket), and a smoke driver that asserts the mocks' fixtures and
+# drives a real MCP session through the gateway (a granted + a policy-denied
+# tool). The gateway binds loopback only; the smoke driver shares its network
+# namespace to reach it, exactly as a local cloudflared would in production.
+name: fineco-helper-e2e
+
+services:
+  mock-fineco:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    image: fineco-helper-e2e:latest
+    command: ["mock-fineco"]
+    environment:
+      MOCK_FINECO_ADDR: "0.0.0.0:8081"
+    expose: ["8081"]
+
+  mock-enrichment:
+    image: fineco-helper-e2e:latest
+    command: ["mock-enrichment"]
+    environment:
+      MOCK_ENRICHMENT_ADDR: "0.0.0.0:8082"
+    expose: ["8082"]
+
+  # The credential-free store-query worker: opens the (empty) SQLite store and
+  # answers cached reads on the snapshot-query Unix socket in the shared volume.
+  store-server:
+    image: fineco-helper-e2e:latest
+    command: ["fineco-helper", "store-server"]
+    environment:
+      FINECO_DB_PATH: "/run/fineco/store.sqlite"
+      FINECO_QUERY_SOCKET: "/run/fineco/query.sock"
+      FINECO_POLICY_PATH: "/etc/fineco/policy.json"
+    volumes:
+      - fineco-run:/run/fineco
+
+  # The internet-facing MCP gateway, bound to loopback only. It reaches the store
+  # only over the shared socket and holds no credentials or DB handle.
+  gateway:
+    image: fineco-helper-e2e:latest
+    command: ["fineco-helper", "gateway"]
+    environment:
+      FINECO_GATEWAY_BIND: "127.0.0.1:8799"
+      FINECO_QUERY_SOCKET: "/run/fineco/query.sock"
+      FINECO_POLICY_PATH: "/etc/fineco/policy.json"
+      # No Cloudflare Access in the local E2E (no real Tunnel/Access); the gateway
+      # requires an explicit opt-out rather than silently running without auth.
+      FINECO_ACCESS_DISABLED: "true"
+    volumes:
+      - fineco-run:/run/fineco
+    depends_on:
+      - store-server
+
+  smoke:
+    image: fineco-helper-e2e:latest
+    command: ["smoke"]
+    environment:
+      MOCK_FINECO_URL: "http://mock-fineco:8081"
+      MOCK_ENRICHMENT_URL: "http://mock-enrichment:8082"
+      # The gateway is loopback-only; sharing its netns makes 127.0.0.1 reach it.
+      GATEWAY_URL: "http://127.0.0.1:8799/"
+    # Share the gateway's network namespace so the loopback bind is reachable
+    # (and service-name DNS for the mocks still resolves through it).
+    network_mode: "service:gateway"
+    depends_on:
+      - mock-fineco
+      - mock-enrichment
+      - gateway
+
+volumes:
+  fineco-run:

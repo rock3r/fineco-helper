@@ -1,0 +1,44 @@
+# cargo-deny configuration (schema v2; cargo-deny 0.19.x).
+#
+# Do NOT add ignore/exception entries to dodge a finding (AGENTS.md, "Lint
+# config and suppressions"): fix at the source or surface to the owner.
+
+[advisories]
+# Vulnerabilities and unsound advisories are denied by default in schema v2.
+# Lock down yanked crates too. Keep `ignore` empty — no silent suppressions.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# First-party + permissive licenses only. Anything not listed here is denied.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Mozilla CA root-certificate bundle (`webpki-roots`, via ureq + rustls). A
+    # Linux Foundation permissive *data* license used for CA-cert bundles;
+    # needed for TLS against real Fineco. Owner-approved 2026-06-03.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal crates are linked by path without a version; that is intentional for
+# this non-published workspace and is not a wildcard-dependency smell.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+# Supply-chain rule: crates.io only. No third-party registries or git sources
+# (no repackagers / prebuilt-binary installers).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

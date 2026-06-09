@@ -1,0 +1,62 @@
+[package]
+name = "fineco-gateway"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The internet-facing owner MCP gateway (Streamable HTTP via rmcp). Holds no
+# credentials/DB/live-socket: private reads go over the snapshot-query socket
+# (fineco-ipc Client), market tools call the credential-free market path
+# (fineco-market) in-process. Depends only on these — never fineco-store/worker.
+fineco-core = { path = "../fineco-core" }
+fineco-ipc = { path = "../fineco-ipc" }
+fineco-market = { path = "../fineco-market" }
+rmcp = { version = "1", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "net",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only for the `http::request::Parts` type that rmcp surfaces in the request
+# context (so the tool-scoping wrapper can read the Access channel the middleware
+# stamped in). Single in-tree version (already transitive via rmcp/axum); the
+# gateway holds NO credentials, so this is not the credentialed path.
+http = "1"
+# Cloudflare Access JWT verification (issuer/audience/expiry/signature via the
+# team JWKS). Owner-approved 2026-06-04. Pinned to 9.x: it verifies via `ring`
+# (already in the tree via rustls/ureq) — no new crypto backend, audit-clean.
+# (jsonwebtoken 10 has no default crypto backend; `rust_crypto` pulls the `rsa`
+# crate with an open RUSTSEC advisory, and `aws_lc_rs` adds a second C crypto
+# library.) JWKS is fetched over the in-tree ureq (same rustls stack).
+jsonwebtoken = "9"
+ureq = { version = "3.3", default-features = false, features = ["rustls", "json"] }
+
+[dev-dependencies]
+# Integration tests stand up a real store-query worker behind the socket.
+fineco-query = { path = "../fineco-query" }
+fineco-store = { path = "../fineco-store" }
+# Market-tool tests drive the in-process market client against the SYNTHETIC
+# mock servers (enrichment page + public ETF list) over loopback TCP.
+httptiny = { path = "../../e2e/httptiny" }
+mock-fineco = { path = "../../e2e/mock-fineco" }
+mock-enrichment = { path = "../../e2e/mock-enrichment" }
+# Origin-validation test serves the gateway's tower service over axum (already in
+# the tree via the binary) and drives it with httptiny.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+
+[lib]
+name = "fineco_gateway"
+path = "src/lib.rs"

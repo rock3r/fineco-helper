@@ -1,0 +1,28 @@
+[package]
+name = "fineco-store"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "fineco_store"
+path = "src/lib.rs"
+
+[dependencies]
+# Statically-linked SQLite (plan: "rusqlite with the bundled feature"). `bundled`
+# compiles SQLite from source into the binary — no host libsqlite3 dependency.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# First-party leaf crate (freshness states + safe error envelope); no ext deps.
+fineco-core = { path = "../fineco-core" }
+# HMAC-SHA256 of broker ids with a per-DB key (owner-approved). Pure Rust.
+hmac = "0.13"
+sha2 = "0.11"
+# Serialize the `New*` capture types so the credential-holding worker can return
+# freshly-fetched data to the no-network controller over the fineco-live socket.
+# (fineco-store is the DB/controller path, NOT the credential-holding worker.)
+serde = { version = "1", features = ["derive"] }

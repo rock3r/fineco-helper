@@ -1,0 +1,92 @@
+# fineco-helper — store-server: snapshot-query + (M8) the refresh controller.
+#
+# Owns the local SQLite store and answers cached reads on the snapshot-query Unix
+# socket; in M8 it ALSO hosts the refresh controller on refresh-control.sock (a
+# second accept loop) and is the CLIENT of fineco-live.sock (the worker's socket).
+# Holds NO credentials and needs NO network — it speaks only local Unix sockets,
+# including clienting the live socket (a pathname AF_UNIX connect, which works
+# under PrivateNetwork=true). The internet-facing gateway reaches it over the
+# sockets, never via a dependency or the DB file.
+#
+# Topology (M8 — see docs/DEPLOYMENT.md): this is the `fineco-store` user (the DB
+# owner), distinct from `fineco-worker` (the credential worker). It serves two
+# sockets in two setgid, group-shared runtime dirs (tmpfiles.d): snapshot-query
+# (group fineco-ipc-store) and refresh-control (group fineco-ipc-refresh); the
+# gateway joins those two groups. It joins fineco-ipc-live so the controller can
+# CONNECT to the worker's fineco-live.sock. The binary chmods each socket to 0660.
+#
+# NOTE: validate on the target host (`systemd-analyze security fineco-store-server`)
+# and adjust paths/users to the LXC. Values below are the intended baseline.
+
+[Unit]
+Description=fineco-helper store-server (snapshot-query + refresh controller)
+Documentation=https://github.com/rock3r/fineco-helper
+After=local-fs.target
+
+[Service]
+Type=simple
+User=fineco-store
+Group=fineco-store
+# Join fineco-ipc-live so the refresh controller can CONNECT to the worker's
+# fineco-live.sock. (It is NOT in fineco-ipc-store/-refresh as a member — it owns
+# those socket dirs, so it creates the sockets as the dir owner; the setgid dirs
+# assign the group the gateway connects with.)
+SupplementaryGroups=fineco-ipc-live
+
+# Persistent DB under /var/lib/fineco-helper (owner-only fineco-store). The socket
+# runtime dirs are tmpfiles.d-managed (per-group setgid) — NOT RuntimeDirectory,
+# which can't give the two sockets two different groups. See deploy/tmpfiles.d.
+StateDirectory=fineco-helper
+StateDirectoryMode=0700
+
+Environment=FINECO_DB_PATH=/var/lib/fineco-helper/fineco-history.sqlite
+Environment=FINECO_QUERY_SOCKET=/run/fineco-helper/snapshot-query.sock
+Environment=FINECO_QUERY_SOCKET_MODE=0660
+Environment=FINECO_REFRESH_SOCKET=/run/fineco-helper-refresh/refresh-control.sock
+Environment=FINECO_REFRESH_SOCKET_MODE=0660
+Environment=FINECO_LIVE_SOCKET=/run/fineco-worker/fineco-live.sock
+Environment=FINECO_POLICY_PATH=/etc/fineco/policy.json
+
+ExecStart=/usr/local/bin/fineco-helper store-server
+Restart=on-failure
+RestartSec=2
+
+# --- hardening (plan "LXC Hardening") ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+# One `~` makes the whole list a denylist; both groups must share that line
+# (`~@privileged ~@resources` would parse the second token literally and ignore
+# it, leaving @resources allowed).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+# Suppress core dumps: this unit holds the DB hashing key in memory.
+LimitCORE=0
+
+# No network at all: the worker speaks only the local Unix socket.
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+
+# Everything is read-only except the DB + the two socket dirs it creates sockets
+# in. Connecting to the worker's /run/fineco-worker/fineco-live.sock needs no
+# write path (a socket connect is not a filesystem write). The policy is read-only.
+ReadWritePaths=/var/lib/fineco-helper /run/fineco-helper /run/fineco-helper-refresh
+
+[Install]
+WantedBy=multi-user.target

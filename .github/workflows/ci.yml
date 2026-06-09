@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "wt/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  static-and-test:
+    name: fmt / clippy / build / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup honors rust-toolchain.toml on first cargo invocation, installing
+      # the pinned 1.96.0 toolchain with rustfmt + clippy.
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build
+        run: cargo build --workspace --all-targets
+        env:
+          RUSTFLAGS: "-D warnings"
+      - name: Test
+        run: cargo test --workspace
+        env:
+          RUSTFLAGS: "-D warnings"
+
+  supply-chain:
+    name: audit / deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Build the audit tooling from crates.io source (supply-chain policy: no
+      # third-party prebuilt-binary installers).
+      # Pin tool versions so CI matches the reviewed config (deny.toml targets
+      # the cargo-deny 0.19.x schema); bump deliberately, not by drift.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.8 --locked
+      - name: Audit
+        run: cargo audit
+      - name: Deny
+        run: cargo deny check
+
+  e2e:
+    name: docker e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker E2E (mock topology + smoke driver)
+        run: ./e2e/run.sh

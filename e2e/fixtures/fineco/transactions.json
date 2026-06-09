@@ -1,0 +1,35 @@
+{
+  "_fixture": "SYNTHETIC mock-fineco order monitor transactions; not real account data",
+  "transactions": [
+    {
+      "transId": "SYNTH-TX-0001",
+      "instrId": "SYNTH0000001",
+      "venueSystem": "SYNTHV",
+      "symbol": "SYNTH-A",
+      "description": "SYNTHETIC Alpha Corp",
+      "type": "EQUITY",
+      "currencyCd": "EUR",
+      "status": "EXECUTED",
+      "sign": "BUY",
+      "orderSize": 10,
+      "sizeFilled": 10,
+      "avgPrice": 100.0,
+      "submitTime": "2026-01-01T09:30:00Z"
+    },
+    {
+      "transId": "SYNTH-TX-0002",
+      "instrId": "SYNTH0000002",
+      "venueSystem": "SYNTHV",
+      "symbol": "SYNTH-B",
+      "description": "SYNTHETIC Beta SpA",
+      "type": "EQUITY",
+      "currencyCd": "EUR",
+      "status": "PENDING",
+      "sign": "SELL",
+      "orderSize": 5,
+      "sizeFilled": 0,
+      "avgPrice": null,
+      "submitTime": "2026-01-02T10:00:00Z"
+    }
+  ]
+}

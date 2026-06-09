@@ -1,0 +1,47 @@
+# Rust build output.
+target/
+# Build-output dirs: the release script (deploy/build/build.sh) stages the stripped
+# binary under a `dist/` dir, and a pre-removal checkout may still have a stale TS
+# `node_modules/`/`dist/` on disk — keep all of them out of commits.
+node_modules/
+dist/
+
+# Local ad-hoc diagnostic scripts — these tend to touch the real Fineco credential
+# and print cookies/auth bodies; never commit them (keep diagnostics out of the repo).
+diag.sh
+diag-*.sh
+*.diag.sh
+
+# Local reports and captured pages may contain private portfolio/session data.
+*.html
+*.local.html
+*.local.json
+*.local.csv
+enrichment-reports/
+
+# Exception: track the clearly-marked SYNTHETIC E2E html fixture despite the
+# broad *.html ignore above (later rule wins). Keep this scoped to specific
+# files so a stray REAL *.html capture under e2e/fixtures/ stays ignored; new
+# synthetic html fixtures must add their own explicit negation here.
+!e2e/fixtures/enrichment/stock.html
+
+.DS_Store
+*.log
+
+.plans/
+
+# Cloudflare Access spike: the filled-in real-account config holds the
+# Tunnel connector token + service-token secret. Only the *.example template is
+# tracked; the live env never is.
+e2e/spike/cf-spike.env
+
+# Self-host config: a deployer's filled-in /etc/fineco/* values (creds, tunnel
+# token, Access config, enrichment host, age recipient). Only the *.example
+# templates under deploy/config/ are tracked; a real *.env never is.
+deploy/config/*.env
+# The Docker path's filled-in config (env files + the real policy.json).
+deploy/docker/config/
+
+# Per-milestone git worktrees live here (see AGENTS.md). Each is its own
+# checkout; keep them out of the parent repo's status.
+.worktrees/

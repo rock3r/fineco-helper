@@ -1,0 +1,22 @@
+[package]
+name = "fineco-query"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The store-query worker: answers `fineco-ipc` cached-read commands from the
+# local SQLite store (and, later, the credential-free market path). Sits behind
+# the snapshot-query socket; the gateway never depends on this crate.
+fineco-core = { path = "../fineco-core" }
+fineco-store = { path = "../fineco-store" }
+fineco-ipc = { path = "../fineco-ipc" }
+
+[lib]
+name = "fineco_query"
+path = "src/lib.rs"

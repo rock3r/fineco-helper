@@ -1,0 +1,13 @@
+# Keep the Docker build context small and free of host build output / secrets.
+.git/
+.worktrees/
+target/
+# Keep any stray local tooling dirs (e.g. node_modules) out of the build context.
+# NOTE: do NOT add a `dist/` ignore here — the release image (deploy/docker/Dockerfile) does
+# `COPY deploy/build/dist/fineco-helper` from the root context, so excluding dist would
+# break that build. (The git ignore of `dist/` is fine — build output isn't committed.)
+node_modules/
+enrichment-reports/
+.plans/
+*.log
+.DS_Store

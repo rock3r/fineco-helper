@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "auth_ids": {
+    "owner": {
+      "capabilities": [
+        "market.read",
+        "portfolio.cached.full_read",
+        "portfolio.shareable.read",
+        "orders.cached.read",
+        "tax.cached.read"
+      ]
+    }
+  }
+}

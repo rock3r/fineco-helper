@@ -1,0 +1,57 @@
+# Scheduled portfolio live-refresh trigger (the binary's `refresh` subcommand).
+#
+# This is a refresh-control CLIENT only: it holds NO Fineco credentials, never opens
+# the SQLite DB, and never reaches the live socket — it sends one framed
+# PortfolioRefreshLive request to the controller (store-server) on
+# refresh-control.sock and prints a status-only line. The controller does the login/
+# fetch/capture behind its existing gates (cooldown, daily budget, circuit breaker).
+#
+# Runs as an ephemeral DynamicUser joined to ONLY fineco-ipc-refresh, so the trigger
+# can reach nothing but refresh-control.sock — not the snapshot-query socket or the
+# policy files the gateway *account* can read (it is in fineco-ipc-store +
+# fineco-policy too). This is the plan's "local admin" caller for refresh-control.sock
+# (IPC table). The controller authorizes a refresh by SOCKET ACCESS + policy
+# (OWNER_AUTH_ID), not by the caller's uid, so a transient identity is fine. A failed
+# refresh (SCA, timeout, a gate denial) makes the subcommand exit non-zero, so the
+# unit fails and the existing alerting (NRestarts / journal) surfaces it.
+[Unit]
+Description=fineco-helper scheduled portfolio live refresh
+# Order after the controller so a boot-time catch-up run finds the socket; do NOT
+# Require= it — a missed run just waits for the next OnCalendar tick (best-effort).
+After=fineco-store-server.service
+
+[Service]
+Type=oneshot
+# Ephemeral uid/gid for the run; the only standing group it joins is the refresh
+# group (mode 2750 dir + 0660 socket are group-accessible to fineco-ipc-refresh).
+DynamicUser=yes
+SupplementaryGroups=fineco-ipc-refresh
+Environment=FINECO_REFRESH_SOCKET=/run/fineco-helper-refresh/refresh-control.sock
+ExecStart=/usr/local/bin/fineco-helper refresh portfolio
+# A live refresh (login + fetch + bounded retries) can take a while: the client's
+# own reply timeout is 180s. Give systemd more than that so the subcommand's clean
+# fail-closed timeout governs the outcome — never a premature SIGKILL of a still-valid
+# refresh (which the default ~90s start timeout would cause).
+TimeoutStartSec=240
+
+# --- hardening ---
+NoNewPrivileges=true
+# Suppress core dumps (consistency with the other units; no secrets, but cheap).
+LimitCORE=0
+PrivateTmp=true
+# Talks to a Unix socket and prints to the journal — it writes no files at all.
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Needs no capabilities; reaches the controller only over an AF_UNIX socket.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX

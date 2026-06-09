@@ -1,0 +1,21 @@
+# Keep the private-worker egress allow sets fresh as the Fineco API IPs rotate.
+# Short interval + the script's timeout-overlap (no flush) means a rotated IP
+# ages out without ever creating a connection-deny window.
+[Unit]
+Description=Periodically refresh fineco-worker egress nftables allow sets
+# No Requires=/Wants= on the service: the timer activates its same-named service on
+# elapse (OnBootSec=30s triggers it shortly after boot/enable). A Requires= would
+# pull the oneshot in the instant the timer is enabled, so a transient failure could
+# fail the timer itself; the brief empty-set window before the first run fails SAFE
+# (the worker is denied all egress until the set populates — no escape).
+
+[Timer]
+# Populate shortly after boot (the firewall's flush leaves the sets empty), then
+# every 5 minutes. Persistent re-runs a missed timer after downtime.
+OnBootSec=30s
+OnUnitActiveSec=5m
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

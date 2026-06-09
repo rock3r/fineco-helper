@@ -1,0 +1,41 @@
+# Resolve the fixed Fineco (+ 1Password) hostnames and the CT's DNS resolvers
+# into the private-worker egress nftables allow sets (see
+# deploy/firewall/fineco-refresh-egress-set.sh). Driven by the paired .timer
+# (OnBootSec + every 5 min). Must also be started after any `nft -f` reload,
+# since `flush ruleset` empties the sets.
+[Unit]
+Description=Refresh fineco-worker egress nftables allow sets
+After=nftables.service network-online.target
+Wants=network-online.target
+Requires=nftables.service
+
+[Service]
+Type=oneshot
+# Writes nftables (needs CAP_NET_ADMIN + AF_NETLINK) and resolves DNS; otherwise
+# tightly sandboxed (a root helper, so the clamp matters).
+ExecStart=/usr/local/libexec/fineco-refresh-egress-set
+NoNewPrivileges=true
+# Suppress core dumps: a root (CAP_NET_ADMIN) helper — no dump of resolver/nft state.
+LimitCORE=0
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Clamp the syscall ABI to the native architecture (drop the compat-ABI surface)
+# even for this short-lived root helper. (A full SystemCallFilter is deliberately
+# omitted: the helper shells out to getent/awk/nft, whose syscall set is awkward
+# to enumerate without risking a broken egress refresh.)
+SystemCallArchitectures=native
+# Clamp to exactly the privilege it needs (nftables), drop the rest of root.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+# AF_NETLINK for nft, AF_INET/AF_INET6 + AF_UNIX for DNS resolution (getent/NSS).
+RestrictAddressFamilies=AF_NETLINK AF_INET AF_INET6 AF_UNIX

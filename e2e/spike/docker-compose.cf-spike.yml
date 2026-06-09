@@ -1,0 +1,78 @@
+# Cloudflare Access spike topology.
+# NOT a CI gate — this is the owner-supervised spike against the REAL Cloudflare
+# account. It stands up the real product binary as the two-process boundary
+# (store-server + loopback-only gateway) with Cloudflare Access verification
+# ENABLED against the real team JWKS, plus a cloudflared Tunnel that shares the
+# gateway's network namespace — exactly the production shape (the gateway binds
+# 127.0.0.1 only; only cloudflared reaches it; the origin is never exposed).
+#
+# Every real-account value comes from a gitignored cf-spike.env (NEVER committed,
+# never pasted into chat/logs):
+#   - non-secret: FINECO_ACCESS_ISSUER / _AUDIENCE / _JWKS_URL, FINECO_ALLOWED_ORIGINS
+#   - secret:     TUNNEL_TOKEN (the Tunnel connector token)
+# The service-token CF-Access-Client-Id/-Secret are consumed by the CLIENT (your
+# MCP client / a curl probe), not by any container here — keep them in
+# cf-spike.env too and inject them from the client side only.
+#
+# Run with ./run-spike.sh (wraps: docker compose --env-file cf-spike.env ... up).
+name: fineco-helper-cf-spike
+
+services:
+  # Credential-free store-query worker — opens the (empty) SQLite store and
+  # answers cached reads on the snapshot-query socket in the shared volume. Lets
+  # the spike drive a real MCP tool call end-to-end (returns "missing"/empty, but
+  # exercises the full handshake + a policy-gated tool through Access).
+  store-server:
+    build:
+      context: ../..
+      dockerfile: e2e/Dockerfile
+    image: fineco-helper-e2e:latest
+    command: ["fineco-helper", "store-server"]
+    environment:
+      FINECO_DB_PATH: "/run/fineco/store.sqlite"
+      FINECO_QUERY_SOCKET: "/run/fineco/query.sock"
+      FINECO_POLICY_PATH: "/etc/fineco/policy.json"
+    volumes:
+      - fineco-run:/run/fineco
+
+  # The internet-facing MCP gateway, loopback-only, with REAL Cloudflare Access
+  # verification. It fetches the real team JWKS at startup (fail closed) and
+  # verifies issuer/audience/expiry/RS256-signature on every request.
+  gateway:
+    image: fineco-helper-e2e:latest
+    command: ["fineco-helper", "gateway"]
+    environment:
+      FINECO_GATEWAY_BIND: "127.0.0.1:8799"
+      FINECO_QUERY_SOCKET: "/run/fineco/query.sock"
+      FINECO_POLICY_PATH: "/etc/fineco/policy.json"
+      # REAL Access config (from cf-spike.env). FINECO_OWNER_EMAIL is deliberately
+      # UNSET: a service-token JWT carries no `email` claim, so pinning it would
+      # fail-closed against the very headless client we are validating. Instead we pin
+      # the service token's COMMON_NAME (its Client ID) — Access now requires exactly
+      # one identity pin, and common_name is the right one for a headless client.
+      FINECO_ACCESS_ISSUER: "${FINECO_ACCESS_ISSUER}"
+      FINECO_ACCESS_AUDIENCE: "${FINECO_ACCESS_AUDIENCE}"
+      FINECO_ACCESS_JWKS_URL: "${FINECO_ACCESS_JWKS_URL}"
+      FINECO_ACCESS_OWNER_COMMON_NAME: "${FINECO_ACCESS_OWNER_COMMON_NAME}"
+      FINECO_ALLOWED_ORIGINS: "${FINECO_ALLOWED_ORIGINS:-}"
+    volumes:
+      - fineco-run:/run/fineco
+    depends_on:
+      - store-server
+
+  # The Cloudflare Tunnel connector. Shares the gateway's netns so it reaches the
+  # loopback bind at 127.0.0.1:8799 — exactly as cloudflared does on the real LXC
+  # host. The tunnel's dashboard ingress must route the public hostname to
+  # http://127.0.0.1:8799 (HTTP). `:latest` matches the image the dashboard's
+  # install command uses; pin to a dated tag once the spike is settled.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: "${TUNNEL_TOKEN}"
+    network_mode: "service:gateway"
+    depends_on:
+      - gateway
+
+volumes:
+  fineco-run:

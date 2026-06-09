@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "auth_ids": {
+    "owner": {
+      "capabilities": [
+        "market.read",
+        "portfolio.shareable.read"
+      ]
+    }
+  }
+}

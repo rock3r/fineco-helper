@@ -1,0 +1,117 @@
+# fineco-helper — owner MCP gateway (loopback only).
+#
+# Serves the read-only MCP tool surface over Streamable HTTP, bound to 127.0.0.1
+# only (the binary refuses any non-loopback bind until the authenticated remote
+# mode lands). A local `cloudflared` is the only client of the loopback bind
+# (its own unit/egress, not this one). This unit holds NO credentials, no DB
+# handle, and no live socket — it reaches stored data only over the snapshot-
+# query socket, and runs the credential-free market path in-process.
+#
+# It joins the fineco-ipc-store group (SupplementaryGroups) only to reach the
+# worker's 0660 group-shared socket. See docs/DEPLOYMENT.md.
+#
+# NOTE: validate on the target host (`systemd-analyze security fineco-gateway`).
+# Egress (Cloudflare Tunnel + the allowlisted enrichment host when enrichment is
+# enabled) is enforced at the firewall layer — see deploy/firewall/ — because the
+# enrichment allowlist is by host, not by IP range. The binary additionally pins
+# the enrichment host (SHA-256) at the application layer.
+
+[Unit]
+Description=fineco-helper owner MCP gateway (loopback)
+Documentation=https://github.com/rock3r/fineco-helper
+After=fineco-store-server.service network-online.target
+Wants=network-online.target
+Requires=fineco-store-server.service
+# The gateway's egress allow set must be populated before its startup JWKS fetch
+# (fail-closed if it can't reach the team JWKS), so order after the egress-set —
+# same pattern as the worker. Wants= (not Requires=): on a normal boot After= runs
+# the egress-set first so the set is populated before startup; if that set-refresh
+# transiently FAILS on a cold boot (empty set -> JWKS denied), Restart=on-failure
+# (below, RestartSec=2) retries until the timer (OnBootSec + 5 min) repopulates —
+# self-healing. Requires= would instead risk leaving the gateway permanently down
+# after a single transient set-refresh failure, which is worse.
+Wants=fineco-refresh-egress-set.service
+After=fineco-refresh-egress-set.service
+
+[Service]
+Type=simple
+User=fineco-gateway
+Group=fineco-gateway
+# fineco-ipc-store → snapshot-query.sock (cached reads). fineco-ipc-refresh →
+# refresh-control.sock (M8 live refresh; join only when live refresh is enabled).
+# NEVER fineco-ipc-live — the gateway must not reach the worker's live socket.
+SupplementaryGroups=fineco-ipc-store fineco-ipc-refresh
+
+Environment=FINECO_GATEWAY_BIND=127.0.0.1:8765
+Environment=FINECO_QUERY_SOCKET=/run/fineco-helper/snapshot-query.sock
+# M8 live refresh: the refresh-control socket. Remove this (and leave the gateway
+# out of fineco-ipc-refresh) for a cached-only gateway.
+Environment=FINECO_REFRESH_SOCKET=/run/fineco-helper-refresh/refresh-control.sock
+Environment=FINECO_POLICY_PATH=/etc/fineco/policy.json
+# Cloudflare Access (M6) — REQUIRED for the remote deployment. The gateway FAILS
+# CLOSED: with none of the three vars set it REFUSES TO START unless the explicit
+# opt-out FINECO_ACCESS_DISABLED=true is also set (which runs loopback-only with
+# NO client authentication — only for a same-host cloudflared dev/test setup).
+# So set all three below for the remote deployment, OR set the opt-out. The JWKS
+# URL must be on the issuer's own origin (the key source is bound to the issuer).
+# Environment=FINECO_ACCESS_ISSUER=https://<team>.cloudflareaccess.com
+# Environment=FINECO_ACCESS_AUDIENCE=<access-application-AUD-tag>
+# Environment=FINECO_ACCESS_JWKS_URL=https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+# REQUIRED identity pin when Access is enabled — set AT LEAST ONE (set BOTH for
+# dual-pin: a token matching either maps to owner; the gateway refuses to start with
+# neither, since without a pin any admitted token would map to owner):
+# Environment=FINECO_OWNER_EMAIL=<owner@example.com>                       # SSO / OAuth (connectors)
+# Environment=FINECO_ACCESS_OWNER_COMMON_NAME=<service-token-client-id>.access  # service token (CLI)
+# Loopback-only opt-out (NO auth) — only if Access is deliberately not configured:
+# Environment=FINECO_ACCESS_DISABLED=true
+# Origin allowlist (DNS-rebinding protection) — the legitimate client origins:
+# Environment=FINECO_ALLOWED_ORIGINS=https://<origin1>,https://<origin2>
+# Market tools (config-only enrichment host) — set on the host to enable them:
+# Environment=FINECO_ENRICHMENT_BASE=https://<configured-host>
+# Environment=FINECO_ENRICHMENT_HOST_HASHES=<sha256(host)>
+# Environment=FINECO_ETF_URL=https://<configured-etf-list-url>
+
+ExecStart=/usr/local/bin/fineco-helper gateway
+Restart=on-failure
+RestartSec=2
+
+# --- hardening (plan "LXC Hardening") ---
+NoNewPrivileges=true
+# Suppress core dumps: this unit holds the verified Access JWT and cached private
+# portfolio/order/tax data in memory.
+LimitCORE=0
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+# One `~` makes the whole list a denylist; both groups must share that line
+# (`~@privileged ~@resources` would parse the second token literally and ignore
+# it, leaving @resources allowed).
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+# Loopback HTTP bind (AF_INET/AF_INET6) + the worker socket (AF_UNIX). No DB,
+# no credentials. Outbound is constrained to loopback + the enrichment host by
+# the firewall layer (this unit does not own a private-network namespace because
+# enrichment fetches need real egress when enabled).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# The gateway writes no files; it only connects to the socket. Nothing writable.
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

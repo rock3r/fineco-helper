@@ -1,0 +1,37 @@
+[package]
+name = "fineco-market"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+fineco-core = { path = "../fineco-core" }
+# Credential-free outbound HTTP for market reads (same TLS stack as the worker:
+# ureq + rustls). gzip handles compressed enrichment pages; json parses the ETF
+# list. Redirects are disabled at the client.
+ureq = { version = "3.3", default-features = false, features = ["rustls", "gzip", "json"] }
+# Parse-not-execute: fetched HTML/JS is parsed as data via serde_json, never run.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-256 host pinning for the enrichment source allowlist (no plaintext host in
+# source; the allowlist is supplied as hashes / hashed config at startup).
+sha2 = "0.11"
+# JSON Schema derives so the gateway can expose the report/ETF outputs as rmcp
+# tool results (rmcp's `Json<T>` requires `T: JsonSchema`). Already in the tree
+# via rmcp/fineco-ipc; build-time derive only.
+schemars = "1"
+
+[dev-dependencies]
+# Tests drive the client against the SYNTHETIC mock servers over a real socket.
+httptiny = { path = "../../e2e/httptiny" }
+mock-fineco = { path = "../../e2e/mock-fineco" }
+mock-enrichment = { path = "../../e2e/mock-enrichment" }
+
+[lib]
+name = "fineco_market"
+path = "src/lib.rs"

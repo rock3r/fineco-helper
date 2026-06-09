@@ -1,0 +1,17 @@
+# curl config for an ntfy.sh (or self-hosted ntfy) alert notifier.
+#
+# Install at /etc/fineco/ntfy.curl, mode 0600 root:root — the access token is a
+# SECRET and must never appear in argv. NEVER commit a filled-in copy. Prefer a
+# SELF-HOSTED ntfy or a token-protected topic: a public ntfy.sh topic name is
+# effectively a bearer secret (anyone who knows it can read your alert metadata).
+#
+# Use it from /etc/fineco/alert.env:
+#   FINECO_ALERT_COMMAND='curl -fsS -o /dev/null --config /etc/fineco/ntfy.curl -d @-'
+#
+# `-d @-` sends the piped alert line as the message body. `-f` fails closed on an
+# HTTP 4xx/5xx so a failed publish re-fires next scan.
+
+url = "https://ntfy.example.com/your-topic"
+header = "Authorization: Bearer tk_<YOUR_NTFY_TOKEN>"
+header = "Title: fineco-helper"
+header = "Priority: high"

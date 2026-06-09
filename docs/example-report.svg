@@ -1,0 +1,90 @@
+<svg width="1440" height="960" viewBox="0 0 1440 960" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1440" height="960" rx="28" fill="#F5F7F8"/>
+  <rect x="54" y="48" width="1332" height="864" rx="18" fill="#FFFFFF" stroke="#DDE4E8"/>
+  <text x="86" y="118" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="38" font-weight="700" fill="#182026">Fineco Portfolio Report</text>
+  <text x="88" y="153" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="19" font-weight="500" fill="#69757F">12 positions · EUR, USD, GBP</text>
+  <text x="1254" y="118" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" font-weight="600" fill="#69757F">Captured</text>
+  <text x="1254" y="148" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="18" fill="#69757F">Tuesday, 5 May 2026 at 16:05:46</text>
+
+  <g transform="translate(86 195)">
+    <rect width="286" height="104" rx="8" fill="#FFFFFF" stroke="#DDE4E8"/>
+    <text x="24" y="37" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="3" fill="#69757F">BOOK VALUE</text>
+    <text x="24" y="78" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" font-weight="700" fill="#182026">42.850,00 €</text>
+  </g>
+  <g transform="translate(396 195)">
+    <rect width="286" height="104" rx="8" fill="#FFFFFF" stroke="#DDE4E8"/>
+    <text x="24" y="37" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="3" fill="#69757F">MARKET VALUE</text>
+    <text x="24" y="78" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" font-weight="700" fill="#182026">51.420,00 €</text>
+  </g>
+  <g transform="translate(706 195)">
+    <rect width="286" height="104" rx="8" fill="#FFFFFF" stroke="#DDE4E8"/>
+    <text x="24" y="37" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="3" fill="#69757F">PROFIT / LOSS</text>
+    <text x="24" y="78" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" font-weight="700" fill="#087443">8.570,00 €</text>
+  </g>
+  <g transform="translate(1016 195)">
+    <rect width="286" height="104" rx="8" fill="#FFFFFF" stroke="#DDE4E8"/>
+    <text x="24" y="37" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="3" fill="#69757F">RETURN</text>
+    <text x="24" y="78" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" font-weight="700" fill="#087443">20,00%</text>
+  </g>
+
+  <g transform="translate(86 331)">
+    <rect width="1216" height="448" rx="8" fill="#FFFFFF" stroke="#DDE4E8"/>
+    <rect width="1216" height="54" rx="8" fill="#FBFCFD"/>
+    <path d="M0 54H1216" stroke="#DDE4E8"/>
+    <text x="18" y="34" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="2" fill="#69757F">INSTRUMENT</text>
+    <text x="435" y="34" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="2" fill="#69757F">QTY</text>
+    <text x="582" y="34" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="2" fill="#69757F">AVG PRICE</text>
+    <text x="752" y="34" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="2" fill="#69757F">MARKET PRICE</text>
+    <text x="920" y="34" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="2" fill="#69757F">MARKET VALUE</text>
+    <text x="1080" y="34" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="2" fill="#69757F">P/L</text>
+    <text x="1190" y="34" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" font-weight="700" letter-spacing="2" fill="#69757F">P/L %</text>
+
+    <g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+      <g transform="translate(0 54)">
+        <path d="M0 72H1216" stroke="#DDE4E8"/>
+        <text x="18" y="30" font-size="20" font-weight="700" fill="#182026">GLOBAL INDEX ETF</text>
+        <text x="18" y="55" font-size="15" fill="#69757F">FAKEETF.MI · AFF · etf</text>
+        <text x="435" y="42" text-anchor="end" font-size="20" fill="#182026">120,00</text>
+        <text x="582" y="42" text-anchor="end" font-size="20" fill="#182026">82,10 €</text>
+        <text x="752" y="42" text-anchor="end" font-size="20" fill="#182026">101,45 €</text>
+        <text x="920" y="42" text-anchor="end" font-size="20" font-weight="700" fill="#182026">12.174,00 €</text>
+        <text x="1080" y="42" text-anchor="end" font-size="20" fill="#087443">2.322,00 €</text>
+        <text x="1190" y="42" text-anchor="end" font-size="20" fill="#087443">23,57%</text>
+      </g>
+      <g transform="translate(0 126)">
+        <path d="M0 72H1216" stroke="#DDE4E8"/>
+        <text x="18" y="30" font-size="20" font-weight="700" fill="#182026">ACME CLOUD SOFTWARE</text>
+        <text x="18" y="55" font-size="15" fill="#69757F">ACME.O · NASDAQ · equity</text>
+        <text x="435" y="42" text-anchor="end" font-size="20" fill="#182026">35,00</text>
+        <text x="582" y="42" text-anchor="end" font-size="20" fill="#182026">94,20 USD</text>
+        <text x="752" y="42" text-anchor="end" font-size="20" fill="#182026">118,30 USD</text>
+        <text x="920" y="42" text-anchor="end" font-size="20" font-weight="700" fill="#182026">3.862,41 €</text>
+        <text x="1080" y="42" text-anchor="end" font-size="20" fill="#087443">786,12 €</text>
+        <text x="1190" y="42" text-anchor="end" font-size="20" fill="#087443">25,56%</text>
+      </g>
+      <g transform="translate(0 198)">
+        <path d="M0 72H1216" stroke="#DDE4E8"/>
+        <text x="18" y="30" font-size="20" font-weight="700" fill="#182026">EUROPE VALUE FUND</text>
+        <text x="18" y="55" font-size="15" fill="#69757F">FAKE000123 · FONDI · fund</text>
+        <text x="435" y="42" text-anchor="end" font-size="20" fill="#182026">480,25</text>
+        <text x="582" y="42" text-anchor="end" font-size="20" fill="#182026">14,20 €</text>
+        <text x="752" y="42" text-anchor="end" font-size="20" fill="#182026">13,85 €</text>
+        <text x="920" y="42" text-anchor="end" font-size="20" font-weight="700" fill="#182026">6.651,46 €</text>
+        <text x="1080" y="42" text-anchor="end" font-size="20" fill="#B42318">-168,09 €</text>
+        <text x="1190" y="42" text-anchor="end" font-size="20" fill="#B42318">-2,46%</text>
+      </g>
+      <g transform="translate(0 270)">
+        <path d="M0 72H1216" stroke="#DDE4E8"/>
+        <text x="18" y="30" font-size="20" font-weight="700" fill="#182026">SAMPLE INDUSTRIALS PLC</text>
+        <text x="18" y="55" font-size="15" fill="#69757F">SMP.L · LSE · equity</text>
+        <text x="435" y="42" text-anchor="end" font-size="20" fill="#182026">210,00</text>
+        <text x="582" y="42" text-anchor="end" font-size="20" fill="#182026">7,40 GBP</text>
+        <text x="752" y="42" text-anchor="end" font-size="20" fill="#182026">8,10 GBP</text>
+        <text x="920" y="42" text-anchor="end" font-size="20" font-weight="700" fill="#182026">1.963,25 €</text>
+        <text x="1080" y="42" text-anchor="end" font-size="20" fill="#087443">152,75 €</text>
+        <text x="1190" y="42" text-anchor="end" font-size="20" fill="#087443">8,43%</text>
+      </g>
+    </g>
+  </g>
+  <text x="86" y="884" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" fill="#69757F">Example image uses fake demo data only.</text>
+</svg>

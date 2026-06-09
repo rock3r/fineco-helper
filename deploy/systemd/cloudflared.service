@@ -1,0 +1,45 @@
+# Cloudflare Tunnel connector — the only client of the gateway's loopback bind.
+# It makes outbound connections to the Cloudflare edge and proxies inbound tunnel
+# traffic to the local gateway (the published-route service URL + HTTP Host Header
+# point at the gateway's loopback bind). The connector token is read by systemd
+# (as root) from the EnvironmentFile and injected as TUNNEL_TOKEN; the service
+# itself runs as an ephemeral DynamicUser with no extra privileges.
+[Unit]
+Description=cloudflared tunnel connector (fineco-mcp) for the owner MCP gateway
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target fineco-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secret: TUNNEL_TOKEN=... (0600 root:root, never committed).
+EnvironmentFile=/etc/fineco/cloudflared.env
+ExecStart=/usr/bin/cloudflared --no-autoupdate --loglevel info tunnel run
+Restart=on-failure
+RestartSec=5
+
+# Least privilege — egress only, no filesystem write, no new privileges.
+DynamicUser=yes
+NoNewPrivileges=yes
+# Suppress core dumps: this unit holds the tunnel token + session in memory.
+LimitCORE=0
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+# cloudflared is a Go binary. MemoryDenyWriteExecute (W^X) is verified working
+# with the deployed version, but Go runtimes/QUIC have historically tripped over
+# W^X — if a future cloudflared upgrade fails to start with a mmap/segv error,
+# this is the first directive to drop.
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

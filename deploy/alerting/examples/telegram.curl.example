@@ -1,0 +1,21 @@
+# curl config for a Telegram-bot alert notifier.
+#
+# Install at /etc/fineco/telegram.curl, mode 0600 root:root — the bot token below
+# is a SECRET and must never appear in argv / a process listing. NEVER commit a
+# filled-in copy.
+#
+# Use it from /etc/fineco/alert.env:
+#   FINECO_ALERT_COMMAND='curl -fsS -o /dev/null --config /etc/fineco/telegram.curl --data-urlencode text@-'
+#
+# The alert script pipes ONE payload-free line on stdin; `--data-urlencode text@-`
+# sends it as the message `text`, combined with the chat_id below. `-f` makes curl
+# exit non-zero on an HTTP 4xx/5xx so a failed send re-fires next scan.
+#
+# Get the two values from Telegram:
+#   - BOT_TOKEN: message @BotFather -> /newbot -> it gives a token like 123456:ABC-…
+#   - CHAT_ID:   message your new bot once, then open
+#                https://api.telegram.org/bot<BOT_TOKEN>/getUpdates and read
+#                result[].message.chat.id  (or message @userinfobot for your id)
+
+url = "https://api.telegram.org/bot<BOT_TOKEN>/sendMessage"
+data = "chat_id=<CHAT_ID>"

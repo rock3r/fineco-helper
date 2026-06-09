@@ -1,0 +1,53 @@
+{
+  "_fixture": "SYNTHETIC mock-fineco positions summary; not real account data",
+  "summary": {
+    "show": {
+      "currencyCd": "EUR",
+      "bookValue": 1500.0,
+      "marketValue": 1750.0,
+      "profitLoss": 250.0,
+      "profitLossPerc": 16.6667
+    },
+    "total": {
+      "currencyCd": "EUR",
+      "bookValue": 1500.0,
+      "marketValue": 1750.0,
+      "profitLoss": 250.0,
+      "profitLossPerc": 16.6667
+    }
+  },
+  "positions": {
+    "show": [
+      {
+        "instrId": "SYNTH0000001",
+        "venueSystem": "SYNTHV",
+        "symbol": "SYNTH-A",
+        "description": "SYNTHETIC Alpha Corp",
+        "type": "EQUITY",
+        "currencyCd": "EUR",
+        "qty": 10,
+        "avgPrice": 100.0,
+        "marketPrice": 120.0,
+        "bookValue": 1000.0,
+        "marketValue": 1200.0,
+        "profitLoss": 200.0,
+        "profitLossPerc": 20.0
+      },
+      {
+        "instrId": "SYNTH0000002",
+        "venueSystem": "SYNTHV",
+        "symbol": "SYNTH-B",
+        "description": "SYNTHETIC Beta SpA",
+        "type": "EQUITY",
+        "currencyCd": "EUR",
+        "qty": 5,
+        "avgPrice": 100.0,
+        "marketPrice": 110.0,
+        "bookValue": 500.0,
+        "marketValue": 550.0,
+        "profitLoss": 50.0,
+        "profitLossPerc": 10.0
+      }
+    ]
+  }
+}

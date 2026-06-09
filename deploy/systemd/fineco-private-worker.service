@@ -1,0 +1,96 @@
+# fineco-helper — private Fineco worker (M8 live refresh).
+#
+# The SOLE credential holder: logs in to Fineco, performs allowlisted read-only
+# requests, and serves the results on fineco-live.sock. It holds NO DB handle and
+# has NO public listener; the only client of its socket is the refresh controller
+# (inside the store-server), reached via the fineco-ipc-live group. Orders cross
+# the socket UN-HASHED (RawOrder); the controller hashes them — so the worker
+# never holds the DB key either.
+#
+# Topology (see docs/DEPLOYMENT.md):
+#   user  : fineco-worker   (creds + network; NOT the store user — that's fineco-store)
+#   socket: /run/fineco-worker/fineco-live.sock  group fineco-ipc-live, 0660
+#           (the dir is setgid 2750 fineco-worker:fineco-ipc-live via tmpfiles.d,
+#            so the socket inherits the group; the store-server joins that group)
+#   creds : /etc/fineco/private-worker.env  0640 root:fineco-worker — ONLY this
+#           user can read it (gateway + store-server cannot).
+#
+# Unlike the store-server this process NEEDS the network (outbound to Fineco), so
+# it does NOT set PrivateNetwork and allows AF_INET/AF_INET6. Its egress is pinned
+# to the resolved Fineco IPs by the nftables `meta skuid "fineco-worker"` rules
+# (deploy/firewall/) — the hard M8 gate.
+#
+# NOTE: validate on the target host (`systemd-analyze security fineco-private-worker`)
+# and adjust paths/users to the LXC. Values below are the intended baseline.
+
+[Unit]
+Description=fineco-helper private Fineco worker (fineco-live socket)
+Documentation=https://github.com/rock3r/fineco-helper
+After=network-online.target nftables.service
+Wants=network-online.target
+# The egress allow-set must be populated before the worker can reach Fineco —
+# pull it in (Wants) AND order after it, so starting the worker also starts the
+# set-population unit (the timer covers the periodic refresh).
+Wants=fineco-refresh-egress-set.service
+After=fineco-refresh-egress-set.service
+
+[Service]
+Type=simple
+User=fineco-worker
+Group=fineco-worker
+
+# The Fineco credentials — readable ONLY by this unit's user (root:fineco-worker
+# 0640). The gateway and store-server users cannot read it.
+EnvironmentFile=/etc/fineco/private-worker.env
+
+# The live socket lives under a setgid, group-shared (fineco-ipc-live) runtime
+# dir created by tmpfiles.d (deploy/tmpfiles.d/fineco-helper.conf), so the socket
+# inherits that group and the controller (in fineco-ipc-live) can connect.
+Environment=FINECO_LIVE_SOCKET=/run/fineco-worker/fineco-live.sock
+Environment=FINECO_LIVE_SOCKET_MODE=0660
+# Unset FINECO_LIVE_UPSTREAM_BASE => the real Fineco production endpoints.
+
+ExecStart=/usr/local/bin/fineco-helper private-worker
+Restart=on-failure
+RestartSec=2
+
+# --- hardening (plan "LXC Hardening") ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+# One `~` makes the whole list a denylist; both groups must share that line.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+# Suppress core dumps: this unit holds the Fineco credential in its environment,
+# and a core dump (or a systemd-coredump capture) could otherwise expose it.
+LimitCORE=0
+
+# This worker DOES need the network (outbound to Fineco) — unlike the no-network
+# store-server. It speaks TCP/TLS to Fineco and Unix sockets locally.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# NOTE: egress is pinned to the resolved Fineco IPs by the nftables
+# `meta skuid "fineco-worker"` rules (deploy/firewall/), NOT by systemd
+# IPAddressAllow/Deny — those use cgroup-BPF, which may be unavailable in an
+# unprivileged LXC (and would otherwise have to track the same rotating IPs).
+
+# Only the live-socket runtime dir is writable; everything else is read-only.
+ReadWritePaths=/run/fineco-worker
+
+[Install]
+WantedBy=multi-user.target

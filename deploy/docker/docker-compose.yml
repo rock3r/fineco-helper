@@ -1,0 +1,91 @@
+name: fineco-helper
+
+# Best-effort production topology for Docker. READ deploy/docker/README.md first —
+# Docker does NOT reproduce the LXC path's systemd seccomp/namespace hardening or
+# the per-uid nftables egress pinning, and runs the processes under one uid rather
+# than three OS users. The CRITICAL boundaries are preserved by VOLUME SEPARATION:
+# the gateway never mounts the live-socket volume, so it physically cannot reach
+# the credential worker's socket; the worker never mounts the cached-IPC volume.
+#
+# Before `docker compose up`: build the runtime image (see README), then create
+# ./config/ with your filled-in files copied from ../config/*.env.example
+# (private-worker.env, access.env, enrichment.env, cloudflared.env) and
+# ../policy.json -> ./config/policy.json. ./config/ is gitignored.
+
+x-hardening: &hardening
+  image: fineco-helper:latest        # built from deploy/build/Dockerfile (see README)
+  user: "10001:10001"                # one uid for all three (see README caveat)
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: ["/tmp"]
+  restart: unless-stopped
+
+services:
+  # Owns the DB + capability policy; serves the cached-query and refresh-control
+  # sockets and CONNECTS to the worker's live socket. No network.
+  store-server:
+    <<: *hardening
+    command: ["store-server"]                  # appended to the image ENTRYPOINT (the binary)
+    network_mode: "none"
+    environment:
+      FINECO_DB_PATH: /var/lib/fineco-helper/fineco-history.sqlite
+      FINECO_QUERY_SOCKET: /run/ipc/snapshot-query.sock
+      FINECO_QUERY_SOCKET_MODE: "0660"
+      FINECO_REFRESH_SOCKET: /run/ipc/refresh-control.sock
+      FINECO_REFRESH_SOCKET_MODE: "0660"
+      FINECO_LIVE_SOCKET: /run/live/fineco-live.sock
+      FINECO_POLICY_PATH: /etc/fineco/policy.json
+    volumes:
+      - fineco-ipc:/run/ipc                       # query + refresh sockets (it serves)
+      - fineco-live:/run/live                      # live socket (it connects to)
+      - fineco-data:/var/lib/fineco-helper
+      - ./config/policy.json:/etc/fineco/policy.json:ro
+
+  # The SOLE credential holder. Serves the live socket; reaches Fineco. It does NOT
+  # mount fineco-ipc, and the gateway does NOT mount fineco-live — so neither can
+  # reach the other's socket.
+  worker:
+    <<: *hardening
+    command: ["private-worker"]
+    env_file: ["./config/private-worker.env"]      # FINECO_USER_ID / FINECO_PASSWORD
+    environment:
+      FINECO_LIVE_SOCKET: /run/live/fineco-live.sock
+      FINECO_LIVE_SOCKET_MODE: "0660"
+    volumes:
+      - fineco-live:/run/live
+    # The worker reaches Fineco over the default bridge. Docker has NO per-uid
+    # egress pinning — constrain this at YOUR network layer (see README).
+
+  # Internet-facing MCP gateway, loopback-only. Holds no credentials, no DB, and
+  # NO live-socket mount. Reaches the store only over the cached-IPC sockets.
+  gateway:
+    <<: *hardening
+    command: ["gateway"]
+    env_file:
+      - ./config/access.env                        # Cloudflare Access (required)
+      - path: ./config/enrichment.env              # optional market tools
+        required: false                            #   (skip the file → tools disabled)
+    environment:
+      FINECO_GATEWAY_BIND: 127.0.0.1:8799
+      FINECO_QUERY_SOCKET: /run/ipc/snapshot-query.sock
+      FINECO_REFRESH_SOCKET: /run/ipc/refresh-control.sock
+      FINECO_POLICY_PATH: /etc/fineco/policy.json
+    volumes:
+      - fineco-ipc:/run/ipc                        # query + refresh (it connects to)
+      - ./config/policy.json:/etc/fineco/policy.json:ro
+    depends_on: [store-server, worker]
+
+  # The only client of the gateway's loopback bind; shares its netns to reach it.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "run"]
+    env_file: ["./config/cloudflared.env"]         # TUNNEL_TOKEN
+    network_mode: "service:gateway"
+    depends_on: [gateway]
+    restart: unless-stopped
+
+volumes:
+  fineco-ipc:    # snapshot-query + refresh-control sockets (store-server ↔ gateway)
+  fineco-live:   # fineco-live socket (worker ↔ store-server) — NEVER mounted in the gateway
+  fineco-data:   # the SQLite store

@@ -1,0 +1,7 @@
+# clippy configuration. Do NOT relax these to dodge a finding (AGENTS.md, "Lint
+# config and suppressions"): fix at the source or surface to the owner.
+#
+# Complexity caps surface over-dense code early, before it hides a bug.
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250

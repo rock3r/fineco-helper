@@ -1,0 +1,38 @@
+# Daily encrypted SQLite backup (deploy/backup/fineco-backup.sh). Runs as the DB
+# owner (fineco-store); the age-encrypted output is what leaves that boundary. The
+# age PUBLIC recipient + the backup dir come from /etc/fineco/backup.env (the
+# private identity stays OFFLINE — it is needed only for the restore drill).
+[Unit]
+Description=fineco-helper encrypted SQLite backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=fineco-store
+Group=fineco-store
+EnvironmentFile=/etc/fineco/backup.env
+ExecStart=/usr/local/libexec/fineco-backup
+
+# --- hardening ---
+NoNewPrivileges=true
+# Suppress core dumps: this unit streams the private SQLite DB through memory.
+LimitCORE=0
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Needs no capabilities and no network — it reads files, runs the binary, gzip,
+# and age, all locally.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+# Reads the DB, writes the encrypted backups (both owned by fineco-store).
+ReadWritePaths=/var/lib/fineco-helper /var/backups/fineco-helper

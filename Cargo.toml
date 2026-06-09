@@ -1,0 +1,38 @@
+# Workspace root for fineco-helper: a hardened, owner-only remote MCP over
+# read-only Fineco data, built as a single self-contained Rust binary.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/fineco-core",
+    "crates/fineco-gateway",
+    "crates/fineco-helper",
+    "crates/fineco-ipc",
+    "crates/fineco-live",
+    "crates/fineco-market",
+    "crates/fineco-query",
+    "crates/fineco-refresh",
+    "crates/fineco-store",
+    "crates/fineco-worker",
+    "e2e/httptiny",
+    "e2e/mock-fineco",
+    "e2e/mock-enrichment",
+    "e2e/smoke",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+# No new `unsafe` without an explicit, reviewed justification (AGENTS.md).
+# `deny` (not `forbid`) so a justified, commented `#[allow(unsafe_code)]` is
+# possible after review; `forbid` would block that escape hatch entirely.
+unsafe_code = "deny"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

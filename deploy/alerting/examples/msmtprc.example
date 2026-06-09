@@ -1,0 +1,30 @@
+# msmtp relay config for EMAIL alerts (SMTP).
+#
+# Install at /etc/msmtprc, mode 0600 root:root — the relay password is a SECRET and
+# must never appear in argv. NEVER commit a filled-in copy. Also install the MTA
+# shim so `mail` routes through msmtp:  apt-get install -y msmtp msmtp-mta bsd-mailx
+#
+# Then in /etc/fineco/alert.env:
+#   FINECO_ALERT_COMMAND='mail -s "fineco-helper alert" you@example.com'
+# `mail` adds the headers and pipes the alert line as the body to /usr/sbin/sendmail
+# (-> msmtp -> your relay). The password lives in THIS file, not in argv.
+#
+# Keep the password out of this file too if you can: `passwordeval` reads it from a
+# separate 0600 file (shown), or use an app-password. Test:
+#   printf 'fineco-alert: test\n' | mail -s "fineco-helper alert" you@example.com
+
+defaults
+auth           on
+tls            on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+# Log to journald, NOT a /var/log file: the fineco-alert unit runs with
+# ProtectSystem=strict (only its StateDirectory is writable), so a `logfile`
+# under /var/log fails on every alert and makes msmtp return non-zero.
+syslog         on
+
+account        default
+host           smtp.example.com
+port           587
+from           alerts@example.com
+user           alerts@example.com
+passwordeval   "cat /etc/fineco/smtp-password"   # 0600 root:root; or: password <app-password>

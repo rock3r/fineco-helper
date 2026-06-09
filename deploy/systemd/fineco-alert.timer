@@ -1,0 +1,16 @@
+# Scan the live-refresh alert sources on boot and every few minutes.
+[Unit]
+Description=Periodic fineco-helper live-refresh alert scan
+# Deliberately NO Requires=/Wants= on fineco-alert.service: the timer already
+# activates the same-named service when it elapses. A Requires= would also pull the
+# oneshot in the instant the timer is enabled/booted, and because the script exits
+# non-zero on an unreadable source / failed notifier, a transient failure then could
+# leave the timer itself failed instead of simply retrying on the next tick.
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=3min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+[package]
+name = "mock-enrichment"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+httptiny = { path = "../httptiny" }
+
+[lib]
+name = "mock_enrichment"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mock-enrichment"
+path = "src/main.rs"

@@ -1,0 +1,15 @@
+# Run the encrypted backup once a day.
+[Unit]
+Description=Daily fineco-helper encrypted SQLite backup
+# No Requires=/Wants= on the service: the timer activates its same-named service on
+# elapse. A Requires= would also pull the oneshot in the instant the timer is
+# enabled, so a transient backup failure could leave the timer itself failed
+# instead of just running at the next OnCalendar tick (Persistent= catches up).
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+AccuracySec=1h
+
+[Install]
+WantedBy=timers.target

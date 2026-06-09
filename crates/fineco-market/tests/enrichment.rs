@@ -1,0 +1,278 @@
+//! Tests for the pure enrichment core: parse-not-execute extraction, the source
+//! allowlist, bounded output, and title matching. Fixtures are SYNTHETIC and use
+//! a fake host — never the real enrichment host.
+
+use fineco_market::{EnrichmentHostAllowlist, build_enrichment_report, validate_source_url};
+
+const NOW: &str = "2026-06-03T12:00:00Z";
+const SOURCE: &str = "https://stocks.example/stocks/it/diversified-financials/syn-tip/synth-shares";
+
+/// Wrap a `__REACT_QUERY_STATE__` payload in a minimal HTML page.
+fn page(payload: &str) -> String {
+    format!(
+        "<html><head><script>window.__REACT_QUERY_STATE__ = {payload};</script></head><body>SYNTHETIC</body></html>"
+    )
+}
+
+/// A canonical synthetic company cache, with one JS-ism (`undefined`) and a
+/// string that literally contains the word "undefined" (must be preserved).
+fn canonical_payload() -> String {
+    r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "synth"],
+          "state": {
+            "data": {
+              "data": {
+                "name": "Fallback Name",
+                "unique_symbol": "BIT:TIP",
+                "exchange_symbol": "BIT",
+                "isin_symbol": "IT0003153621",
+                "year_founded": undefined,
+                "info": { "name": "fallback info" },
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "company_info": {
+                              "name": "SYNTHETIC Tamburi Investment Partners SpA",
+                              "unique_symbol": "BIT:TIP",
+                              "exchange_symbol": "BIT",
+                              "isin_symbol": "IT0003153621",
+                              "country": "Italy",
+                              "url": "https://www.tamburi.example",
+                              "description": "SYNTHETIC holding; the value is undefined here."
+                            }
+                          }
+                        },
+                        "analysis": {
+                          "value": { "pe": 12.3, "trap": "1);DROP TABLE;--" },
+                          "future": { "growth": 0.05 },
+                          "past": {},
+                          "health": {},
+                          "dividend": {},
+                          "management": {}
+                        },
+                        "scores": { "value": 4, "future": 3, "total": 20 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }"#
+    .to_string()
+}
+
+#[test]
+fn extracts_company_scores_and_metrics() {
+    let report = build_enrichment_report(&page(&canonical_payload()), SOURCE, NOW, None)
+        .expect("report should build");
+
+    assert_eq!(report.captured_at, NOW);
+    assert_eq!(report.source_url, SOURCE);
+
+    // company_info wins over the top-level fallbacks.
+    assert_eq!(
+        report.company.name,
+        "SYNTHETIC Tamburi Investment Partners SpA"
+    );
+    assert_eq!(report.company.ticker, "BIT:TIP");
+    assert_eq!(report.company.exchange, "BIT");
+    assert_eq!(report.company.isin, "IT0003153621");
+    assert_eq!(report.company.country, "Italy");
+    assert_eq!(report.company.website, "https://www.tamburi.example");
+    assert!(report.company.description.contains("SYNTHETIC"));
+    // A string literally containing "undefined" is preserved, not nulled.
+    assert!(report.company.description.contains("undefined"));
+
+    assert_eq!(report.scores["value"], serde_json::json!(4));
+    assert_eq!(report.scores["total"], serde_json::json!(20));
+    assert_eq!(report.metrics["value"]["pe"], serde_json::json!(12.3));
+    assert_eq!(report.metrics["future"]["growth"], serde_json::json!(0.05));
+}
+
+#[test]
+fn parse_is_data_only_not_execution() {
+    // A metric value that looks like injected code is kept verbatim as data —
+    // never interpreted. (Reaching this assertion at all means nothing ran it.)
+    let report = build_enrichment_report(&page(&canonical_payload()), SOURCE, NOW, None)
+        .expect("report should build");
+    assert_eq!(
+        report.metrics["value"]["trap"],
+        serde_json::json!("1);DROP TABLE;--")
+    );
+}
+
+#[test]
+fn bare_undefined_becomes_absent_not_an_error() {
+    // `year_founded: undefined` must normalize cleanly (no parse failure). It is
+    // not a surfaced field, so we just assert the report builds.
+    let report = build_enrichment_report(&page(&canonical_payload()), SOURCE, NOW, None);
+    assert!(report.is_ok());
+}
+
+#[test]
+fn missing_marker_is_a_safe_error() {
+    let html = "<html><body>no embedded cache here</body></html>";
+    let err = build_enrichment_report(html, SOURCE, NOW, None).expect_err("no marker");
+    assert_eq!(err.code(), "invalid_request");
+    assert!(!err.safe_message().is_empty());
+}
+
+#[test]
+fn non_object_cache_is_rejected() {
+    let err =
+        build_enrichment_report(&page("[1, 2, 3]"), SOURCE, NOW, None).expect_err("array cache");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn missing_company_entry_is_rejected() {
+    let payload = r#"{ "queries": [ { "queryKey": ["other"], "state": { "data": {} } } ] }"#;
+    let err =
+        build_enrichment_report(&page(payload), SOURCE, NOW, None).expect_err("no company entry");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn oversized_page_is_rejected() {
+    let html = "x".repeat(4 * 1024 * 1024 + 1);
+    let err = build_enrichment_report(&html, SOURCE, NOW, None).expect_err("too large");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn long_text_and_wide_sections_are_bounded() {
+    let long = "A".repeat(10_000);
+    let mut wide = String::new();
+    for i in 0..40 {
+        if i > 0 {
+            wide.push(',');
+        }
+        wide.push_str(&format!("\"m{i}\": {i}"));
+    }
+    let payload = format!(
+        r#"{{
+          "queries": [{{
+            "queryKey": ["company"],
+            "state": {{ "data": {{ "data": {{
+              "analysis": {{ "data": {{ "extended": {{ "data": {{
+                "raw_data": {{ "data": {{ "company_info": {{
+                  "name": "SYNTHETIC Co",
+                  "description": "{long}"
+                }} }} }},
+                "analysis": {{ "value": {{ {wide} }} }},
+                "scores": {{}}
+              }} }} }} }}
+            }} }} }}
+          }}]
+        }}"#
+    );
+
+    let report =
+        build_enrichment_report(&page(&payload), SOURCE, NOW, None).expect("report should build");
+    assert_eq!(report.company.description.chars().count(), 4096);
+    let value_section = report.metrics["value"].as_object().expect("value object");
+    assert_eq!(value_section.len(), 16);
+}
+
+#[test]
+fn title_match_scores_strong_on_isin_and_name() {
+    let report = build_enrichment_report(
+        &page(&canonical_payload()),
+        SOURCE,
+        NOW,
+        Some("Tamburi Investment Partners IT0003153621"),
+    )
+    .expect("report should build");
+
+    let title_match = report.title_match.expect("a title match");
+    assert_eq!(title_match.verdict, "strong");
+    assert!(title_match.score >= 0.7);
+    assert!(title_match.reasons.iter().any(|r| r.contains("ISIN")));
+}
+
+#[test]
+fn title_match_scores_weak_on_unrelated_title() {
+    let report = build_enrichment_report(
+        &page(&canonical_payload()),
+        SOURCE,
+        NOW,
+        Some("Completely Unrelated Widget"),
+    )
+    .expect("report should build");
+    assert_eq!(report.title_match.expect("match").verdict, "weak");
+}
+
+// ---- Source-URL allowlisting ----------------------------------------------
+
+fn allowlist() -> EnrichmentHostAllowlist {
+    EnrichmentHostAllowlist::from_allowed_hosts(["stocks.example"])
+}
+
+#[test]
+fn accepts_allowlisted_https_stock_url() {
+    assert!(validate_source_url(SOURCE, &allowlist()).is_ok());
+    // A locale-prefixed path is accepted (the locale is stripped before the
+    // /stocks/ check).
+    assert!(validate_source_url("https://stocks.example/it/stocks/foo/bar", &allowlist()).is_ok());
+}
+
+#[test]
+fn rejects_http_scheme() {
+    let err = validate_source_url("http://stocks.example/stocks/x", &allowlist())
+        .expect_err("http must be rejected");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn rejects_unlisted_host() {
+    let err = validate_source_url("https://evil.example/stocks/x", &allowlist())
+        .expect_err("unlisted host");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn rejects_userinfo() {
+    let err = validate_source_url("https://user:pass@stocks.example/stocks/x", &allowlist())
+        .expect_err("userinfo must be rejected");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn rejects_non_stock_path() {
+    let err = validate_source_url("https://stocks.example/markets/x", &allowlist())
+        .expect_err("non-stock path");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn host_is_matched_case_insensitively_without_port() {
+    assert!(validate_source_url("https://STOCKS.example:443/stocks/x", &allowlist()).is_ok());
+}
+
+#[test]
+fn accepts_bracketed_ipv6_host() {
+    // A bracketed IPv6 authority must normalize to the address (not `[`), so the
+    // host pin matches with or without a port.
+    let allow = EnrichmentHostAllowlist::from_allowed_hosts(["[::1]"]);
+    assert!(validate_source_url("https://[::1]/stocks/x", &allow).is_ok());
+    assert!(validate_source_url("https://[::1]:8443/stocks/x", &allow).is_ok());
+    // A different IPv6 host is still rejected.
+    assert!(validate_source_url("https://[::2]/stocks/x", &allow).is_err());
+}
+
+#[test]
+fn rejects_malformed_non_numeric_port() {
+    // A malformed authority must not slip through host normalization (which
+    // would otherwise strip the bad port and accept the host).
+    let err = validate_source_url("https://stocks.example:notaport/stocks/x", &allowlist())
+        .expect_err("non-numeric port must be rejected");
+    assert_eq!(err.code(), "invalid_request");
+}

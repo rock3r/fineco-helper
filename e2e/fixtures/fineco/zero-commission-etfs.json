@@ -1,0 +1,17 @@
+{
+  "_fixture": "SYNTHETIC mock-fineco zero-commission ETF list (public, no auth)",
+  "instruments": [
+    {
+      "instrId": "SYNTHETF0001",
+      "venueSystem": "SYNTHV",
+      "description": "SYNTHETIC World ETF",
+      "issuer": "SYNTHETIC Asset Mgmt"
+    },
+    {
+      "instrId": "SYNTHETF0002",
+      "venueSystem": "SYNTHV",
+      "description": "SYNTHETIC Bond ETF",
+      "issuer": "SYNTHETIC Asset Mgmt"
+    }
+  ]
+}

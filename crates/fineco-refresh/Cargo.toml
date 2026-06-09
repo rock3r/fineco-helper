@@ -1,0 +1,20 @@
+[package]
+name = "fineco-refresh"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "fineco_refresh"
+path = "src/lib.rs"
+
+[dependencies]
+# Orchestration only: holds NO Fineco credentials. The data source is an injected
+# `PortfolioFetcher` trait (the real Fineco fetch lands in the M3 private worker).
+fineco-core = { path = "../fineco-core" }
+fineco-store = { path = "../fineco-store" }

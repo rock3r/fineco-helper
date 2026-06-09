@@ -1,0 +1,33 @@
+# Trigger one portfolio refresh on Mon–Sat mornings, at a RANDOM time in the
+# 06:00–08:00 Europe/Rome window.
+#
+# Why this window: it sits well after the ~22:00-Rome US market close (so the prior
+# day's US prices are captured), and 06:00–08:00 is a human-plausible "checking
+# before work" hour — an unattended login at, say, 03:00 is exactly the kind of
+# unusual-hour event that can trip a bank's fraud heuristics and provoke the SCA we
+# want to avoid. The randomized delay avoids a fixed, machine-looking timestamp.
+# Sunday is skipped: nothing has traded since Saturday's run captured Friday's close.
+[Unit]
+Description=Scheduled fineco-helper portfolio live refresh (Mon-Sat morning)
+# No Requires=/Wants= on the service (same rationale as the backup timer): the timer
+# activates its same-named service on elapse. A Requires= would also pull the oneshot
+# in the instant the timer is enabled, so a transient refresh failure could leave the
+# timer itself failed instead of simply retrying at the next OnCalendar tick.
+
+[Timer]
+# Timezone-qualified OnCalendar (systemd >= 252, e.g. Debian 12) so the window
+# tracks Rome wall-clock across CET/CEST automatically.
+OnCalendar=Mon..Sat *-*-* 06:00:00 Europe/Rome
+# Spread the actual fire time uniformly across the two-hour window (06:00 -> 08:00).
+RandomizedDelaySec=2h
+# Keep the randomization sharp (don't let timer batching swallow the spread).
+AccuracySec=1m
+# Deliberately NOT Persistent=: a missed elapse (host off during the window, or the
+# timer enabled after 08:00) would otherwise fire a CATCH-UP login on activation,
+# subject only to RandomizedDelaySec — i.e. a real Fineco login OUTSIDE the
+# 06:00-08:00 human-plausible window this unit exists to stay within (the exact
+# fraud-heuristic risk we're avoiding). A skipped day just waits for the next
+# in-window tick; best-effort, the cached data holds.
+
+[Install]
+WantedBy=timers.target

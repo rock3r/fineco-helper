@@ -1,0 +1,55 @@
+[package]
+name = "fineco-helper"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The self-contained product binary wires the roles together (plan "Migration
+# target": one binary, subcommands/roles). The gateway role hosts the rmcp
+# Streamable HTTP service (a tower Service) over axum, bound to loopback only;
+# the store-server role runs the credential-free query worker on the socket.
+fineco-core = { path = "../fineco-core" }
+fineco-ipc = { path = "../fineco-ipc" }
+fineco-gateway = { path = "../fineco-gateway" }
+fineco-query = { path = "../fineco-query" }
+fineco-store = { path = "../fineco-store" }
+fineco-market = { path = "../fineco-market" }
+# The private-fineco-worker role (creds + network, no DB) serves `fineco-live.sock`
+# via the fineco-live protocol. These are first-party path crates, not new external
+# deps; they enter only the binary's `private-worker` role, never the gateway
+# crate's runtime closure (the gateway architecture test enforces that).
+fineco-worker = { path = "../fineco-worker" }
+fineco-refresh = { path = "../fineco-refresh" }
+fineco-live = { path = "../fineco-live" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+] }
+
+[dev-dependencies]
+# The Access-middleware test drives the gateway router over loopback: it signs
+# tokens with the gateway's offline RSA test key + JWKS fixtures (jsonwebtoken,
+# serde_json) and POSTs with httptiny.
+jsonwebtoken = "9"
+serde_json = "1"
+httptiny = { path = "../../e2e/httptiny" }
+# The live-refresh e2e drives the REAL FinecoWorker over fineco-live.sock through
+# the controller against the synthetic mock Fineco (no real creds).
+mock-fineco = { path = "../../e2e/mock-fineco" }
+
+[lib]
+name = "fineco_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fineco-helper"
+path = "src/main.rs"

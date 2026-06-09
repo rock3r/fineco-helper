@@ -1,0 +1,50 @@
+# Live-refresh alerting (deploy/alerting/fineco-alert.sh). Driven by the paired
+# .timer. Scans the payload-free alert sources (gateway audit journal, the
+# nftables deny counter, the worker's NRestarts) and pipes any fired alert to the
+# notifier command from /etc/fineco/alert.env. Holds no Fineco secret and never
+# opens the SQLite DB. See docs/LIVE-REFRESH-GATES.md.
+[Unit]
+Description=fineco-helper live-refresh alerting
+After=fineco-gateway.service nftables.service
+
+[Service]
+Type=oneshot
+# NOTE: alert.env is deliberately NOT imported via systemd EnvironmentFile. That
+# would load the file (PATH/BASH_ENV/…) into this root bash process BEFORE any
+# validation. Instead fineco-alert.sh reads the FIXED path /etc/fineco/alert.env
+# itself, refuses to run unless it is root-owned and non-group/other-writable, and
+# only then sources it. The timer still runs (journald default) before it exists.
+ExecStart=/usr/local/libexec/fineco-alert
+# Per-run state (last-seen counters + the journald cursor); systemd creates and
+# owns /var/lib/fineco-alert and adds it to ReadWritePaths.
+StateDirectory=fineco-alert
+StateDirectoryMode=0700
+
+# --- hardening (a root helper, so the clamp matters) ---
+NoNewPrivileges=true
+# Suppress core dumps: this root unit reads the notifier secret from /etc/fineco.
+LimitCORE=0
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# Reading the nftables ruleset needs CAP_NET_ADMIN. CAP_SETPCAP lets the script
+# drop the bounding set before running a notifier: the process is root (euid 0), so
+# the kernel's "root file caps = all-ones" exec rule would otherwise re-grant
+# CAP_NET_ADMIN to the notifier (curl/mail/…) from the bounding set even with the
+# ambient set cleared. The notifier is run via `setpriv --bounding-set=-all
+# --ambient-caps=-all`, leaving it capability-less. Nothing else of root is needed.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETPCAP
+AmbientCapabilities=CAP_NET_ADMIN CAP_SETPCAP
+# AF_NETLINK for nft; AF_UNIX for journald/systemctl/logger; AF_INET/AF_INET6 so a
+# network notifier (curl/ntfy/mail relay) configured in alert.env can reach out.
+RestrictAddressFamilies=AF_NETLINK AF_UNIX AF_INET AF_INET6

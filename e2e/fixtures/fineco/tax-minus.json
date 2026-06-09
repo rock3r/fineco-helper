@@ -1,0 +1,8 @@
+{
+  "_fixture": "SYNTHETIC mock-fineco tax minus by year; not real account data",
+  "total": 0,
+  "list": [
+    { "year": 2026, "minusResidue": 500.0, "expirationDate": "2030-12-31" },
+    { "year": 2025, "minusResidue": 250.0, "expirationDate": "2029-12-31" }
+  ]
+}

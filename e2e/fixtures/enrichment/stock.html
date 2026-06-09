@@ -1,0 +1,61 @@
+<!doctype html>
+<!-- SYNTHETIC mock enrichment page; not real data -->
+<html lang="en">
+  <head>
+    <title>SYNTHETIC Stock Profile</title>
+  </head>
+  <body>
+    <h1>SYNTHETIC Stock Profile</h1>
+    <!-- Present on purpose: enrichment must parse embedded scripts as data,
+         never execute them. If this ever ran, it would be a bug. -->
+    <script>window.__SHOULD_NEVER_RUN__ = true;</script>
+    <script>window.__REACT_QUERY_STATE__ = {
+      "queries": [
+        {
+          "queryKey": ["company", "synth"],
+          "state": {
+            "data": {
+              "data": {
+                "name": "SYNTHETIC Fallback Name",
+                "unique_symbol": "BIT:TIP",
+                "exchange_symbol": "BIT",
+                "isin_symbol": "IT0003153621",
+                "year_founded": undefined,
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "company_info": {
+                              "name": "SYNTHETIC Tamburi Investment Partners SpA",
+                              "unique_symbol": "BIT:TIP",
+                              "exchange_symbol": "BIT",
+                              "isin_symbol": "IT0003153621",
+                              "country": "Italy",
+                              "url": "https://www.example.invalid",
+                              "description": "SYNTHETIC diversified financials holding company."
+                            }
+                          }
+                        },
+                        "analysis": {
+                          "value": { "pe": 12.3, "pb": 1.1 },
+                          "future": { "growth": 0.05 },
+                          "past": {},
+                          "health": {},
+                          "dividend": { "yield": 2.1 },
+                          "management": {}
+                        },
+                        "scores": { "value": 4, "future": 3, "past": 5, "health": 6, "dividend": 2, "total": 20 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    };</script>
+  </body>
+</html>
