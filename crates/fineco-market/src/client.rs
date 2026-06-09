@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use ureq::Agent;
 
 use crate::build_enrichment_report;
-use crate::report::EnrichmentReport;
+use crate::report::{EnrichmentReport, sanitize_text};
 use crate::source::{EnrichmentHostAllowlist, validate_fetch_target};
 
 /// Cap the enrichment page read at the network layer (matches the parser's page
@@ -217,16 +217,7 @@ impl MarketClient {
         if !(200..300).contains(&status) {
             return Err(SafeError::from_upstream_status(status));
         }
-        // Map through `map_transport_error`, not a blanket `internal()`: with the
-        // global timeout, an upstream that sends headers then stalls the body times
-        // out HERE (during the read), not in `.call()` — that must still surface as
-        // `fineco_timeout`. Parse/oversize errors fall through to `internal()`.
-        response
-            .body_mut()
-            .with_config()
-            .limit(MAX_ENRICHMENT_BYTES)
-            .read_to_string()
-            .map_err(map_transport_error)
+        read_body_to_string_bounded(response.body_mut(), MAX_ENRICHMENT_BYTES)
     }
 
     /// GET `url` and parse the JSON body, bounding status to 2xx.
@@ -240,17 +231,12 @@ impl MarketClient {
         if !(200..300).contains(&status) {
             return Err(SafeError::from_upstream_status(status));
         }
-        // Read the body to a string FIRST, then parse — do not use `read_json`,
-        // which wraps a body-read timeout inside a `serde_json` error
-        // (`Json("timeout: global")`) that would be misclassified as `internal`.
-        // Reading to a string surfaces a stalled-body timeout cleanly as
-        // `Timeout` (-> `fineco_timeout`); the JSON parse maps to `internal`.
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_JSON_BYTES)
-            .read_to_string()
-            .map_err(map_transport_error)?;
+        // Read the body to a string FIRST, then parse — not `read_json`, which
+        // wraps a body-read timeout inside a `serde_json` error that would be
+        // misclassified as `internal`. The bounded read surfaces a stalled-body
+        // timeout cleanly as `fineco_timeout` and caps the DECOMPRESSED size; the
+        // JSON parse maps to `internal`.
+        let body = read_body_to_string_bounded(response.body_mut(), MAX_JSON_BYTES)?;
         serde_json::from_str(&body).map_err(|_| SafeError::internal())
     }
 }
@@ -286,11 +272,13 @@ struct EtfEntry {
 
 impl EtfEntry {
     fn into_instrument(self) -> ZeroCommissionEtf {
+        // The ETF list is untrusted third-party content returned to the model:
+        // control-strip and length-bound every string field, like enrichment.
         ZeroCommissionEtf {
-            instr_id: self.instr_id.unwrap_or_default(),
-            venue_system: self.venue_system.unwrap_or_default(),
-            description: self.description.unwrap_or_default(),
-            issuer: self.issuer.unwrap_or_default(),
+            instr_id: sanitize_text(&self.instr_id.unwrap_or_default()),
+            venue_system: sanitize_text(&self.venue_system.unwrap_or_default()),
+            description: sanitize_text(&self.description.unwrap_or_default()),
+            issuer: sanitize_text(&self.issuer.unwrap_or_default()),
         }
     }
 }
@@ -334,6 +322,39 @@ fn ensure_secure_transport(url: &str) -> Result<(), SafeError> {
     }
 }
 
+/// Read a response body to a `String`, bounding the **decompressed** size.
+///
+/// ureq's `.limit()` caps the *compressed* bytes read off the socket — the limit
+/// reader sits beneath the gzip decoder — so a small gzip body that inflates to
+/// gigabytes would slip past a compressed-size cap and be materialized whole. We
+/// therefore read through the decoded reader under a `take` cap on the
+/// *decompressed* output and reject anything larger, bounding memory against a
+/// hostile/compromised upstream. A stalled body read is still surfaced as
+/// `fineco_timeout`: the gzip decoder passes a wrapped ureq timeout through, and
+/// `ureq::Error::from(io::Error)` round-trips it (see `map_read_error`).
+fn read_body_to_string_bounded(body: &mut ureq::Body, max: u64) -> Result<String, SafeError> {
+    use std::io::Read;
+    // Keep the compressed-side cap too (bounds bytes pulled off the socket), then
+    // bound the decoded output — the cap that actually stops a decompression bomb.
+    let mut reader = body.with_config().limit(max).reader();
+    let mut buf = Vec::new();
+    (&mut reader)
+        .take(max + 1)
+        .read_to_end(&mut buf)
+        .map_err(map_read_error)?;
+    if buf.len() as u64 > max {
+        return Err(SafeError::internal());
+    }
+    String::from_utf8(buf).map_err(|_| SafeError::internal())
+}
+
+/// Map an I/O error from the bounded body read to a safe envelope, preserving the
+/// `fineco_timeout` classification a stalled body read produces (the decoder
+/// passes a wrapped ureq error through, which `ureq::Error::from` recovers).
+fn map_read_error(err: std::io::Error) -> SafeError {
+    map_transport_error(ureq::Error::from(err))
+}
+
 /// Map a ureq transport error to a safe envelope. The error's `Display` may
 /// reference the URL, so it is NEVER placed into the envelope message.
 fn map_transport_error(err: ureq::Error) -> SafeError {
@@ -341,5 +362,40 @@ fn map_transport_error(err: ureq::Error) -> SafeError {
         ureq::Error::Timeout(_) => SafeError::fineco_timeout(),
         ureq::Error::StatusCode(code) => SafeError::from_upstream_status(code),
         _ => SafeError::internal(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn etf_entry_string_fields_are_sanitized_and_bounded() {
+        // The public ETF list is untrusted third-party content too: its string
+        // fields must be control-stripped and length-bounded before reaching the
+        // model, exactly like the enrichment free-text fields.
+        let entry = EtfEntry {
+            instr_id: Some("IE00\u{1b}[31mB4L5Y983".to_string()),
+            venue_system: Some("MOT\nMTA".to_string()),
+            description: Some("d".repeat(crate::report::MAX_STR + 100)),
+            issuer: Some("Issuer\u{0}Co".to_string()),
+        };
+        let etf = entry.into_instrument();
+        for field in [
+            &etf.instr_id,
+            &etf.venue_system,
+            &etf.description,
+            &etf.issuer,
+        ] {
+            assert!(
+                !field.chars().any(char::is_control),
+                "ETF field still has a control char: {field:?}"
+            );
+            assert!(
+                field.chars().count() <= crate::report::MAX_STR,
+                "ETF field not length-bounded: {} chars",
+                field.chars().count()
+            );
+        }
     }
 }

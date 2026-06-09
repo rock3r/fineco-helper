@@ -31,6 +31,9 @@ schemars = "1"
 httptiny = { path = "../../e2e/httptiny" }
 mock-fineco = { path = "../../e2e/mock-fineco" }
 mock-enrichment = { path = "../../e2e/mock-enrichment" }
+# Build a gzip "bomb" body in the decompression-cap test. Already in the tree
+# (transitive via ureq's gzip feature), so this pins no new crate; test-only.
+flate2 = "1"
 
 [lib]
 name = "fineco_market"

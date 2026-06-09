@@ -9,8 +9,9 @@ use fineco_core::SafeError;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-/// Max characters kept for any external free-text string.
-const MAX_STR: usize = 4096;
+/// Max characters kept for any external free-text string. Shared with the ETF
+/// list path in `client.rs`, which sanitizes its untrusted string fields too.
+pub(crate) const MAX_STR: usize = 4096;
 /// Max entries kept from the scores object.
 const MAX_SCORE_ENTRIES: usize = 64;
 /// Max metric entries kept per analysis section (mirrors the TS `slice(0, 16)`).
@@ -155,13 +156,27 @@ fn pick_str(object: &Value, key: &str) -> Option<String> {
 /// Whitespace-collapsed, trimmed, length-bounded rendering of a JSON value.
 /// Objects/arrays render empty (only primitives carry display text).
 fn clean_value(value: &Value) -> String {
-    let raw = match value {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
+    match value {
+        Value::String(s) => sanitize_text(s),
+        Value::Number(n) => truncate(&n.to_string(), MAX_STR),
         Value::Bool(b) => b.to_string(),
         _ => String::new(),
-    };
-    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+}
+
+/// Sanitize an external free-text string before it reaches the model: replace
+/// every control character (newline, tab, NUL, ANSI/ESC, DEL, C1) with a space,
+/// collapse whitespace runs to single spaces, trim, and length-bound. Applied to
+/// every untrusted free-text field — company overview, metric/score keys and
+/// string values, and the public ETF list's string fields — so a hostile
+/// provider cannot smuggle line breaks or escape sequences (a prompt-injection
+/// channel) into a payload returned to the model.
+pub(crate) fn sanitize_text(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate(&collapsed, MAX_STR)
 }
 
@@ -203,11 +218,14 @@ fn bounded_primitive_map(value: &Value, max: usize) -> Map<String, Value> {
         if !is_primitive(val) {
             continue;
         }
+        // Sanitize string values and keys the same way as company free text:
+        // control-stripped, whitespace-collapsed, length-bounded. Non-string
+        // primitives (numbers/bools) are preserved as their JSON type.
         let bounded = match val {
-            Value::String(s) => Value::String(truncate(s, MAX_STR)),
+            Value::String(s) => Value::String(sanitize_text(s)),
             other => other.clone(),
         };
-        out.insert(key.clone(), bounded);
+        out.insert(sanitize_text(key), bounded);
     }
     out
 }
@@ -335,4 +353,74 @@ fn tokens(value: &str) -> Vec<String> {
         .filter(|t| t.chars().count() > 1 && !STOPWORDS.contains(t))
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Metric/score maps reach the model verbatim today: string values are only
+    /// length-truncated (control chars kept) and keys are copied unbounded and
+    /// unsanitized. Both must be control-stripped, whitespace-collapsed, and
+    /// length-bounded like the company free-text fields, so a hostile provider
+    /// cannot smuggle newlines/ANSI escapes (a prompt-injection channel) or an
+    /// unbounded key into the report.
+    #[test]
+    fn metric_keys_and_string_values_are_sanitized_and_bounded() {
+        let long_key = "k".repeat(MAX_STR + 50);
+        let mut src = Map::new();
+        src.insert("score".to_string(), json!(1.5));
+        src.insert(
+            "ev\u{1b}[31mil\nkey".to_string(),
+            json!("line1\nline2\u{1b}[0m\ttabbed"),
+        );
+        src.insert(long_key.clone(), json!("v"));
+        // A nested object must still be dropped (only primitives kept).
+        src.insert("nested".to_string(), json!({"a": 1}));
+
+        let out = bounded_primitive_map(&Value::Object(src), MAX_SCORE_ENTRIES);
+
+        assert!(
+            !out.contains_key("nested"),
+            "nested objects must be dropped"
+        );
+        for (key, val) in &out {
+            assert!(
+                !key.chars().any(char::is_control),
+                "key still has a control char: {key:?}"
+            );
+            assert!(
+                key.chars().count() <= MAX_STR,
+                "key not length-bounded: {} chars",
+                key.chars().count()
+            );
+            if let Value::String(s) = val {
+                assert!(
+                    !s.chars().any(char::is_control),
+                    "string value still has a control char: {s:?}"
+                );
+            }
+        }
+        // The numeric primitive is preserved as a number, not stringified.
+        assert!(
+            out.values().any(|v| v.as_f64() == Some(1.5)),
+            "numeric score value should be preserved"
+        );
+    }
+
+    /// Company free-text fields share the same sanitizer: the ESC byte of an ANSI
+    /// sequence and an embedded newline/NUL are removed and whitespace collapsed.
+    /// Only the control bytes are stripped — the inert printable remainder of the
+    /// escape (`[31m`) is left as ordinary text rather than lossily mangled.
+    #[test]
+    fn clean_value_strips_control_characters() {
+        let dirty = json!("Acme\u{1b}[31m Corp\nSpA\u{0}");
+        let cleaned = clean_value(&dirty);
+        assert!(
+            !cleaned.chars().any(char::is_control),
+            "clean_value left a control char: {cleaned:?}"
+        );
+        assert_eq!(cleaned, "Acme [31m Corp SpA");
+    }
 }
