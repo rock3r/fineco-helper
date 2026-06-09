@@ -436,6 +436,7 @@ name = "fineco-market"
 version = "0.0.0"
 dependencies = [
  "fineco-core",
+ "flate2",
  "httptiny",
  "mock-enrichment",
  "mock-fineco",

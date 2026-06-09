@@ -82,7 +82,12 @@ Implemented:
   and that the page's never-run `<script>` has no effect.
 - **Enrichment bounds** (gate: *external free text + raw score/metric output are
   size-limited and sanitized*) → same file: oversized page rejected, long text
-  truncated, per-section metrics capped, non-primitive values dropped.
+  truncated, per-section metrics capped, non-primitive values dropped. Plus
+  `crates/fineco-market/tests/gzip_bomb.rs` (a gzip body that inflates past the
+  **decompressed** cap is rejected, not buffered whole — the `.limit()` cap is on
+  compressed bytes only) and unit tests in `report.rs`/`client.rs` (metric/score
+  **keys and string values** and the ETF list's string fields are control-stripped
+  and length-bounded, like the company free-text fields).
 - **Enrichment source allowlist** (gate: *callable only by identifier; fixed host
   allowlist*) → same file + `crates/fineco-market/tests/client.rs`: https + host
   SHA-256 pin + `/stocks/` path; the client builds the URL server-side from a
