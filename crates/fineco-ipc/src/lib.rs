@@ -584,35 +584,45 @@ fn write_frame<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
-/// A `Read` adapter that fails once a wall-clock `deadline` passes.
+/// A `Read` adapter over a `UnixStream` that bounds the TOTAL wall-clock of a
+/// framed read to a `deadline`.
 ///
 /// The socket read timeout (`SO_RCVTIMEO`) re-arms on *every* partial read, so a
 /// peer that trickles one byte just under the timeout could hold a connection —
-/// and the single-consumer accept loop — open indefinitely. Wrapping a framed
-/// read in this bounds the TOTAL wall-clock one request may take, independent of
-/// how the peer paces its bytes, so a slow-loris peer cannot starve the loop.
-pub struct DeadlineReader<'a, R: Read> {
-    inner: &'a mut R,
+/// and the single-consumer accept loop — open indefinitely. Before each read this
+/// caps the stream's read timeout to the REMAINING budget, so even a single
+/// blocking read cannot run past the deadline (a deadline check between reads
+/// alone would let the last read overshoot by up to a full timeout). A
+/// non-positive budget fails closed with `TimedOut`.
+pub struct DeadlineReader<'a> {
+    stream: &'a mut UnixStream,
     deadline: Instant,
 }
 
-impl<'a, R: Read> DeadlineReader<'a, R> {
-    /// Wrap `inner`, failing any read attempted at or after `deadline`.
+impl<'a> DeadlineReader<'a> {
+    /// Wrap `stream`, bounding reads to `deadline`.
     #[must_use]
-    pub fn new(inner: &'a mut R, deadline: Instant) -> Self {
-        Self { inner, deadline }
+    pub fn new(stream: &'a mut UnixStream, deadline: Instant) -> Self {
+        Self { stream, deadline }
     }
 }
 
-impl<R: Read> Read for DeadlineReader<'_, R> {
+impl Read for DeadlineReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if Instant::now() >= self.deadline {
+        let Some(remaining) = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|budget| !budget.is_zero())
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "connection deadline exceeded",
             ));
-        }
-        self.inner.read(buf)
+        };
+        // Cap THIS read to the remaining budget so a blocking socket read cannot run
+        // past the deadline.
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
     }
 }
 

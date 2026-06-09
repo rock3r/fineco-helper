@@ -50,7 +50,16 @@ impl Store {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let staging = parent.join(format!(".fineco-backup-staging-{}", std::process::id()));
+        // Unique per call: pid keeps it distinct across processes, the counter keeps
+        // concurrent backups within one process (e.g. parallel tests, or two backup
+        // roles) from colliding on the same staging directory.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let staging = parent.join(format!(
+            ".fineco-backup-staging-{}-{seq}",
+            std::process::id()
+        ));
         // Clear any stale staging dir from a previously crashed run, then create it
         // empty and tighten it to 0700 BEFORE writing the copy — the brief
         // create→chmod window exposes only an empty directory.
