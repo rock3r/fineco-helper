@@ -402,6 +402,7 @@ dependencies = [
  "fineco-refresh",
  "fineco-store",
  "fineco-worker",
+ "http-body-util",
  "httptiny",
  "jsonwebtoken",
  "mock-fineco",

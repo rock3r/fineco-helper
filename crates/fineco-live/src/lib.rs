@@ -173,7 +173,16 @@ where
     // explicitly via `validate_envelope_keys` (the adjacently-tagged enum alone
     // would silently ignore them) — so a malformed or hostile frame never reaches
     // a fetcher; it becomes a safe error envelope instead.
-    let reply = match fineco_ipc::read_command_message::<_, LiveRequest>(stream) {
+    // Bound the TOTAL read time too, not just each read: the per-read timeout
+    // re-arms on every byte, so a trickling peer needs a wall-clock deadline.
+    let decoded = {
+        let mut reader = fineco_ipc::DeadlineReader::new(
+            stream,
+            std::time::Instant::now() + LIVE_SERVER_TIMEOUT,
+        );
+        fineco_ipc::read_command_message::<_, LiveRequest>(&mut reader)
+    };
+    let reply = match decoded {
         Ok(request) => match handle_live_request(fetcher, request) {
             Ok(body) => LiveReply::Ok(body),
             Err(error) => LiveReply::Err(SafeErrorDto::from(&error)),

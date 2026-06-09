@@ -53,6 +53,7 @@ pub struct StoreError(ErrorKind);
 #[derive(Debug)]
 enum ErrorKind {
     Sqlite(rusqlite::Error),
+    Io(std::io::Error),
     SchemaTooNew { found: i64, supported: i64 },
 }
 
@@ -60,6 +61,7 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
             ErrorKind::Sqlite(e) => write!(f, "sqlite error: {e}"),
+            ErrorKind::Io(e) => write!(f, "io error: {e}"),
             ErrorKind::SchemaTooNew { found, supported } => write!(
                 f,
                 "database schema version {found} is newer than this binary supports ({supported})"
@@ -72,6 +74,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.0 {
             ErrorKind::Sqlite(e) => Some(e),
+            ErrorKind::Io(e) => Some(e),
             ErrorKind::SchemaTooNew { .. } => None,
         }
     }
@@ -80,6 +83,12 @@ impl std::error::Error for StoreError {
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         StoreError(ErrorKind::Sqlite(e))
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(e: std::io::Error) -> Self {
+        StoreError(ErrorKind::Io(e))
     }
 }
 

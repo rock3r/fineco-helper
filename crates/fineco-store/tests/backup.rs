@@ -54,6 +54,50 @@ fn backup_to_produces_a_readable_standalone_copy() {
 }
 
 #[test]
+#[cfg(unix)]
+fn backup_to_restricts_the_copy_to_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    // The backup is a full plaintext copy of sensitive data. It must be owner-only
+    // (0600) regardless of the caller's umask — a manual `fineco-helper backup`
+    // run under the default umask 022 must not leave a world-readable copy.
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let dest = dir.join(format!("fineco-store-backup-mode-{pid}.sqlite"));
+    let _ = std::fs::remove_file(&dest);
+
+    let store = Store::open_in_memory().expect("open");
+    store.backup_to(&dest).expect("backup");
+
+    let mode = std::fs::metadata(&dest).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "backup must be 0600, got {mode:o}");
+
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[test]
+fn backup_to_handles_a_destination_path_with_a_quote() {
+    // The destination path is handled verbatim — the copy is staged internally and
+    // published with `hard_link`, so `dest` never enters SQL at all — and a path
+    // with a single quote (or any other character) works with no escaping burden
+    // and no injection surface.
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let dest = dir.join(format!("fineco-store-backup-qu'ote-{pid}.sqlite"));
+    let _ = std::fs::remove_file(&dest);
+
+    let store = Store::open_in_memory().expect("open");
+    store.backup_to(&dest).expect("backup with a quoted path");
+    assert!(
+        dest.exists(),
+        "the backup file should exist at the quoted path"
+    );
+    // It is a real SQLite copy.
+    Store::open(&dest).expect("re-open the quoted-path backup");
+
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[test]
 fn backup_to_refuses_to_overwrite_an_existing_file() {
     let dir = std::env::temp_dir();
     let pid = std::process::id();

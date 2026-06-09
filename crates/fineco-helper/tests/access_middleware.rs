@@ -141,6 +141,54 @@ async fn without_access_configured_requests_pass() {
     assert_eq!(status, 200, "no Access => initialize passes");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_request_body_is_rejected() {
+    // The rmcp Streamable HTTP handler buffers the whole request body before
+    // parsing, so an oversized body must be rejected up front (413) rather than
+    // allocated whole. Tested without Access to isolate the body-limit layer.
+    let gateway =
+        Gateway::new("/tmp/fineco-helper-bodylimit-unused.sock").with_policy(owner_policy());
+    let app = gateway_router(gateway, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service()).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("http://{addr}/");
+    let outcome = tokio::task::spawn_blocking(move || {
+        // A VALID initialize whose `clientInfo.name` is well over the 256 KiB cap:
+        // old (unbounded) code parses it and returns 200; the cap must reject it.
+        let pad = "x".repeat(512 * 1024);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"{pad}","version":"0"}}}}}}"#
+        );
+        httptiny::post(
+            &base,
+            &[
+                ("Content-Type", "application/json"),
+                ("Accept", "application/json, text/event-stream"),
+            ],
+            &body,
+        )
+        .map(|response| response.status)
+    })
+    .await
+    .expect("join");
+    // The gateway rejects the oversized body either with a clean 413 or — because a
+    // non-proxy client keeps sending after the server rejects early — a connection
+    // reset. Both mean the body was NOT accepted; only the old unbounded path
+    // returned 200. (In production Cloudflare fronts the origin and surfaces the
+    // 413 cleanly.)
+    match outcome {
+        Ok(status) => assert_ne!(status, 200, "an oversized request body must be rejected"),
+        Err(_) => { /* connection reset mid-body = rejected before buffering */ }
+    }
+}
+
 /// A Cloudflare service-token `common_name` (no `email`) — the CLI channel.
 const SERVICE_CN: &str = "78599ba946c2e172fc40b29726e4d835.access";
 

@@ -34,6 +34,9 @@ tokio = { version = "1", default-features = false, features = [
     "net",
     "signal",
 ] }
+# Hard-limit the gateway request body (the rmcp handler buffers the whole body).
+# Already in the tree via axum/hyper; no new crate.
+http-body-util = "0.1"
 
 [dev-dependencies]
 # The Access-middleware test drives the gateway router over loopback: it signs

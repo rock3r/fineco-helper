@@ -306,7 +306,10 @@ The cached-read deployment runs two processes over one local socket:
 **Internal protocols (`fineco-ipc` + `fineco-live`).** Each socket carries only a
 typed command allowlist — schema-validated at **both** ends, bounded, safe-error
 envelope on every failure, no generic-proxy/forbidden fields; length-prefixed
-framing, 8 MiB cap. `refresh-control` returns operation/snapshot **status only**
+framing, 8 MiB cap, plus a per-connection **wall-clock read deadline** on every
+serve loop (the per-read socket timeout re-arms on each byte, so a trickling peer
+can't otherwise hold the single-consumer accept loop open). `refresh-control`
+returns operation/snapshot **status only**
 (never a payload); `fineco-live` returns the typed `New*`/`RawOrder` data the
 controller captures.
 
