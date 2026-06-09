@@ -496,8 +496,11 @@ Restore") — required before the live worker writes real private rows.
 **Pipeline** ([`deploy/backup/fineco-backup.sh`](../deploy/backup/fineco-backup.sh),
 driven by `fineco-backup.timer`, run as `fineco-store`):
 `fineco-helper backup` does an online `VACUUM INTO` (a consistent copy, no host
-`sqlite3` needed), then `gzip`, then `age -r <public recipient>`. The plaintext
-copy lives only in a private `mktemp` dir removed on exit. Output lands in
+`sqlite3` needed), then `gzip`, then `age -r <public recipient>`. The binary itself
+stages the copy in a private `0700` dir and writes it `0600` before publishing
+(so even a manual `fineco-helper backup` under a permissive umask is never exposed);
+the pipeline additionally keeps the plaintext copy only in a private `mktemp` dir
+removed on exit. Output lands in
 `/var/backups/fineco-helper/{daily,weekly,monthly}/` with retention **7 daily / 8
 weekly / 12 monthly**.
 

@@ -256,6 +256,44 @@ fn refresh_request_reply_over_a_unix_socket() {
 }
 
 #[test]
+fn a_panicking_handler_does_not_kill_the_refresh_loop() {
+    // The controller runs on a DETACHED thread; a panic inside its handler must
+    // not unwind out of the accept loop and silently take live refresh down until
+    // a manual restart. A panic must become a safe error reply, and the loop must
+    // keep serving subsequent requests.
+    let path = socket_path("panic");
+    let listener = UnixListener::bind(&path).expect("bind socket");
+    thread::spawn(move || {
+        let _ = serve_refresh_blocking(&listener, |request| match request {
+            RefreshRequest::OrdersRefreshLive(_) => panic!("boom inside the handler"),
+            RefreshRequest::PortfolioRefreshLive => Ok(RefreshOutcome {
+                data_area: "portfolio".to_string(),
+                captured_at: "2026-06-05T10:00:00Z".to_string(),
+                snapshot_id: Some(7),
+                count: 1,
+            }),
+            _ => Err(SafeError::already_refreshing()),
+        });
+    });
+
+    let client = RefreshClient::new(&path);
+    // A handler panic surfaces as the safe `internal` envelope, not a dropped
+    // connection.
+    let err = client
+        .call(&RefreshRequest::OrdersRefreshLive(OrdersRefreshParams {
+            instrument_kind: "equity".to_string(),
+            days: 1,
+        }))
+        .expect_err("a panicking handler should yield a safe error reply");
+    assert_eq!(err.code, "internal");
+    // The accept loop SURVIVED the panic: a later request is still served.
+    let outcome = client
+        .call(&RefreshRequest::PortfolioRefreshLive)
+        .expect("the loop must keep serving after a handler panic");
+    assert_eq!(outcome.snapshot_id, Some(7));
+}
+
+#[test]
 fn the_server_rejects_a_forged_command_without_reaching_the_handler() {
     // A hostile frame (unknown command, smuggled url) must be rejected by the
     // server's re-validation, never reaching the controller's refresh.

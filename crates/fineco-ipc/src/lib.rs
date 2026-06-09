@@ -15,7 +15,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fineco_core::{SafeError, validate_order_request, validate_tax_range};
 use serde::de::DeserializeOwned;
@@ -584,6 +584,48 @@ fn write_frame<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
+/// A `Read` adapter over a `UnixStream` that bounds the TOTAL wall-clock of a
+/// framed read to a `deadline`.
+///
+/// The socket read timeout (`SO_RCVTIMEO`) re-arms on *every* partial read, so a
+/// peer that trickles one byte just under the timeout could hold a connection —
+/// and the single-consumer accept loop — open indefinitely. Before each read this
+/// caps the stream's read timeout to the REMAINING budget, so even a single
+/// blocking read cannot run past the deadline (a deadline check between reads
+/// alone would let the last read overshoot by up to a full timeout). A
+/// non-positive budget fails closed with `TimedOut`.
+pub struct DeadlineReader<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl<'a> DeadlineReader<'a> {
+    /// Wrap `stream`, bounding reads to `deadline`.
+    #[must_use]
+    pub fn new(stream: &'a mut UnixStream, deadline: Instant) -> Self {
+        Self { stream, deadline }
+    }
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(remaining) = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|budget| !budget.is_zero())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection deadline exceeded",
+            ));
+        };
+        // Cap THIS read to the remaining budget so a blocking socket read cannot run
+        // past the deadline.
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
+    }
+}
+
 /// Read one length-prefixed frame, bounding the body before allocating.
 fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
@@ -665,7 +707,12 @@ where
     // Bound a stalled peer so one half-open connection cannot pin the accept loop.
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
-    let raw = read_frame(stream)?;
+    // Bound the TOTAL read time, not just each read: the per-read `SO_RCVTIMEO`
+    // re-arms on every byte, so a trickling peer needs a wall-clock deadline too.
+    let raw = {
+        let mut reader = DeadlineReader::new(stream, Instant::now() + SOCKET_TIMEOUT);
+        read_frame(&mut reader)?
+    };
     let validated = std::str::from_utf8(&raw)
         .map_err(|_| SafeError::invalid_request("Request is not valid UTF-8."))
         .and_then(Request::from_json);
@@ -911,12 +958,27 @@ where
 {
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
-    let raw = read_frame(stream)?;
+    // Bound the TOTAL read time, not just each read (see `serve_one`).
+    let raw = {
+        let mut reader = DeadlineReader::new(stream, Instant::now() + SOCKET_TIMEOUT);
+        read_frame(&mut reader)?
+    };
     let validated = std::str::from_utf8(&raw)
         .map_err(|_| SafeError::invalid_request("Request is not valid UTF-8."))
         .and_then(RefreshRequest::from_json);
     let reply = match validated {
-        Ok(request) => RefreshWireReply::from_result(handler(request)),
+        // Run the handler under `catch_unwind`: this serve loop runs on a DETACHED
+        // thread (the store-server's refresh controller), so a handler panic must
+        // not unwind out of the accept loop and silently take live refresh down
+        // until a manual restart. A panic becomes the safe `internal` envelope and
+        // the loop keeps serving. (The controller tolerates a poisoned store mutex,
+        // so subsequent requests degrade to `internal` rather than re-panicking.)
+        Ok(request) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(request))) {
+                Ok(result) => RefreshWireReply::from_result(result),
+                Err(_) => RefreshWireReply::Err(SafeErrorDto::from(&SafeError::internal())),
+            }
+        }
         Err(error) => RefreshWireReply::Err(SafeErrorDto::from(&error)),
     };
     write_message(stream, &reply)

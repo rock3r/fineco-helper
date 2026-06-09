@@ -548,7 +548,38 @@ pub fn gateway_router(gateway: Gateway, access: Option<Arc<AccessVerifier>>) -> 
             enforce_access,
         ));
     }
-    app
+    // Bound the request body on every request (independent of auth): the rmcp
+    // Streamable HTTP handler buffers the whole body before parsing, so without a
+    // cap an (authenticated) client could force an unbounded allocation. Added
+    // last so it is the OUTERMOST layer and caps before anything reads the body.
+    app.layer(axum::middleware::from_fn(limit_request_body))
+}
+
+/// Cap on the gateway request body. MCP JSON-RPC requests are small (a few KiB);
+/// this is a generous bound against an oversized body, not a tight limit.
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
+
+/// axum middleware bounding the request body. A declared `Content-Length` over the
+/// cap is rejected fast with `413`; the body is then wrapped in a hard limiter so a
+/// chunked or mis-declared body still cannot be buffered past the cap downstream.
+async fn limit_request_body(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(len) = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        && len > MAX_REQUEST_BODY_BYTES as u64
+    {
+        return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let (parts, body) = request.into_parts();
+    let limited = http_body_util::Limited::new(body, MAX_REQUEST_BODY_BYTES);
+    let request = axum::extract::Request::from_parts(parts, axum::body::Body::new(limited));
+    next.run(request).await
 }
 
 /// axum middleware enforcing Cloudflare Access: every request must carry a valid
@@ -655,9 +686,13 @@ pub fn run_store_server(config: StoreServerConfig) -> Result<(), ServeError> {
     // shared IPC group in the multi-user topology). The worker treats every peer
     // as the implicit owner identity, so without this any local principal that
     // could reach the path would bypass the gateway and exercise owner-granted
-    // cached reads directly. (Deployment should additionally keep the socket's
-    // parent directory private; the residual bind→chmod window is sub-millisecond
-    // and same-user-local.)
+    // cached reads directly. The residual bind→chmod window is closed in practice
+    // and not safely closable in std (no `umask`/mode-on-bind without `unsafe`,
+    // which the workspace lint forbids): systemd sets `UMask=0077` so the socket
+    // is born 0600, the parent dir is `2750` (owner + IPC group only), and even
+    // under a permissive umask a Unix socket's umask-derived mode denies `connect`
+    // to non-owners — connecting requires the write bit, which group/other lack at
+    // the 0755 a default umask would produce.
     restrict_socket_permissions(&config.socket_path, config.socket_mode)?;
     fineco_ipc::serve_blocking(&listener, move |request| {
         handler.handle(request, fineco_core::now_epoch_seconds())
