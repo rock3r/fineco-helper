@@ -104,9 +104,11 @@ usermod -aG fineco-policy fineco-store
 > (and any backups) so the repurposed `fineco-worker` retains **no** DB access —
 > this is the one isolation-critical step; remove `fineco-worker` from
 > `fineco-ipc-store`; set the memberships above; install the updated units. Group
-> changes don't affect already-running processes, so restart everything. Since CT
-> 107 holds no data, dropping `/var/lib/fineco-helper` and letting the store-server
-> recreate it fresh as `fineco-store` is the simplest safe path.
+> changes don't affect already-running processes, so restart everything.
+> **Only if this instance has no SQLite history to preserve** (a fresh or test
+> deployment) you may instead drop `/var/lib/fineco-helper` and let the store-server
+> recreate it fresh as `fineco-store` — simpler, but **destructive**. On any instance
+> with data to keep, use the `chown` step above; never drop the directory.
 
 Each socket sits in its own **setgid (`2750`) runtime dir** so the socket inherits
 the dir's IPC group; the binary then chmods the socket to `0660`. The dir is
@@ -398,7 +400,9 @@ deployed to the LXC as `/etc/nftables.conf` and loaded at boot by
 - **Inbound deny-by-default** — no public port is open (the gateway binds
   loopback only; verify with `ss -ltnp | grep -v 127.0.0.1` returning nothing
   for the gateway). The input chain allows loopback, established/related,
-  ICMP/ICMPv6 (PMTUD + IPv6 ND), the DHCP reply, and LAN-only management SSH.
+  ICMP/ICMPv6 (PMTUD + IPv6 ND), and the DHCP reply; LAN-only management SSH is a
+  **commented-out** opt-in template (off by default — uncomment + set your admin
+  subnet to enable).
 - **Egress deny-by-default** — the output chain pins each privileged uid to its
   own targets: the **worker** (`fineco-worker`) and the **gateway**
   (`fineco-gateway`) each reach only the pinned DNS resolver + their own resolved

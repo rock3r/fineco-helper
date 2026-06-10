@@ -16,7 +16,7 @@ jobs:
     name: fmt / clippy / build / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # rustup honors rust-toolchain.toml on first cargo invocation, installing
       # the pinned 1.96.0 toolchain with rustfmt + clippy.
       - name: Toolchain
@@ -38,7 +38,7 @@ jobs:
     name: audit / deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # Build the audit tooling from crates.io source (supply-chain policy: no
       # third-party prebuilt-binary installers).
       # Pin tool versions so CI matches the reviewed config (deny.toml targets
@@ -56,6 +56,6 @@ jobs:
     name: docker e2e
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Docker E2E (mock topology + smoke driver)
         run: ./e2e/run.sh

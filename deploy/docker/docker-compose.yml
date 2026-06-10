@@ -78,7 +78,9 @@ services:
 
   # The only client of the gateway's loopback bind; shares its netns to reach it.
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    # Pinned to a version + digest (not `:latest`) so the tunnel sidecar holding
+    # the TUNNEL_TOKEN can't drift; bump deliberately.
+    image: cloudflare/cloudflared:2026.6.0@sha256:ba461b8aa9c042156dbd39c38657fe7431bafa063220eab8d5330a523863da9f
     command: ["tunnel", "run"]
     env_file: ["./config/cloudflared.env"]         # TUNNEL_TOKEN
     network_mode: "service:gateway"
