@@ -5,10 +5,13 @@
 # compose `command`.
 
 # --- build stage -----------------------------------------------------------
-FROM rust:1.96-slim-bookworm AS build
+# Digest-pinned to match the release-build toolchain image (no tag drift).
+FROM rust:1.96-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release \
+# `--locked` so the e2e image builds the SAME dependency set `cargo audit`/`deny`
+# reviewed (against the committed Cargo.lock), never a silently re-resolved one.
+RUN cargo build --release --locked \
     --bin mock-fineco \
     --bin mock-enrichment \
     --bin smoke \

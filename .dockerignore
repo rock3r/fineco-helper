@@ -11,3 +11,22 @@ enrichment-reports/
 .plans/
 *.log
 .DS_Store
+# Secrets, host config, and private captures — gitignored, and must ALSO stay out
+# of every Docker build context: the build Dockerfiles `COPY . .` from the repo
+# root, so without these a filled-in secret file (or a local capture holding
+# private portfolio/session data) on disk would bake into a build-stage layer (and
+# the local layer cache). Keep in sync with .gitignore's secret + private sections.
+deploy/config/*.env
+deploy/docker/config/
+e2e/spike/cf-spike.env
+diag.sh
+diag-*.sh
+*.diag.sh
+# Local reports / captured pages may contain private portfolio/session data.
+*.html
+*.local.html
+*.local.json
+*.local.csv
+# …but keep the clearly-marked SYNTHETIC e2e fixture in the context (the build
+# needs it), mirroring .gitignore's negation.
+!e2e/fixtures/enrichment/stock.html

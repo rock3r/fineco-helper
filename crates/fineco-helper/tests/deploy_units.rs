@@ -25,6 +25,45 @@ fn active_lines(body: &str) -> Vec<String> {
         .collect()
 }
 
+/// A repo-root file (one level above `deploy/`).
+fn repo_file(rel: &str) -> String {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("../..");
+    path.push(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// Every gitignored SECRET / host-config pattern must ALSO be excluded from the
+/// Docker build context: the build Dockerfiles `COPY . .` from the repo root, so a
+/// filled-in secret file on disk would otherwise bake into a build-stage layer (and
+/// the local layer cache). Keeps `.dockerignore` from drifting out of sync with the
+/// `.gitignore` secret section.
+#[test]
+fn dockerignore_excludes_every_gitignored_secret() {
+    let active = active_lines(&repo_file(".dockerignore"));
+    for pattern in [
+        // secret / host config
+        "deploy/config/*.env",
+        "deploy/docker/config/",
+        "e2e/spike/cf-spike.env",
+        "diag.sh",
+        "diag-*.sh",
+        "*.diag.sh",
+        ".plans/",
+        // private captures / reports (may hold portfolio/session data)
+        "*.html",
+        "*.local.html",
+        "*.local.json",
+        "*.local.csv",
+    ] {
+        assert!(
+            active.iter().any(|line| line == pattern),
+            ".dockerignore must exclude the gitignored secret pattern `{pattern}` \
+             (the Docker build context COPYs the repo root)"
+        );
+    }
+}
+
 /// The effective (last-wins) value of a `Key=Value` systemd directive among the
 /// active lines.
 fn effective<'a>(lines: &'a [String], key: &str) -> Option<&'a str> {

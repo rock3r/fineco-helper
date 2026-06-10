@@ -73,8 +73,10 @@ install -m0755 "$DEPLOY"/alerting/fineco-alert.sh /usr/local/libexec/fineco-aler
 
 echo "== backup output dir (owned by the backup user; default FINECO_BACKUP_DIR) =="
 # The backup unit runs as fineco-store and writes here; /var/backups is root-owned,
-# so pre-create this owned by fineco-store or the first backup fails.
-install -d -m0750 -o fineco-store -g fineco-store /var/backups/fineco-helper
+# so pre-create this owned by fineco-store or the first backup fails. 0700
+# (owner-only) — the backup user is the only principal that needs it; matches the
+# DEPLOYMENT.md runbook.
+install -d -m0700 -o fineco-store -g fineco-store /var/backups/fineco-helper
 
 echo "== firewall template (installed + syntax-checked, NOT applied) =="
 install -m0644 "$DEPLOY"/firewall/fineco-egress.nft /etc/nftables.conf
