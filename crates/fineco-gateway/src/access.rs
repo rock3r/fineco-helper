@@ -241,6 +241,10 @@ pub fn fetch_jwks(jwks_url: &str) -> Result<JwkSet, AccessError> {
         .http_status_as_error(false)
         .max_redirects(0)
         .max_redirects_will_error(false)
+        // Ignore proxy env vars (ureq honors them by default): the JWKS fetch is
+        // egress-pinned to the Access issuer origin and must not be rerouted
+        // through an env-injected proxy.
+        .proxy(None)
         // Bound the whole fetch: a JWKS endpoint that accepts the connection but
         // stalls must not block gateway startup (the startup fetch runs before the
         // bind) or wedge the background refresh thread forever.

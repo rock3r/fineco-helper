@@ -131,6 +131,10 @@ impl MarketClient {
             .http_status_as_error(false)
             .max_redirects(0)
             .max_redirects_will_error(false)
+            // Ignore proxy env vars (ureq honors them by default): the market path
+            // is egress-pinned to its allowlisted hosts and must not be rerouted
+            // through an env-injected proxy.
+            .proxy(None)
             .timeout_global(Some(fetch_timeout))
             .build();
         Self {

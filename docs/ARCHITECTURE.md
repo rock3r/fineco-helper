@@ -94,7 +94,9 @@ Product (`crates/`):
   `refresh_tax` (each = one `job_runs` row), the pre-flight gate
   `refresh_preflight` (cooldown / daily budget (UTC day) / circuit breaker — a
   denial creates no row), and `RetryPolicy`/`with_retry`/`Retrying<F>` (retry a
-  retryable Fineco blip **inside** one fetch → one row).
+  transient upstream/timeout blip — the same `fineco_timeout`/`fineco_upstream_error`
+  codes the breaker keys on, **not** a 429/auth — **inside** one fetch → one row, so
+  a rate-limited bank is never hammered with re-logins).
 - **`crates/fineco-worker`** (M3) — the **sole credential holder** and the only
   component that mints/holds a Fineco session cookie and reaches the live Fineco
   endpoints. Logs in and performs allowlisted read-only requests against
@@ -114,7 +116,10 @@ Product (`crates/`):
   `gdate`/`store-sessionid`/`finecoLogin`) the WAF expects present — random/
   timestamped, non-secret, entropy from `/dev/urandom` (no added dependency) —
   and the reads replay that jar plus the session. Session is **stateless per
-  call** (login → use on the stack → discard). Uses `ureq`+rustls. Depends on `fineco-core`, `fineco-store` (the
+  call** (login → use on the stack → discard). The Fineco **password and session
+  cookies are zeroized on drop** (`zeroize::Zeroizing`, owner-approved credentialed
+  dep), and the agent **ignores proxy env vars** (`.proxy(None)`) so an env-injected
+  proxy can't reroute the credentialed login. Uses `ureq`+rustls. Depends on `fineco-core`, `fineco-store` (the
   `New*`/`RawOrder` types), `fineco-refresh` (the fetcher traits). No
   payloads/secrets logged; failures map to `SafeError`. Behind the live socket it
   is the server half of `fineco-live` (the binary's `private-worker` role).
