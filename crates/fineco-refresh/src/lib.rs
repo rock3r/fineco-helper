@@ -433,14 +433,18 @@ impl RetryPolicy {
     }
 }
 
-/// Run `op`, retrying ONLY on retryable errors (5xx/timeout — see
-/// [`SafeError::retryable`]) up to `policy.max_attempts`, sleeping
-/// `base * 2^(n-1)` before retry `n`. Non-retryable errors (auth/validation)
-/// return immediately so a credential or input problem is not hammered.
+/// Run `op`, retrying ONLY on transient upstream/timeout failures (the same
+/// `fineco_timeout`/`fineco_upstream_error` codes that trip the circuit breaker —
+/// see [`is_upstream_failure`]) up to `policy.max_attempts`, sleeping
+/// `base * 2^(n-1)` before retry `n`. Everything else returns immediately —
+/// crucially a 429 (`rate_limited`): although it is `retryable` in the
+/// client-facing sense (try LATER), re-driving the fetch in-job re-runs the login
+/// POST and hammers a bank that just rate-limited us. Auth/validation/not-found
+/// failures are likewise not hammered.
 ///
 /// # Errors
 /// The last error from `op` once attempts are exhausted, or the first
-/// non-retryable error.
+/// non-retried error.
 pub fn with_retry<T>(
     policy: &RetryPolicy,
     mut op: impl FnMut() -> Result<T, SafeError>,
@@ -452,7 +456,11 @@ pub fn with_retry<T>(
     loop {
         match op() {
             Ok(value) => return Ok(value),
-            Err(err) if err.retryable() && attempt < max_attempts => {
+            Err(err)
+                if err.retryable()
+                    && is_upstream_failure(Some(err.code()))
+                    && attempt < max_attempts =>
+            {
                 let backoff = policy
                     .backoff_base
                     .saturating_mul(2u32.saturating_pow(attempt - 1));
@@ -929,6 +937,24 @@ mod tests {
         });
         assert_eq!(out.expect_err("auth not retried").code(), "auth_required");
         assert_eq!(calls.get(), 1, "auth failures must not be retried");
+    }
+
+    #[test]
+    fn with_retry_does_not_retry_a_rate_limit() {
+        // A 429 from Fineco is `retryable` (a client may try LATER) but must NOT be
+        // auto-retried in-job: re-driving the fetch immediately re-runs the login
+        // POST and hammers a bank that just rate-limited us (risking lockout). Only
+        // transient upstream/timeout failures are retried in-job.
+        let calls = Cell::new(0u32);
+        let out: Result<u8, SafeError> = with_retry(&RetryPolicy::immediate(5), || {
+            calls.set(calls.get() + 1);
+            Err(SafeError::rate_limited())
+        });
+        assert_eq!(
+            out.expect_err("rate limit not retried").code(),
+            "rate_limited"
+        );
+        assert_eq!(calls.get(), 1, "a 429 must not be auto-retried in-job");
     }
 
     #[test]

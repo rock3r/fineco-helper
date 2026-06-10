@@ -6,16 +6,19 @@
 //! never a real credential.
 
 use fineco_core::SafeError;
+use zeroize::Zeroizing;
 
 /// A Fineco login credential, held only transiently during a login.
 ///
 /// Deliberately does NOT derive `Debug`/`Clone`-with-logging affordances: the
-/// password must never be formatted into a log or error.
+/// password must never be formatted into a log or error. The password is wrapped
+/// in [`Zeroizing`] so its heap buffer is zeroed when the credential drops (after
+/// each login), rather than lingering in freed pages.
 pub struct FinecoCredential {
     /// Fineco user id.
     pub user_id: String,
-    /// Fineco password.
-    pub password: String,
+    /// Fineco password (zeroed on drop).
+    pub password: Zeroizing<String>,
 }
 
 impl FinecoCredential {
@@ -24,7 +27,7 @@ impl FinecoCredential {
     pub fn new(user_id: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             user_id: user_id.into(),
-            password: password.into(),
+            password: Zeroizing::new(password.into()),
         }
     }
 }
@@ -39,10 +42,12 @@ pub trait CredentialSource {
     fn load(&self) -> Result<FinecoCredential, SafeError>;
 }
 
-/// Credentials held in memory — from config, or synthetic values in tests.
+/// Credentials held in memory — from config, or synthetic values in tests. The
+/// password is zeroed on drop (the source can outlive a process, so its in-memory
+/// copy is wrapped too, not just the per-login [`FinecoCredential`]).
 pub struct StaticCredentialSource {
     user_id: String,
-    password: String,
+    password: Zeroizing<String>,
 }
 
 impl StaticCredentialSource {
@@ -51,7 +56,7 @@ impl StaticCredentialSource {
     pub fn new(user_id: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             user_id: user_id.into(),
-            password: password.into(),
+            password: Zeroizing::new(password.into()),
         }
     }
 }
@@ -60,7 +65,7 @@ impl CredentialSource for StaticCredentialSource {
     fn load(&self) -> Result<FinecoCredential, SafeError> {
         Ok(FinecoCredential::new(
             self.user_id.clone(),
-            self.password.clone(),
+            self.password.as_str(),
         ))
     }
 }
@@ -103,7 +108,7 @@ mod tests {
         let credential = credential_from_parts(Some("user".into()), Some("pass".into()))
             .expect("complete credential");
         assert_eq!(credential.user_id, "user");
-        assert_eq!(credential.password, "pass");
+        assert_eq!(credential.password.as_str(), "pass");
     }
 
     #[test]

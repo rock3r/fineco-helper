@@ -27,8 +27,10 @@ pub use endpoints::FinecoEndpoints;
 use fineco_core::{SafeError, validate_order_request, validate_tax_range};
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ureq::Agent;
+use zeroize::Zeroizing;
 
 /// Cap on an authenticated JSON response body, so a hostile/buggy upstream
 /// cannot drive unbounded memory in the sole credential-holding process.
@@ -122,6 +124,12 @@ impl FinecoWorker {
             .http_status_as_error(false)
             .max_redirects(0)
             .max_redirects_will_error(false)
+            // Ignore proxy environment variables (`HTTPS_PROXY`/`ALL_PROXY`/…):
+            // ureq honors them by default, which would let an env-injection
+            // mistake silently reroute the credentialed login through an
+            // attacker-chosen proxy. The worker talks only to its fixed,
+            // egress-pinned Fineco endpoints — no proxy, ever.
+            .proxy(None)
             .timeout_global(Some(http_timeout))
             .build();
         Self {
@@ -135,7 +143,7 @@ impl FinecoWorker {
     /// cookies the login then needs (mirrors the TS reference). Returns the
     /// collected `Cookie` header value (possibly empty); a non-2xx home is not
     /// fatal — login still proceeds.
-    fn preflight(&self) -> Result<String, SafeError> {
+    fn preflight(&self) -> Result<Zeroizing<String>, SafeError> {
         ensure_secure_transport(&self.endpoints.home)?;
         let response = with_headers(self.agent.get(&self.endpoints.home), BROWSER_HEADERS)
             .header(
@@ -151,7 +159,7 @@ impl FinecoWorker {
 
     /// Log in and return the session `Cookie` header value (in memory only),
     /// merged with any preflight cookies the reads then replay.
-    fn login(&self) -> Result<String, SafeError> {
+    fn login(&self) -> Result<Zeroizing<String>, SafeError> {
         // Never send the credential over cleartext to a non-loopback host.
         ensure_secure_transport(&self.endpoints.login)?;
         let preflight_cookie = self.preflight()?;
@@ -161,26 +169,41 @@ impl FinecoWorker {
         // `auth.invalid.credentials`) — mirrors the TS reference's
         // `synthetic_public_cookies()`. When the preflight DID set cookies, replay
         // those instead; the two are mutually exclusive (as in the reference).
-        let login_cookie = if preflight_cookie.is_empty() {
-            synthetic_public_cookies()
+        let login_cookie: Zeroizing<String> = if preflight_cookie.is_empty() {
+            // Synthetic public cookies are not secret, but wrap them so both
+            // branches share the zeroized type.
+            Zeroizing::new(synthetic_public_cookies())
         } else {
             preflight_cookie
         };
 
         let credential = self.credentials.load()?;
-        let body = serde_json::json!({
-            "userId": credential.user_id,
-            "password": credential.password,
-        });
+        // Serialize from borrowed fields so no intermediate `serde_json::Value`
+        // owns a second, un-zeroized copy of the password.
+        #[derive(Serialize)]
+        struct LoginBody<'a> {
+            #[serde(rename = "userId")]
+            user_id: &'a str,
+            password: &'a str,
+        }
+        let body = LoginBody {
+            user_id: &credential.user_id,
+            password: credential.password.as_str(),
+        };
+        // Serialize into a ZEROIZED buffer and send raw JSON bytes — not
+        // `send_json`, whose internal `Vec<u8>` would hold an un-zeroized copy of
+        // the password. (ureq/rustls still buffer the bytes to write them to the
+        // socket; that copy is outside our control and is the irreducible residual.)
+        let json = Zeroizing::new(serde_json::to_vec(&body).map_err(|_| SafeError::internal())?);
         let mut request = with_headers(self.agent.post(&self.endpoints.login), BROWSER_HEADERS)
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .header("Origin", LOGIN_ORIGIN)
             .header("Referer", LOGIN_REFERER);
         if !login_cookie.is_empty() {
-            request = request.header("Cookie", &login_cookie);
+            request = request.header("Cookie", login_cookie.as_str());
         }
-        let response = request.send_json(body).map_err(map_transport_error)?;
+        let response = request.send(&json[..]).map_err(map_transport_error)?;
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
@@ -329,8 +352,10 @@ fn with_headers<B>(
 
 /// Merge two `Cookie` header values (preflight + session), deduplicating by
 /// cookie name with the later value winning, preserving first-seen order.
-fn merge_cookies(first: &str, second: &str) -> String {
-    let mut pairs: Vec<(String, String)> = Vec::new();
+fn merge_cookies(first: &str, second: &str) -> Zeroizing<String> {
+    // The cookie *values* carry session material, so each owned fragment is held
+    // in a `Zeroizing<String>` (the name, used only for dedup, is not secret).
+    let mut pairs: Vec<(String, Zeroizing<String>)> = Vec::new();
     for raw in first.split("; ").chain(second.split("; ")) {
         let pair = raw.trim();
         if pair.is_empty() {
@@ -338,15 +363,17 @@ fn merge_cookies(first: &str, second: &str) -> String {
         }
         let name = pair.split('=').next().unwrap_or(pair).to_string();
         match pairs.iter_mut().find(|(existing, _)| *existing == name) {
-            Some(slot) => slot.1 = pair.to_string(),
-            None => pairs.push((name, pair.to_string())),
+            Some(slot) => slot.1 = Zeroizing::new(pair.to_string()),
+            None => pairs.push((name, Zeroizing::new(pair.to_string()))),
         }
     }
-    pairs
-        .iter()
-        .map(|(_, value)| value.as_str())
-        .collect::<Vec<_>>()
-        .join("; ")
+    Zeroizing::new(
+        pairs
+            .iter()
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 /// Refuse to send the credential or session cookie over cleartext to a
@@ -374,16 +401,18 @@ fn map_transport_error(err: ureq::Error) -> SafeError {
 /// Build a `Cookie` request-header value from a response's `Set-Cookie`
 /// headers: take each cookie's `name=value` pair (before the first `;`) and
 /// join with `; `.
-fn cookie_header_from(headers: &ureq::http::HeaderMap) -> String {
-    headers
-        .get_all(ureq::http::header::SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .filter_map(|set_cookie| set_cookie.split(';').next())
-        .map(str::trim)
-        .filter(|pair| !pair.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ")
+fn cookie_header_from(headers: &ureq::http::HeaderMap) -> Zeroizing<String> {
+    Zeroizing::new(
+        headers
+            .get_all(ureq::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|set_cookie| set_cookie.split(';').next())
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 /// Mint the synthetic public cookies the real Fineco home page would otherwise
@@ -503,7 +532,28 @@ fn random_below(bound: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::synthetic_public_cookies;
+    use super::{FinecoEndpoints, FinecoWorker, StaticCredentialSource};
     use std::collections::HashMap;
+
+    /// The credentialed worker must NEVER honor a proxy from the environment:
+    /// ureq honors `HTTPS_PROXY`/`ALL_PROXY`/… by default, which would let an
+    /// env-injection mistake reroute the credentialed login through an
+    /// attacker-chosen proxy. We pin `proxy(None)`, so the built agent's config
+    /// carries no proxy. (The adversarial env-hijack scenario isn't unit-testable
+    /// here: `std::env::set_var` is `unsafe` on edition 2024 and the workspace
+    /// lint forbids `unsafe`; this asserts the resulting config invariant.)
+    #[test]
+    fn the_worker_agent_does_not_honor_proxy_env_vars() {
+        let worker = FinecoWorker::new_with_timeout(
+            FinecoEndpoints::for_base("https://example.invalid"),
+            Box::new(StaticCredentialSource::new("u", "p")),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            worker.agent.config().proxy().is_none(),
+            "the credentialed worker must not honor a proxy from the environment"
+        );
+    }
 
     /// Split a `name=value; name=value` cookie header into a name→value map.
     fn parse(header: &str) -> HashMap<String, String> {
