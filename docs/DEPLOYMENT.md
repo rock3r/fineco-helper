@@ -104,9 +104,11 @@ usermod -aG fineco-policy fineco-store
 > (and any backups) so the repurposed `fineco-worker` retains **no** DB access —
 > this is the one isolation-critical step; remove `fineco-worker` from
 > `fineco-ipc-store`; set the memberships above; install the updated units. Group
-> changes don't affect already-running processes, so restart everything. Since the
-> LXC holds no data, dropping `/var/lib/fineco-helper` and letting the store-server
-> recreate it fresh as `fineco-store` is the simplest safe path.
+> changes don't affect already-running processes, so restart everything.
+> **Only if this instance has no SQLite history to preserve** (a fresh or test
+> deployment) you may instead drop `/var/lib/fineco-helper` and let the store-server
+> recreate it fresh as `fineco-store` — simpler, but **destructive**. On any instance
+> with data to keep, use the `chown` step above; never drop the directory.
 
 Each socket sits in its own **setgid (`2750`) runtime dir** so the socket inherits
 the dir's IPC group; the binary then chmods the socket to `0660`. The dir is
