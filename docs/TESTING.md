@@ -79,7 +79,8 @@ Implemented:
   executed*) → `crates/fineco-market/tests/enrichment.rs`. Structural: the parse
   path is `extract → normalize → serde_json` with no `eval`/`Function`/JS engine
   anywhere; tests assert a code-looking embedded value is kept verbatim as data
-  and that the page's never-run `<script>` has no effect.
+  and that the page's never-run `<script>` has no effect. The same suite covers
+  both equity-style `company` cache entries and ETF/fund-style profile entries.
 - **Enrichment bounds** (gate: *external free text + raw score/metric output are
   size-limited and sanitized*) → same file: oversized page rejected, long text
   truncated, per-section metrics capped, non-primitive values dropped. Plus

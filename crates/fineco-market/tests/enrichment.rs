@@ -98,6 +98,83 @@ fn extracts_company_scores_and_metrics() {
 }
 
 #[test]
+fn extracts_fund_scores_and_metrics_from_etf_pages() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": {
+            "data": {
+              "data": {
+                "name": "Fallback ETF Name",
+                "unique_symbol": "LSE:VHYL",
+                "exchange_symbol": "LSE",
+                "isin_symbol": "IE00B8GKDB10",
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "fund_info": {
+                              "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                              "unique_symbol": "LSE:VHYL",
+                              "exchange_symbol": "LSE",
+                              "isin_symbol": "IE00B8GKDB10",
+                              "country": "Ireland",
+                              "url": "https://www.vanguard.example",
+                              "description": "Synthetic ETF profile."
+                            }
+                          }
+                        },
+                        "analysis": {
+                          "value": { "expense_ratio": 0.0029 },
+                          "future": {},
+                          "past": {},
+                          "health": {},
+                          "dividend": { "yield": 0.037 },
+                          "management": {}
+                        },
+                        "scores": { "value": 3, "dividend": 5, "total": 16 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF"),
+    )
+    .expect("fund-style ETF report should build");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+    assert_eq!(report.company.isin, "IE00B8GKDB10");
+    assert_eq!(report.company.country, "Ireland");
+    assert_eq!(
+        report.metrics["value"]["expense_ratio"],
+        serde_json::json!(0.0029)
+    );
+    assert_eq!(
+        report.metrics["dividend"]["yield"],
+        serde_json::json!(0.037)
+    );
+    assert_eq!(report.scores["total"], serde_json::json!(16));
+    assert_eq!(report.title_match.expect("a title match").verdict, "strong");
+}
+
+#[test]
 fn parse_is_data_only_not_execution() {
     // A metric value that looks like injected code is kept verbatim as data —
     // never interpreted. (Reaching this assertion at all means nothing ran it.)

@@ -1,6 +1,6 @@
 //! Build a bounded, structured enrichment report from the parsed query cache.
 //!
-//! Navigates the React-Query cache to the `company` entry, extracts the company
+//! Navigates the React-Query cache to a profile entry, extracts the company/fund
 //! overview, scores, and per-section metrics, and optionally scores a Fineco
 //! title match. All external free text and raw score/metric output is
 //! size-limited and reduced to primitives — never echoed unbounded.
@@ -16,6 +16,12 @@ pub(crate) const MAX_STR: usize = 4096;
 const MAX_SCORE_ENTRIES: usize = 64;
 /// Max metric entries kept per analysis section (mirrors the TS `slice(0, 16)`).
 const MAX_METRICS_PER_SECTION: usize = 16;
+/// React-Query profile keys observed for enrichment pages. Equities use
+/// `company`; ETF/fund pages can use fund-oriented keys with the same nested
+/// analysis shape.
+const PROFILE_QUERY_KEYS: [&str; 3] = ["company", "fund", "etf"];
+/// Raw-info object keys observed under `raw_data.data`.
+const RAW_INFO_KEYS: [&str; 3] = ["company_info", "fund_info", "asset_info"];
 /// The analysis sections surfaced as metrics, in order.
 const METRIC_SECTIONS: [&str; 6] = [
     "value",
@@ -65,44 +71,46 @@ pub struct EnrichmentReport {
 /// validated `source_url`. If `fineco_title` is given, include a title match.
 ///
 /// # Errors
-/// Returns [`SafeError::invalid_request`] if the cache lacks a `company` entry.
+/// Returns [`SafeError::invalid_request`] if the cache lacks a recognized
+/// profile entry.
 pub(crate) fn build_report(
     state: &Value,
     source_url: &str,
     captured_at: &str,
     fineco_title: Option<&str>,
 ) -> Result<EnrichmentReport, SafeError> {
-    let company_root = query(state, "company")
+    let profile_root = profile_query(state)
         .and_then(|data| data.get("data"))
-        .ok_or_else(|| SafeError::invalid_request("Enrichment page has no company data."))?;
+        .ok_or_else(|| SafeError::invalid_request("Enrichment page has no profile data."))?;
 
-    let extended = company_root
+    let extended = profile_root
         .pointer("/analysis/data/extended/data")
         .unwrap_or(&Value::Null);
     let raw = extended.pointer("/raw_data/data").unwrap_or(&Value::Null);
     let analysis = extended.get("analysis").unwrap_or(&Value::Null);
     let scores_src = extended
         .get("scores")
-        .or_else(|| company_root.pointer("/score/data"))
+        .or_else(|| profile_root.pointer("/score/data"))
         .unwrap_or(&Value::Null);
 
-    let info = raw
-        .get("company_info")
-        .or_else(|| company_root.get("info"))
+    let info = RAW_INFO_KEYS
+        .into_iter()
+        .find_map(|key| raw.get(key))
+        .or_else(|| profile_root.get("info"))
         .unwrap_or(&Value::Null);
 
     let company = CompanyOverview {
         name: pick_str(info, "name")
-            .or_else(|| pick_str(company_root, "name"))
+            .or_else(|| pick_str(profile_root, "name"))
             .unwrap_or_default(),
         ticker: pick_str(info, "unique_symbol")
-            .or_else(|| pick_str(company_root, "unique_symbol"))
+            .or_else(|| pick_str(profile_root, "unique_symbol"))
             .unwrap_or_default(),
         exchange: pick_str(info, "exchange_symbol")
-            .or_else(|| pick_str(company_root, "exchange_symbol"))
+            .or_else(|| pick_str(profile_root, "exchange_symbol"))
             .unwrap_or_default(),
         isin: pick_str(info, "isin_symbol")
-            .or_else(|| pick_str(company_root, "isin_symbol"))
+            .or_else(|| pick_str(profile_root, "isin_symbol"))
             .unwrap_or_default(),
         country: pick_str(info, "country").unwrap_or_default(),
         website: pick_str(info, "url").unwrap_or_default(),
@@ -131,6 +139,14 @@ pub(crate) fn build_report(
         title_match,
         warnings,
     })
+}
+
+/// Find the first recognized company/fund profile cache entry and return its
+/// `state.data`.
+fn profile_query(state: &Value) -> Option<&Value> {
+    PROFILE_QUERY_KEYS
+        .into_iter()
+        .find_map(|name| query(state, name))
 }
 
 /// Find a React-Query cache entry by name and return its `state.data`.
@@ -285,6 +301,8 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
 
     let fineco_tokens = tokens(fineco_title);
     let source_tokens = tokens(&enrichment_title);
+    let normalized_fineco_title = normalize_title_text(fineco_title);
+    let normalized_company_name = normalize_title_text(&company.name);
     let overlap: Vec<String> = fineco_tokens
         .iter()
         .filter(|t| source_tokens.contains(*t))
@@ -300,6 +318,13 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
     let mut score = 0.0_f64;
     let mut reasons = Vec::new();
 
+    if !normalized_company_name.is_empty()
+        && (normalized_fineco_title.contains(&normalized_company_name)
+            || normalized_company_name.contains(&normalized_fineco_title))
+    {
+        score += 0.4;
+        reasons.push("name match".to_string());
+    }
     if !company.isin.is_empty()
         && fineco_title
             .to_lowercase()
@@ -353,6 +378,10 @@ fn tokens(value: &str) -> Vec<String> {
         .filter(|t| t.chars().count() > 1 && !STOPWORDS.contains(t))
         .map(str::to_string)
         .collect()
+}
+
+fn normalize_title_text(value: &str) -> String {
+    tokens(value).join(" ")
 }
 
 #[cfg(test)]
