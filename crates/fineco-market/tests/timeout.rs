@@ -58,7 +58,7 @@ fn a_stalled_enrichment_endpoint_times_out() {
         Duration::from_millis(750),
     );
     let err = client
-        .fetch_enrichment("it/sector/exchange/acme", None, "2026-06-05T00:00:00Z")
+        .fetch_enrichment("BIT/TIP", None, "2026-06-05T00:00:00Z")
         .expect_err("a stalled enrichment endpoint must time out, not hang");
     assert_eq!(
         err.code(),
@@ -123,7 +123,7 @@ fn a_stalled_enrichment_response_body_times_out() {
         Duration::from_millis(750),
     );
     let err = client
-        .fetch_enrichment("it/sector/exchange/acme", None, "2026-06-05T00:00:00Z")
+        .fetch_enrichment("BIT/TIP", None, "2026-06-05T00:00:00Z")
         .expect_err("a stalled response body must time out");
     assert_eq!(
         err.code(),

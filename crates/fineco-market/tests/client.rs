@@ -55,16 +55,23 @@ fn client_for(enrichment_base: &str, etf_url: &str) -> MarketClient {
 
 #[test]
 fn fetches_and_parses_enrichment_over_http() {
-    let enrichment = spawn(mock_enrichment::route);
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
     let etf = spawn(mock_fineco::route);
     let client = client_for(&enrichment, &format!("{etf}{ETF_PATH}"));
 
     let report = client
-        .fetch_enrichment(
-            "it/diversified-financials/syn-tip/synth-shares",
-            Some("Tamburi Investment Partners IT0003153621"),
-            NOW,
-        )
+        .fetch_enrichment("BIT/TIP", Some("IT0003153621"), NOW)
         .expect("enrichment fetch should succeed");
 
     assert_eq!(
@@ -75,15 +82,11 @@ fn fetches_and_parses_enrichment_over_http() {
     assert_eq!(report.company.isin, "IT0003153621");
     assert_eq!(report.metrics["value"]["pe"], serde_json::json!(12.3));
     assert_eq!(report.scores["total"], serde_json::json!(20));
-    assert_eq!(report.title_match.expect("a match").verdict, "strong");
-    assert_eq!(
-        report.source_url,
-        format!("{enrichment}/stocks/it/diversified-financials/syn-tip/synth-shares")
-    );
+    assert_eq!(report.source_url, format!("{enrichment}/stock/BIT/TIP"));
 }
 
 #[test]
-fn two_segment_identifier_fetches_singular_stock_page_path() {
+fn qualified_identifier_fetches_singular_stock_page_path() {
     let enrichment = spawn(|req| {
         let path = req.path.split('?').next().unwrap_or(&req.path);
         if req.method == "GET" && path == "/stock/LSE/VHYL" {
@@ -100,18 +103,18 @@ fn two_segment_identifier_fetches_singular_stock_page_path() {
     let client = client_for(&enrichment, &format!("{etf}{ETF_PATH}"));
 
     let report = client
-        .fetch_enrichment("LSE/VHYL", Some("VHYL"), NOW)
-        .expect("two-segment stock-page identifier should fetch /stock/");
+        .fetch_enrichment("LSE/VHYL", Some("IT0003153621"), NOW)
+        .expect("qualified ticker identifier should fetch /stock/");
 
     assert_eq!(report.source_url, format!("{enrichment}/stock/LSE/VHYL"));
     assert_eq!(report.company.ticker, "BIT:TIP");
 }
 
 #[test]
-fn lowercase_two_segment_slug_keeps_plural_stocks_path() {
+fn colon_qualified_identifier_is_normalized_to_slash_route() {
     let enrichment = spawn(|req| {
         let path = req.path.split('?').next().unwrap_or(&req.path);
-        if req.method == "GET" && path == "/stocks/it/synth-shares" {
+        if req.method == "GET" && path == "/stock/LSE/VHYL" {
             mock_enrichment::route(&httptiny::Request {
                 method: req.method.clone(),
                 path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
@@ -125,14 +128,35 @@ fn lowercase_two_segment_slug_keeps_plural_stocks_path() {
     let client = client_for(&enrichment, &format!("{etf}{ETF_PATH}"));
 
     let report = client
-        .fetch_enrichment("it/synth-shares", Some("Synthetic Shares"), NOW)
-        .expect("two-segment slug should keep /stocks/");
+        .fetch_enrichment("lse:vhyl", Some("IT0003153621.AF"), NOW)
+        .expect("colon-qualified ticker should normalize to slash route");
 
-    assert_eq!(
-        report.source_url,
-        format!("{enrichment}/stocks/it/synth-shares")
-    );
+    assert_eq!(report.source_url, format!("{enrichment}/stock/LSE/VHYL"));
     assert_eq!(report.company.ticker, "BIT:TIP");
+}
+
+#[test]
+fn bare_ticker_is_rejected_before_fetching() {
+    let client = client_for("http://127.0.0.1:9", "http://127.0.0.1:9/etf");
+    let err = client
+        .fetch_enrichment("VHYL", None, NOW)
+        .expect_err("bare ticker should not be routed or guessed");
+
+    assert_eq!(err.code(), "invalid_request");
+    assert!(err.safe_message().contains("bare tickers"));
+}
+
+#[test]
+fn isin_shaped_identifier_is_rejected_before_fetching() {
+    let client = client_for("http://127.0.0.1:9", "http://127.0.0.1:9/etf");
+
+    for identifier in ["IE00B8GKDB10", "IE00B8GKDB10.AF"] {
+        let err = client
+            .fetch_enrichment(identifier, None, NOW)
+            .expect_err("ISIN belongs in expected_isin, not identifier");
+        assert_eq!(err.code(), "invalid_request", "{identifier}");
+        assert!(err.safe_message().contains("expected_isin"));
+    }
 }
 
 #[test]
@@ -228,10 +252,21 @@ fn fetches_public_zero_commission_etfs() {
 fn enrichment_fetch_sends_browser_headers() {
     // The enrichment fetch must carry the reference's browser context (UA +
     // Accept-Language), or real pages may return bot-defense/locale responses.
-    let (base, captured) = spawn_capturing(mock_enrichment::route);
+    let (base, captured) = spawn_capturing(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
     let client = client_for(&base, "http://127.0.0.1:9/etf");
     client
-        .fetch_enrichment("it/diversified-financials/syn-tip/synth-shares", None, NOW)
+        .fetch_enrichment("BIT/TIP", None, NOW)
         .expect("enrichment fetch");
 
     let headers = captured.lock().expect("lock");

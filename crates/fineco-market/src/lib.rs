@@ -16,7 +16,7 @@ mod state;
 pub use client::{
     DEFAULT_ZERO_COMMISSION_ETFS_URL, MarketClient, ZeroCommissionEtf, ZeroCommissionEtfs,
 };
-pub use report::{CompanyOverview, EnrichmentMatch, EnrichmentReport};
+pub use report::{CompanyOverview, EnrichmentReport};
 pub use source::{EnrichmentHostAllowlist, validate_source_url};
 
 use fineco_core::SafeError;
@@ -24,8 +24,9 @@ use fineco_core::SafeError;
 /// Build a bounded enrichment report from already-fetched page `html`.
 ///
 /// `source_url` is the (already validated) page URL recorded on the report;
-/// `captured_at` is the caller's timestamp; `fineco_title`, when present, adds a
-/// title-match score. Parsing is data-only — the HTML is never executed.
+/// `captured_at` is the caller's timestamp; `expected_isin`, when present,
+/// verifies the parsed page and selects the matching embedded profile. Parsing
+/// is data-only — the HTML is never executed.
 ///
 /// # Errors
 /// Returns [`SafeError::invalid_request`] if the embedded query cache is
@@ -34,8 +35,8 @@ pub fn build_enrichment_report(
     html: &str,
     source_url: &str,
     captured_at: &str,
-    fineco_title: Option<&str>,
+    expected_isin: Option<&str>,
 ) -> Result<EnrichmentReport, SafeError> {
     let state = state::parse_enrichment_state(html)?;
-    report::build_report(&state, source_url, captured_at, fineco_title)
+    report::build_report(&state, source_url, captured_at, expected_isin)
 }

@@ -1,5 +1,5 @@
 //! Tests for the pure enrichment core: parse-not-execute extraction, the source
-//! allowlist, bounded output, and title matching. Fixtures are SYNTHETIC and use
+//! allowlist, bounded output, and ISIN verification. Fixtures are SYNTHETIC and use
 //! a fake host — never the real enrichment host.
 
 use fineco_market::{EnrichmentHostAllowlist, build_enrichment_report, validate_source_url};
@@ -147,13 +147,8 @@ fn extracts_fund_scores_and_metrics_from_etf_pages() {
       ]
     }"#;
 
-    let report = build_enrichment_report(
-        &page(payload),
-        SOURCE,
-        NOW,
-        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF"),
-    )
-    .expect("fund-style ETF report should build");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("IE00B8GKDB10"))
+        .expect("fund-style ETF report should build");
 
     assert_eq!(
         report.company.name,
@@ -171,7 +166,6 @@ fn extracts_fund_scores_and_metrics_from_etf_pages() {
         serde_json::json!(0.037)
     );
     assert_eq!(report.scores["total"], serde_json::json!(16));
-    assert_eq!(report.title_match.expect("a title match").verdict, "strong");
 }
 
 #[test]
@@ -351,7 +345,7 @@ fn company_profile_ignores_stale_fund_info() {
 }
 
 #[test]
-fn selects_the_profile_that_matches_the_fineco_title() {
+fn selects_the_profile_that_matches_expected_isin() {
     let payload = r#"{
       "queries": [
         {
@@ -387,19 +381,14 @@ fn selects_the_profile_that_matches_the_fineco_title() {
       ]
     }"#;
 
-    let report = build_enrichment_report(
-        &page(payload),
-        SOURCE,
-        NOW,
-        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF"),
-    )
-    .expect("matching fund profile should win over stale company profile");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("IE00B8GKDB10"))
+        .expect("expected ISIN should select the matching fund profile");
 
     assert_eq!(report.company.ticker, "LSE:VHYL");
 }
 
 #[test]
-fn skips_unusable_company_profile_without_a_fineco_title() {
+fn skips_unusable_company_profile_without_expected_isin() {
     let payload = r#"{
       "queries": [
         {
@@ -437,7 +426,7 @@ fn skips_unusable_company_profile_without_a_fineco_title() {
 }
 
 #[test]
-fn preserves_react_query_order_when_no_fineco_title_is_supplied() {
+fn preserves_react_query_order_when_no_expected_isin_is_supplied() {
     let payload = r#"{
       "queries": [
         {
@@ -606,7 +595,7 @@ fn fund_profile_prefers_richer_raw_metadata_object() {
 }
 
 #[test]
-fn preserves_react_query_order_when_title_scores_tie() {
+fn preserves_react_query_order_for_similar_profiles_without_expected_isin() {
     let payload = r#"{
       "queries": [
         {
@@ -642,14 +631,14 @@ fn preserves_react_query_order_when_title_scores_tie() {
       ]
     }"#;
 
-    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
-        .expect("source-order profile should win tied title scores");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("source-order profile should win without expected ISIN");
 
     assert_eq!(report.company.ticker, "LSE:GINC");
 }
 
 #[test]
-fn generic_title_overlap_does_not_replace_the_first_usable_profile() {
+fn generic_name_overlap_does_not_replace_the_first_usable_profile() {
     let payload = r#"{
       "queries": [
         {
@@ -685,14 +674,14 @@ fn generic_title_overlap_does_not_replace_the_first_usable_profile() {
       ]
     }"#;
 
-    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
-        .expect("generic title overlap should not switch profiles");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("generic overlap should not switch profiles without expected ISIN");
 
     assert_eq!(report.company.ticker, "LSE:GINC");
 }
 
 #[test]
-fn short_exact_title_does_not_replace_a_more_specific_first_profile() {
+fn short_exact_name_does_not_replace_a_more_specific_first_profile() {
     let payload = r#"{
       "queries": [
         {
@@ -728,15 +717,15 @@ fn short_exact_title_does_not_replace_a_more_specific_first_profile() {
       ]
     }"#;
 
-    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
-        .expect("short title should keep the more specific first profile");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("source order should keep the more specific first profile");
 
     assert_eq!(report.company.ticker, "LSE:GINC");
     assert_eq!(report.scores["total"], serde_json::json!(17));
 }
 
 #[test]
-fn strong_name_match_can_replace_a_stale_first_profile() {
+fn expected_isin_can_replace_a_stale_first_profile() {
     let payload = r#"{
       "queries": [
         {
@@ -744,10 +733,12 @@ fn strong_name_match_can_replace_a_stale_first_profile() {
           "state": { "data": { "data": {
             "name": "Vanguard Group plc",
             "unique_symbol": "LSE:OLD",
+            "isin_symbol": "GB0000000000",
             "analysis": { "data": { "extended": { "data": {
               "raw_data": { "data": { "company_info": {
                 "name": "Vanguard Group plc",
-                "unique_symbol": "LSE:OLD"
+                "unique_symbol": "LSE:OLD",
+                "isin_symbol": "GB0000000000"
               } } },
               "analysis": {},
               "scores": {}
@@ -759,10 +750,12 @@ fn strong_name_match_can_replace_a_stale_first_profile() {
           "state": { "data": { "data": {
             "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
             "unique_symbol": "LSE:VHYL",
+            "isin_symbol": "IE00B8GKDB10",
             "analysis": { "data": { "extended": { "data": {
               "raw_data": { "data": { "fund_info": {
                 "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
-                "unique_symbol": "LSE:VHYL"
+                "unique_symbol": "LSE:VHYL",
+                "isin_symbol": "IE00B8GKDB10"
               } } },
               "analysis": {},
               "scores": {}
@@ -772,13 +765,8 @@ fn strong_name_match_can_replace_a_stale_first_profile() {
       ]
     }"#;
 
-    let report = build_enrichment_report(
-        &page(payload),
-        SOURCE,
-        NOW,
-        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF USD Distributing"),
-    )
-    .expect("strong fund name match should replace stale first profile");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("IE00B8GKDB10"))
+        .expect("expected ISIN should replace stale first profile");
 
     assert_eq!(report.company.ticker, "LSE:VHYL");
 }
@@ -812,16 +800,15 @@ fn metadata_only_profile_does_not_shadow_later_analysis_profile() {
       ]
     }"#;
 
-    let report =
-        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income UCITS ETF"))
-            .expect("full analysis profile should win over metadata-only cache entry");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("full analysis profile should win over metadata-only cache entry");
 
     assert_eq!(report.company.ticker, "LSE:GINC");
     assert_eq!(report.scores["total"], serde_json::json!(17));
 }
 
 #[test]
-fn exact_metadata_title_does_not_shadow_matching_analysis_profile() {
+fn exact_metadata_name_does_not_shadow_matching_analysis_profile() {
     let payload = r#"{
       "queries": [
         {
@@ -849,13 +836,8 @@ fn exact_metadata_title_does_not_shadow_matching_analysis_profile() {
       ]
     }"#;
 
-    let report = build_enrichment_report(
-        &page(payload),
-        SOURCE,
-        NOW,
-        Some("Global Income UCITS ETF GINC"),
-    )
-    .expect("matching full analysis profile should win over exact metadata shell");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("matching full analysis profile should win over exact metadata shell");
 
     assert_eq!(
         report.company.name,
@@ -866,14 +848,15 @@ fn exact_metadata_title_does_not_shadow_matching_analysis_profile() {
 }
 
 #[test]
-fn title_matched_metadata_profile_can_beat_stale_analysis_profile() {
+fn expected_isin_metadata_profile_can_beat_stale_analysis_profile() {
     let payload = r#"{
       "queries": [
         {
           "queryKey": ["fund", "lightweight"],
           "state": { "data": { "data": {
             "name": "Global Income UCITS ETF",
-            "unique_symbol": "LSE:GINC"
+            "unique_symbol": "LSE:GINC",
+            "isin_symbol": "IE00GINC0001"
           } } }
         },
         {
@@ -881,10 +864,12 @@ fn title_matched_metadata_profile_can_beat_stale_analysis_profile() {
           "state": { "data": { "data": {
             "name": "Unrelated Company plc",
             "unique_symbol": "LSE:OLD",
+            "isin_symbol": "GB0000000000",
             "analysis": { "data": { "extended": { "data": {
               "raw_data": { "data": { "company_info": {
                 "name": "Unrelated Company plc",
-                "unique_symbol": "LSE:OLD"
+                "unique_symbol": "LSE:OLD",
+                "isin_symbol": "GB0000000000"
               } } },
               "analysis": { "value": { "pe": 10 } },
               "scores": { "total": 8 }
@@ -894,16 +879,15 @@ fn title_matched_metadata_profile_can_beat_stale_analysis_profile() {
       ]
     }"#;
 
-    let report =
-        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income UCITS ETF"))
-            .expect("title-matched metadata profile should beat stale analysis shell");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("IE00GINC0001"))
+        .expect("expected ISIN metadata profile should beat stale analysis shell");
 
     assert_eq!(report.company.ticker, "LSE:GINC");
     assert!(report.scores.as_object().expect("scores object").is_empty());
 }
 
 #[test]
-fn identifier_matched_metadata_profile_beats_generic_analysis_match() {
+fn expected_isin_metadata_profile_beats_generic_analysis_match() {
     let payload = r#"{
       "queries": [
         {
@@ -911,10 +895,12 @@ fn identifier_matched_metadata_profile_beats_generic_analysis_match() {
           "state": { "data": { "data": {
             "name": "Global Income",
             "unique_symbol": "LSE:OLD",
+            "isin_symbol": "GB0000000000",
             "analysis": { "data": { "extended": { "data": {
               "raw_data": { "data": { "company_info": {
                 "name": "Global Income",
-                "unique_symbol": "LSE:OLD"
+                "unique_symbol": "LSE:OLD",
+                "isin_symbol": "GB0000000000"
               } } },
               "analysis": { "value": { "pe": 10 } },
               "scores": { "total": 8 }
@@ -925,69 +911,22 @@ fn identifier_matched_metadata_profile_beats_generic_analysis_match() {
           "queryKey": ["fund", "lightweight"],
           "state": { "data": { "data": {
             "name": "Global Income UCITS ETF",
-            "unique_symbol": "LSE:GINC"
+            "unique_symbol": "LSE:GINC",
+            "isin_symbol": "IE00GINC0001"
           } } }
         }
       ]
     }"#;
 
-    let report = build_enrichment_report(
-        &page(payload),
-        SOURCE,
-        NOW,
-        Some("Global Income UCITS ETF GINC"),
-    )
-    .expect("identifier-matched metadata profile should beat generic analysis match");
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("IE00GINC0001"))
+        .expect("expected ISIN metadata profile should beat generic analysis match");
 
     assert_eq!(report.company.ticker, "LSE:GINC");
     assert!(report.scores.as_object().expect("scores object").is_empty());
 }
 
 #[test]
-fn title_match_does_not_score_substring_tokens_as_name_matches() {
-    let payload = r#"{
-      "queries": [
-        {
-          "queryKey": ["company", "meta"],
-          "state": { "data": { "data": {
-            "name": "Meta",
-            "unique_symbol": "NasdaqGS:META",
-            "analysis": { "data": { "extended": { "data": {
-              "raw_data": { "data": { "company_info": { "name": "Meta", "unique_symbol": "NasdaqGS:META" } } },
-              "analysis": {},
-              "scores": {}
-            } } } }
-          } } }
-        }
-      ]
-    }"#;
-
-    let report =
-        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Metaverse Holdings ETF"))
-            .expect("report should build");
-    let title_match = report.title_match.expect("title match");
-
-    assert_eq!(title_match.score, 0.0);
-    assert!(
-        !title_match
-            .reasons
-            .iter()
-            .any(|reason| reason == "name match")
-    );
-}
-
-#[test]
-fn empty_fineco_title_does_not_create_a_name_match() {
-    let report = build_enrichment_report(&page(&canonical_payload()), SOURCE, NOW, Some(""))
-        .expect("report should build");
-    let title_match = report.title_match.expect("title match");
-
-    assert_eq!(title_match.score, 0.0);
-    assert!(title_match.reasons.is_empty());
-}
-
-#[test]
-fn blank_fineco_title_preserves_first_usable_profile_selection() {
+fn blank_expected_isin_preserves_first_usable_profile_selection() {
     let payload = r#"{
       "queries": [
         {
@@ -1024,13 +963,13 @@ fn blank_fineco_title_preserves_first_usable_profile_selection() {
     }"#;
 
     let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("   "))
-        .expect("blank title should behave like no title for profile selection");
+        .expect("blank expected ISIN should behave like no expected ISIN for profile selection");
 
     assert_eq!(report.company.ticker, "BIT:TIP");
 }
 
 #[test]
-fn no_title_falls_back_to_usable_metadata_after_empty_analysis_shell() {
+fn no_expected_isin_falls_back_to_usable_metadata_after_empty_analysis_shell() {
     let payload = r#"{
       "queries": [
         {
@@ -1218,31 +1157,28 @@ fn long_text_and_wide_sections_are_bounded() {
 }
 
 #[test]
-fn title_match_scores_strong_on_isin_and_name() {
+fn expected_isin_suffix_is_ignored_for_verification() {
     let report = build_enrichment_report(
         &page(&canonical_payload()),
         SOURCE,
         NOW,
-        Some("Tamburi Investment Partners IT0003153621"),
+        Some("IT0003153621.AF"),
     )
     .expect("report should build");
 
-    let title_match = report.title_match.expect("a title match");
-    assert_eq!(title_match.verdict, "strong");
-    assert!(title_match.score >= 0.7);
-    assert!(title_match.reasons.iter().any(|r| r.contains("ISIN")));
+    assert_eq!(report.company.isin, "IT0003153621");
 }
 
 #[test]
-fn title_match_scores_weak_on_unrelated_title() {
-    let report = build_enrichment_report(
+fn expected_isin_mismatch_fails_closed() {
+    let err = build_enrichment_report(
         &page(&canonical_payload()),
         SOURCE,
         NOW,
-        Some("Completely Unrelated Widget"),
+        Some("GB0000000000"),
     )
-    .expect("report should build");
-    assert_eq!(report.title_match.expect("match").verdict, "weak");
+    .expect_err("wrong ISIN must fail closed");
+    assert_eq!(err.code(), "invalid_request");
 }
 
 // ---- Source-URL allowlisting ----------------------------------------------

@@ -370,7 +370,7 @@ impl Gateway {
 
     #[tool(
         name = "market_get_stock_enrichment",
-        description = "Third-party enrichment for one instrument, identified by its stock-page `identifier` (the server builds the allowlisted URL; the page is parsed, never executed). Optional `fineco_title` adds a title match."
+        description = "Get enrichment for a public market instrument. `identifier` must be a venue-qualified ticker in `<venue>/<symbol>` or `<venue>:<symbol>` form, for example `LSE/VHYL` or `LSE:VHYL`; bare tickers and ISIN-only identifiers are rejected. `expected_isin`, when provided, verifies the parsed page and may be a plain ISIN or an ISIN with a suffix; suffixes are ignored for comparison. The server builds exactly one allowlisted URL and parses the page as data."
     )]
     pub async fn market_get_stock_enrichment(
         &self,
@@ -393,7 +393,7 @@ impl Gateway {
                 let report = tokio::task::spawn_blocking(move || {
                     market.fetch_enrichment(
                         &params.identifier,
-                        params.fineco_title.as_deref(),
+                        params.expected_isin.as_deref(),
                         &now,
                     )
                 })

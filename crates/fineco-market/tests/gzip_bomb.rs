@@ -92,7 +92,7 @@ fn a_gzip_bomb_enrichment_body_is_rejected_not_inflated() {
         Duration::from_secs(10),
     );
     let err = client
-        .fetch_enrichment("it/sector/exchange/acme", None, "2026-06-05T00:00:00Z")
+        .fetch_enrichment("BIT/TIP", None, "2026-06-05T00:00:00Z")
         .expect_err("a gzip body inflating past the decompressed cap must be rejected");
     assert_eq!(err.code(), "internal", "unexpected code: {}", err.code());
 }

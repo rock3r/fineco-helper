@@ -1,8 +1,8 @@
 //! Build a bounded, structured enrichment report from the parsed query cache.
 //!
 //! Navigates the React-Query cache to a profile entry, extracts the company/fund
-//! overview, scores, and per-section metrics, and optionally scores a Fineco
-//! title match. All external free text and raw score/metric output is
+//! overview, scores, and per-section metrics, and optionally verifies an
+//! expected ISIN. All external free text and raw score/metric output is
 //! size-limited and reduced to primitives — never echoed unbounded.
 
 use fineco_core::SafeError;
@@ -51,16 +51,6 @@ pub struct CompanyOverview {
     pub description: String,
 }
 
-/// The outcome of matching a Fineco instrument title against the page company.
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-pub struct EnrichmentMatch {
-    pub fineco_title: String,
-    pub enrichment_title: String,
-    pub score: f64,
-    pub verdict: &'static str,
-    pub reasons: Vec<String>,
-}
-
 /// A bounded, structured enrichment report (the `external_enrichment` payload).
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct EnrichmentReport {
@@ -69,13 +59,12 @@ pub struct EnrichmentReport {
     pub company: CompanyOverview,
     pub scores: Value,
     pub metrics: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title_match: Option<EnrichmentMatch>,
     pub warnings: Vec<String>,
 }
 
 /// Assemble a report from the parsed `state`, stamped with `captured_at` and the
-/// validated `source_url`. If `fineco_title` is given, include a title match.
+/// validated `source_url`. If `expected_isin` is given, select and verify the
+/// profile by exact ISIN match.
 ///
 /// # Errors
 /// Returns [`SafeError::invalid_request`] if the cache lacks a recognized
@@ -84,9 +73,10 @@ pub(crate) fn build_report(
     state: &Value,
     source_url: &str,
     captured_at: &str,
-    fineco_title: Option<&str>,
+    expected_isin: Option<&str>,
 ) -> Result<EnrichmentReport, SafeError> {
-    let profile = profile_query(state, fineco_title)
+    let expected_isin = normalize_expected_isin(expected_isin)?;
+    let profile = profile_query(state, expected_isin.as_deref())
         .ok_or_else(|| SafeError::invalid_request("Enrichment page has no profile data."))?;
     let profile_root = profile
         .data
@@ -115,8 +105,18 @@ pub(crate) fn build_report(
     if analysis.as_object().is_none_or(serde_json::Map::is_empty) {
         warnings.push("Missing analysis metrics.".to_string());
     }
-
-    let title_match = fineco_title.map(|title| match_title(title, &company));
+    if let Some(expected) = expected_isin.as_deref() {
+        if company.isin.is_empty() {
+            return Err(SafeError::invalid_request(
+                "Enrichment page did not expose the expected ISIN.",
+            ));
+        }
+        if !company.isin.eq_ignore_ascii_case(expected) {
+            return Err(SafeError::invalid_request(
+                "Enrichment page ISIN did not match expected_isin.",
+            ));
+        }
+    }
 
     Ok(EnrichmentReport {
         captured_at: captured_at.to_string(),
@@ -124,17 +124,28 @@ pub(crate) fn build_report(
         scores: Value::Object(bounded_primitive_map(scores_src, MAX_SCORE_ENTRIES)),
         metrics: section_metrics(analysis),
         company,
-        title_match,
         warnings,
     })
 }
 
 /// Find the best recognized company/fund profile cache entry and return its
-/// `state.data`. If the caller supplied a Fineco title, prefer the profile whose
-/// extracted display name/ticker/ISIN best matches it; otherwise keep the cache
+/// `state.data`. If the caller supplied an expected ISIN, prefer the profile
+/// whose extracted overview exposes that exact ISIN; otherwise keep the cache
 /// source order.
-fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<ProfileCandidate<'a>> {
+fn profile_query<'a>(
+    state: &'a Value,
+    expected_isin: Option<&str>,
+) -> Option<ProfileCandidate<'a>> {
     let candidates = profile_queries(state);
+    if let Some(expected) = expected_isin
+        && let Some(matching_profile) = candidates.iter().copied().find(|profile| {
+            company_overview(*profile)
+                .isin
+                .eq_ignore_ascii_case(expected)
+        })
+    {
+        return Some(matching_profile);
+    }
     let analysis_candidates = candidates
         .iter()
         .copied()
@@ -145,7 +156,7 @@ fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<Pro
     } else {
         &analysis_candidates
     };
-    let first_usable = preferred_fallback_candidates
+    preferred_fallback_candidates
         .iter()
         .copied()
         .find(|profile| profile_is_usable(*profile))
@@ -156,51 +167,7 @@ fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<Pro
                 .find(|profile| profile_is_usable(*profile))
         })
         .or_else(|| preferred_fallback_candidates.first().copied())
-        .or_else(|| candidates.first().copied());
-    let Some(title) = fineco_title.filter(|title| !tokens(title).is_empty()) else {
-        return first_usable;
-    };
-
-    let first_match = first_usable.map(|profile| {
-        let company = company_overview(profile);
-        let title_match = match_title(title, &company);
-        (profile, company, title_match)
-    });
-    let mut best = None;
-    let mut best_score = 0.0_f64;
-    let mut best_has_extended_analysis = false;
-    let mut best_has_identifier_match = false;
-    for candidate in candidates {
-        let company = company_overview(candidate);
-        let title_match = match_title(title, &company);
-        if !is_decisive_profile_match(&title_match, &company) {
-            continue;
-        }
-        if shorter_exact_name_would_replace_strong_first(
-            first_match.as_ref(),
-            candidate,
-            &company,
-            &title_match,
-        ) {
-            continue;
-        }
-        let score = title_match.score;
-        let has_extended_analysis = profile_has_extended_analysis(candidate);
-        let has_identifier_match = has_identifier_match(&title_match);
-        let should_replace = best.is_none()
-            || (score > best_score
-                && (!best_has_extended_analysis
-                    || has_extended_analysis
-                    || (has_identifier_match && !best_has_identifier_match)))
-            || (score == best_score && has_extended_analysis && !best_has_extended_analysis);
-        if should_replace {
-            best = Some(candidate);
-            best_score = score;
-            best_has_extended_analysis = has_extended_analysis;
-            best_has_identifier_match = has_identifier_match;
-        }
-    }
-    best.or(first_usable)
+        .or_else(|| candidates.first().copied())
 }
 
 fn profile_queries(state: &Value) -> Vec<ProfileCandidate<'_>> {
@@ -410,179 +377,34 @@ fn section_metrics(analysis: &Value) -> Value {
     Value::Object(sections)
 }
 
-// ---- Title matching --------------------------------------------------------
+// ---- ISIN verification -----------------------------------------------------
 
-/// Stopwords dropped from title tokens (corporate suffixes / filler).
-const STOPWORDS: [&str; 25] = [
-    "spa",
-    "s",
-    "p",
-    "a",
-    "sa",
-    "ag",
-    "nv",
-    "plc",
-    "ltd",
-    "limited",
-    "inc",
-    "corp",
-    "corporation",
-    "company",
-    "co",
-    "ordinary",
-    "shares",
-    "stock",
-    "adr",
-    "the",
-    "and",
-    "di",
-    "de",
-    "del",
-    "ord",
-];
-
-/// Score how well `fineco_title` matches the page `company`.
-fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch {
-    let enrichment_title = [&company.name, &company.ticker, &company.isin]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let fineco_tokens = tokens(fineco_title);
-    let source_tokens = tokens(&enrichment_title);
-    let company_name_tokens = tokens(&company.name);
-    let overlap: Vec<String> = fineco_tokens
-        .iter()
-        .filter(|t| source_tokens.contains(*t))
-        .cloned()
-        .collect();
-    let ticker_short = company
-        .ticker
-        .rsplit(':')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-
-    let mut score = 0.0_f64;
-    let mut reasons = Vec::new();
-
-    if contains_token_sequence(&fineco_tokens, &company_name_tokens)
-        || contains_token_sequence(&company_name_tokens, &fineco_tokens)
-    {
-        score += 0.4;
-        reasons.push("name match".to_string());
+fn normalize_expected_isin(expected_isin: Option<&str>) -> Result<Option<String>, SafeError> {
+    let Some(raw) = expected_isin else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
     }
-    if !company.isin.is_empty()
-        && fineco_title
-            .to_lowercase()
-            .contains(&company.isin.to_lowercase())
-    {
-        score += 0.55;
-        reasons.push("ISIN match".to_string());
-    }
-    if !ticker_short.is_empty() && fineco_tokens.iter().any(|t| t == &ticker_short) {
-        score += 0.35;
-        reasons.push("ticker match".to_string());
-    }
-    if !fineco_tokens.is_empty() {
-        let denominator = fineco_tokens.len().max(source_tokens.len()).max(1) as f64;
-        let token_score = overlap.len() as f64 / denominator;
-        score += token_score.min(0.55);
-        if !overlap.is_empty() {
-            reasons.push(format!("shared title tokens: {}", overlap.join(", ")));
-        }
-    }
-
-    let bounded = (score * 1000.0).round() / 1000.0;
-    let bounded = bounded.clamp(0.0, 1.0);
-    let verdict = if bounded >= 0.7 {
-        "strong"
-    } else if bounded >= 0.35 {
-        "possible"
+    let isin = trimmed.split_once('.').map_or(trimmed, |(isin, _)| isin);
+    let isin = isin.to_ascii_uppercase();
+    if is_isin(&isin) {
+        Ok(Some(isin))
     } else {
-        "weak"
-    };
-
-    EnrichmentMatch {
-        fineco_title: truncate(fineco_title, MAX_STR),
-        enrichment_title: truncate(&enrichment_title, MAX_STR),
-        score: bounded,
-        verdict,
-        reasons,
+        Err(SafeError::invalid_request(
+            "expected_isin must be an ISIN, optionally followed by a suffix.",
+        ))
     }
 }
 
-fn is_decisive_profile_match(title_match: &EnrichmentMatch, company: &CompanyOverview) -> bool {
-    let has_identifier_match = title_match
-        .reasons
-        .iter()
-        .any(|reason| reason == "ISIN match" || reason == "ticker match");
-    let fineco_tokens = tokens(&title_match.fineco_title);
-    let company_name_tokens = tokens(&company.name);
-    let has_strong_name_match = title_match.verdict == "strong"
-        && title_match
-            .reasons
-            .iter()
-            .any(|reason| reason == "name match")
-        && contains_token_sequence(&fineco_tokens, &company_name_tokens);
-
-    has_identifier_match || has_strong_name_match
-}
-
-fn shorter_exact_name_would_replace_strong_first(
-    first_match: Option<&(ProfileCandidate<'_>, CompanyOverview, EnrichmentMatch)>,
-    candidate: ProfileCandidate<'_>,
-    company: &CompanyOverview,
-    title_match: &EnrichmentMatch,
-) -> bool {
-    let Some((first_profile, first_company, first_title_match)) = first_match else {
-        return false;
-    };
-    if std::ptr::eq(candidate.data, first_profile.data) {
-        return false;
-    }
-    if first_title_match.verdict != "strong" || has_identifier_match(title_match) {
-        return false;
-    }
-
-    normalized_title_key(&title_match.fineco_title) == normalized_title_key(&company.name)
-        && tokens(&company.name).len() < tokens(&first_company.name).len()
-}
-
-fn has_identifier_match(title_match: &EnrichmentMatch) -> bool {
-    title_match
-        .reasons
-        .iter()
-        .any(|reason| reason == "ISIN match" || reason == "ticker match")
-}
-
-fn normalized_title_key(value: &str) -> String {
-    tokens(value).join(" ")
-}
-
-/// Lowercase alphanumeric tokens, dropping single-character tokens and
-/// stopwords. (No NFKD normalization — inputs here are ASCII tickers/ISINs and
-/// largely-Latin company names.)
-fn tokens(value: &str) -> Vec<String> {
-    value
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .filter(|t| t.chars().count() > 1 && !STOPWORDS.contains(t))
-        .map(str::to_string)
-        .collect()
-}
-
-fn contains_token_sequence(haystack: &[String], needle: &[String]) -> bool {
-    !needle.is_empty()
-        && needle.len() <= haystack.len()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+fn is_isin(value: &str) -> bool {
+    let chars = value.chars().collect::<Vec<_>>();
+    chars.len() == 12
+        && chars[0].is_ascii_alphabetic()
+        && chars[1].is_ascii_alphabetic()
+        && chars[2..11].iter().all(|c| c.is_ascii_alphanumeric())
+        && chars[11].is_ascii_digit()
 }
 
 #[cfg(test)]

@@ -33,13 +33,13 @@ fn all_parameterless_cached_commands_parse() {
 fn enrichment_command_carries_its_params() {
     let request = Request::from_json(
         r#"{"command": "market_get_stock_enrichment",
-            "params": {"identifier": "it/sector/exch/slug", "fineco_title": "Acme"}}"#,
+            "params": {"identifier": "LSE/VHYL", "expected_isin": "IE00B8GKDB10.AF"}}"#,
     )
     .expect("parse");
     match request {
         Request::MarketGetStockEnrichment(params) => {
-            assert_eq!(params.identifier, "it/sector/exch/slug");
-            assert_eq!(params.fineco_title.as_deref(), Some("Acme"));
+            assert_eq!(params.identifier, "LSE/VHYL");
+            assert_eq!(params.expected_isin.as_deref(), Some("IE00B8GKDB10.AF"));
         }
         other => panic!("unexpected variant: {other:?}"),
     }
