@@ -32,6 +32,12 @@ const METRIC_SECTIONS: [&str; 6] = [
     "management",
 ];
 
+#[derive(Clone, Copy)]
+struct ProfileCandidate<'a> {
+    kind: &'a str,
+    data: &'a Value,
+}
+
 /// The company overview extracted from the enrichment page.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct CompanyOverview {
@@ -79,8 +85,11 @@ pub(crate) fn build_report(
     captured_at: &str,
     fineco_title: Option<&str>,
 ) -> Result<EnrichmentReport, SafeError> {
-    let profile_root = profile_query(state, fineco_title)
-        .and_then(|data| data.get("data"))
+    let profile = profile_query(state, fineco_title)
+        .ok_or_else(|| SafeError::invalid_request("Enrichment page has no profile data."))?;
+    let profile_root = profile
+        .data
+        .get("data")
         .ok_or_else(|| SafeError::invalid_request("Enrichment page has no profile data."))?;
 
     let extended = profile_root
@@ -93,7 +102,7 @@ pub(crate) fn build_report(
         .or_else(|| profile_root.pointer("/score/data"))
         .unwrap_or(&Value::Null);
 
-    let info = raw_info(raw)
+    let info = raw_info_for(raw, profile.kind)
         .or_else(|| profile_root.get("info"))
         .unwrap_or(&Value::Null);
 
@@ -143,58 +152,63 @@ pub(crate) fn build_report(
 /// `state.data`. If the caller supplied a Fineco title, prefer the profile whose
 /// extracted display name/ticker/ISIN best matches it; otherwise keep the cache
 /// source order.
-fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<&'a Value> {
+fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<ProfileCandidate<'a>> {
     let candidates = profile_queries(state);
     let first_usable = candidates
         .iter()
         .copied()
-        .find(|profile| profile_is_usable(profile))
+        .find(|profile| profile_is_usable(*profile))
         .or_else(|| candidates.first().copied());
     let Some(title) = fineco_title.filter(|title| !tokens(title).is_empty()) else {
         return first_usable;
     };
-    candidates
-        .into_iter()
-        .max_by(|left, right| {
-            profile_match_score(left, title).total_cmp(&profile_match_score(right, title))
-        })
-        .filter(|profile| profile_match_score(profile, title) > 0.0)
-        .or(first_usable)
+
+    let mut best = None;
+    let mut best_score = 0.0_f64;
+    for candidate in candidates {
+        let score = profile_match_score(candidate, title);
+        if score > best_score {
+            best = Some(candidate);
+            best_score = score;
+        }
+    }
+    best.or(first_usable)
 }
 
-fn profile_queries(state: &Value) -> Vec<&Value> {
+fn profile_queries(state: &Value) -> Vec<ProfileCandidate<'_>> {
     state
         .get("queries")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|entry| {
-            entry
-                .pointer("/queryKey/0")
-                .and_then(Value::as_str)
-                .is_some_and(|name| PROFILE_QUERY_KEYS.contains(&name))
+        .filter_map(|entry| {
+            let kind = entry.pointer("/queryKey/0").and_then(Value::as_str)?;
+            if !PROFILE_QUERY_KEYS.contains(&kind) {
+                return None;
+            }
+            let data = entry.pointer("/state/data")?;
+            Some(ProfileCandidate { kind, data })
         })
-        .filter_map(|entry| entry.pointer("/state/data"))
         .collect()
 }
 
-fn profile_is_usable(profile: &Value) -> bool {
-    profile.get("data").is_some_and(|root| {
+fn profile_is_usable(profile: ProfileCandidate<'_>) -> bool {
+    profile.data.get("data").is_some_and(|root| {
         let raw = root
             .pointer("/analysis/data/extended/data/raw_data/data")
             .unwrap_or(&Value::Null);
-        raw_info(raw).is_some()
+        raw_info_for(raw, profile.kind).is_some()
             || root.get("info").is_some_and(has_display_field)
             || has_display_field(root)
     })
 }
 
-fn profile_match_score(profile: &Value, fineco_title: &str) -> f64 {
-    let root = profile.get("data").unwrap_or(&Value::Null);
+fn profile_match_score(profile: ProfileCandidate<'_>, fineco_title: &str) -> f64 {
+    let root = profile.data.get("data").unwrap_or(&Value::Null);
     let raw = root
         .pointer("/analysis/data/extended/data/raw_data/data")
         .unwrap_or(&Value::Null);
-    let info = raw_info(raw)
+    let info = raw_info_for(raw, profile.kind)
         .or_else(|| root.get("info"))
         .unwrap_or(&Value::Null);
     let company = CompanyOverview {
@@ -217,17 +231,14 @@ fn profile_match_score(profile: &Value, fineco_title: &str) -> f64 {
     match_title(fineco_title, &company).score
 }
 
-fn raw_info(raw: &Value) -> Option<&Value> {
-    let mut best = None;
-    let mut best_score = 0;
-    for value in RAW_INFO_KEYS.into_iter().filter_map(|key| raw.get(key)) {
-        let score = raw_info_score(value);
-        if score > best_score {
-            best = Some(value);
-            best_score = score;
-        }
-    }
-    best
+fn raw_info_for<'a>(raw: &'a Value, profile_kind: &str) -> Option<&'a Value> {
+    let keys = match profile_kind {
+        "fund" | "etf" => ["fund_info", "asset_info", "company_info"],
+        _ => RAW_INFO_KEYS,
+    };
+    keys.into_iter()
+        .filter_map(|key| raw.get(key))
+        .find(|value| raw_info_score(value) > 0)
 }
 
 fn raw_info_score(value: &Value) -> usize {

@@ -275,6 +275,46 @@ fn sparse_company_info_does_not_shadow_richer_fund_info() {
 }
 
 #[test]
+fn fund_profile_prefers_fund_info_over_populated_company_info() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "global-income"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {
+                "company_info": {
+                  "name": "Global Asset Manager plc",
+                  "unique_symbol": "LSE:GAM",
+                  "exchange_symbol": "LSE",
+                  "isin_symbol": "GB0000000001",
+                  "country": "United Kingdom",
+                  "url": "https://manager.example",
+                  "description": "Synthetic manager profile."
+                },
+                "fund_info": {
+                  "name": "Global Income UCITS ETF",
+                  "unique_symbol": "LSE:GINC",
+                  "isin_symbol": "IE00B8GKDB10"
+                }
+              } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("fund profile should prefer fund metadata");
+
+    assert_eq!(report.company.name, "Global Income UCITS ETF");
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.company.isin, "IE00B8GKDB10");
+}
+
+#[test]
 fn selects_the_profile_that_matches_the_fineco_title() {
     let payload = r#"{
       "queries": [
@@ -401,6 +441,49 @@ fn preserves_react_query_order_when_no_fineco_title_is_supplied() {
         .expect("source-order fund profile should be selected");
 
     assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn preserves_react_query_order_when_title_scores_tie() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Global Income Fund",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income Fund",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income Holdings plc",
+            "unique_symbol": "LSE:GLOB",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income Holdings plc",
+                "unique_symbol": "LSE:GLOB"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
+        .expect("source-order profile should win tied title scores");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
 }
 
 #[test]
