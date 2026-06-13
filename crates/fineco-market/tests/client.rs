@@ -3,6 +3,7 @@
 //! allowlist pins the loopback mock.
 
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -157,6 +158,25 @@ fn isin_shaped_identifier_is_rejected_before_fetching() {
         assert_eq!(err.code(), "invalid_request", "{identifier}");
         assert!(err.safe_message().contains("expected_isin"));
     }
+}
+
+#[test]
+fn malformed_expected_isin_is_rejected_before_fetching() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let request_counter = Arc::clone(&requests);
+    let enrichment = spawn(move |_req| {
+        request_counter.fetch_add(1, Ordering::SeqCst);
+        httptiny::Response::not_found()
+    });
+    let client = client_for(&enrichment, "http://127.0.0.1:9/etf");
+
+    let err = client
+        .fetch_enrichment("LSE/VHYL", Some("not-an-isin"), NOW)
+        .expect_err("malformed expected_isin should fail before fetch");
+
+    assert_eq!(err.code(), "invalid_request");
+    assert!(err.safe_message().contains("expected_isin"));
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
 }
 
 #[test]

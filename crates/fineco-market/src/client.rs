@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use ureq::Agent;
 
 use crate::build_enrichment_report;
-use crate::report::{EnrichmentReport, sanitize_text};
+use crate::report::{EnrichmentReport, normalize_expected_isin, sanitize_text};
 use crate::source::{EnrichmentHostAllowlist, validate_fetch_target};
 
 /// Cap the enrichment page read at the network layer (matches the parser's page
@@ -168,6 +168,7 @@ impl MarketClient {
         now_iso: &str,
     ) -> Result<EnrichmentReport, SafeError> {
         let normalized_identifier = normalize_identifier(identifier)?;
+        let normalized_expected_isin = normalize_expected_isin(expected_isin)?;
         let url = format!(
             "{}{}",
             self.enrichment_base.trim_end_matches('/'),
@@ -178,7 +179,7 @@ impl MarketClient {
         validate_fetch_target(&url, &self.allowlist)?;
 
         let html = self.get_text(&url)?;
-        build_enrichment_report(&html, &url, now_iso, expected_isin)
+        build_enrichment_report(&html, &url, now_iso, normalized_expected_isin.as_deref())
     }
 
     /// Fetch and parse the public zero-commission ETF list. `now_iso` stamps

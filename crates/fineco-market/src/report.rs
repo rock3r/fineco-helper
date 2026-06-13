@@ -388,7 +388,9 @@ fn section_metrics(analysis: &Value) -> Value {
 
 // ---- ISIN verification -----------------------------------------------------
 
-fn normalize_expected_isin(expected_isin: Option<&str>) -> Result<Option<String>, SafeError> {
+pub(crate) fn normalize_expected_isin(
+    expected_isin: Option<&str>,
+) -> Result<Option<String>, SafeError> {
     let Some(raw) = expected_isin else {
         return Ok(None);
     };
