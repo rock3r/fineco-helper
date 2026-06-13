@@ -148,14 +148,20 @@ fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<&'a
         .into_iter()
         .filter_map(|name| query(state, name))
         .collect::<Vec<_>>();
-    let Some(title) = fineco_title else {
-        return candidates
-            .into_iter()
-            .find(|profile| profile_is_usable(profile));
+    let first_usable = candidates
+        .iter()
+        .copied()
+        .find(|profile| profile_is_usable(profile));
+    let Some(title) = fineco_title.filter(|title| !tokens(title).is_empty()) else {
+        return first_usable;
     };
-    candidates.into_iter().max_by(|left, right| {
-        profile_match_score(left, title).total_cmp(&profile_match_score(right, title))
-    })
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            profile_match_score(left, title).total_cmp(&profile_match_score(right, title))
+        })
+        .filter(|profile| profile_match_score(profile, title) > 0.0)
+        .or(first_usable)
 }
 
 fn profile_is_usable(profile: &Value) -> bool {

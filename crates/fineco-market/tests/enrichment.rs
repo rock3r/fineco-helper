@@ -351,6 +351,49 @@ fn empty_fineco_title_does_not_create_a_name_match() {
 }
 
 #[test]
+fn blank_fineco_title_preserves_first_usable_profile_selection() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "tip"],
+          "state": { "data": { "data": {
+            "name": "SYNTHETIC Tamburi Investment Partners SpA",
+            "unique_symbol": "BIT:TIP",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "SYNTHETIC Tamburi Investment Partners SpA",
+                "unique_symbol": "BIT:TIP"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Fund",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Unrelated Fund",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("   "))
+        .expect("blank title should behave like no title for profile selection");
+
+    assert_eq!(report.company.ticker, "BIT:TIP");
+}
+
+#[test]
 fn parse_is_data_only_not_execution() {
     // A metric value that looks like injected code is kept verbatim as data —
     // never interpreted. (Reaching this assertion at all means nothing ran it.)
