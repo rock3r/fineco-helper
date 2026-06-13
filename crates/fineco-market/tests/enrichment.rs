@@ -222,6 +222,59 @@ fn skips_empty_raw_info_entries_for_fund_pages() {
 }
 
 #[test]
+fn sparse_company_info_does_not_shadow_richer_fund_info() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": {
+            "data": {
+              "data": {
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "company_info": {
+                              "unique_symbol": "LSE:PLACEHOLDER"
+                            },
+                            "fund_info": {
+                              "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                              "unique_symbol": "LSE:VHYL",
+                              "exchange_symbol": "LSE",
+                              "isin_symbol": "IE00B8GKDB10",
+                              "country": "Ireland",
+                              "url": "https://www.vanguard.example",
+                              "description": "Synthetic ETF profile."
+                            }
+                          }
+                        },
+                        "analysis": {},
+                        "scores": {}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("sparse placeholder should not shadow fund info");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+    assert_eq!(report.company.country, "Ireland");
+}
+
+#[test]
 fn selects_the_profile_that_matches_the_fineco_title() {
     let payload = r#"{
       "queries": [

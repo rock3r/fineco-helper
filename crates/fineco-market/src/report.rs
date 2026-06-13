@@ -218,10 +218,28 @@ fn profile_match_score(profile: &Value, fineco_title: &str) -> f64 {
 }
 
 fn raw_info(raw: &Value) -> Option<&Value> {
-    RAW_INFO_KEYS
+    let mut best = None;
+    let mut best_score = 0;
+    for value in RAW_INFO_KEYS.into_iter().filter_map(|key| raw.get(key)) {
+        let score = raw_info_score(value);
+        if score > best_score {
+            best = Some(value);
+            best_score = score;
+        }
+    }
+    best
+}
+
+fn raw_info_score(value: &Value) -> usize {
+    let display_fields = ["name", "unique_symbol", "exchange_symbol", "isin_symbol"]
         .into_iter()
-        .filter_map(|key| raw.get(key))
-        .find(|value| has_display_field(value))
+        .filter(|key| pick_str(value, key).is_some())
+        .count();
+    if display_fields == 0 {
+        0
+    } else {
+        display_fields * 100 + primitive_count(value)
+    }
 }
 
 fn has_display_field(value: &Value) -> bool {
