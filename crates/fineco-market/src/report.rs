@@ -111,7 +111,7 @@ pub(crate) fn build_report(
                 "Enrichment page did not expose the expected ISIN.",
             ));
         }
-        if !company.isin.eq_ignore_ascii_case(expected) {
+        if page_isin_for_compare(&company.isin).as_deref() != Some(expected) {
             return Err(SafeError::invalid_request(
                 "Enrichment page ISIN did not match expected_isin.",
             ));
@@ -137,22 +137,31 @@ fn profile_query<'a>(
     expected_isin: Option<&str>,
 ) -> Option<ProfileCandidate<'a>> {
     let candidates = profile_queries(state);
-    if let Some(expected) = expected_isin
-        && let Some(matching_profile) = candidates.iter().copied().find(|profile| {
-            company_overview(*profile)
-                .isin
-                .eq_ignore_ascii_case(expected)
-        })
-    {
-        return Some(matching_profile);
+    if let Some(expected) = expected_isin {
+        let matching_candidates = candidates
+            .iter()
+            .copied()
+            .filter(|profile| {
+                page_isin_for_compare(&company_overview(*profile).isin).as_deref() == Some(expected)
+            })
+            .collect::<Vec<_>>();
+        if !matching_candidates.is_empty() {
+            return select_preferred_profile(&matching_candidates);
+        }
     }
+    select_preferred_profile(&candidates)
+}
+
+fn select_preferred_profile<'a>(
+    candidates: &[ProfileCandidate<'a>],
+) -> Option<ProfileCandidate<'a>> {
     let analysis_candidates = candidates
         .iter()
         .copied()
         .filter(|profile| profile_has_extended_analysis(*profile))
         .collect::<Vec<_>>();
     let preferred_fallback_candidates = if analysis_candidates.is_empty() {
-        &candidates
+        candidates
     } else {
         &analysis_candidates
     };
@@ -396,6 +405,13 @@ fn normalize_expected_isin(expected_isin: Option<&str>) -> Result<Option<String>
             "expected_isin must be an ISIN, optionally followed by a suffix.",
         ))
     }
+}
+
+fn page_isin_for_compare(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let isin = trimmed.split_once('.').map_or(trimmed, |(isin, _)| isin);
+    let isin = isin.to_ascii_uppercase();
+    is_isin(&isin).then_some(isin)
 }
 
 fn is_isin(value: &str) -> bool {

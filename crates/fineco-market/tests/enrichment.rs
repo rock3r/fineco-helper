@@ -366,12 +366,12 @@ fn selects_the_profile_that_matches_expected_isin() {
           "state": { "data": { "data": {
             "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
             "unique_symbol": "LSE:VHYL",
-            "isin_symbol": "IE00B8GKDB10",
+            "isin_symbol": "IE00B8GKDB10.AF",
             "analysis": { "data": { "extended": { "data": {
               "raw_data": { "data": { "fund_info": {
                 "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
                 "unique_symbol": "LSE:VHYL",
-                "isin_symbol": "IE00B8GKDB10"
+                "isin_symbol": "IE00B8GKDB10.AF"
               } } },
               "analysis": {},
               "scores": {}
@@ -926,6 +926,45 @@ fn expected_isin_metadata_profile_beats_generic_analysis_match() {
 }
 
 #[test]
+fn expected_isin_prefers_full_analysis_profile_over_matching_metadata() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:LIGHT",
+            "isin_symbol": "IE00GINC0001"
+          } } }
+        },
+        {
+          "queryKey": ["fund", "full"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC",
+            "isin_symbol": "IE00GINC0001",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF",
+                "unique_symbol": "LSE:GINC",
+                "isin_symbol": "IE00GINC0001"
+              } } },
+              "analysis": { "dividend": { "yield": 0.04 } },
+              "scores": { "total": 17 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("IE00GINC0001"))
+        .expect("full matching profile should win over metadata shell");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.scores["total"], serde_json::json!(17));
+}
+
+#[test]
 fn blank_expected_isin_preserves_first_usable_profile_selection() {
     let payload = r#"{
       "queries": [
@@ -1167,6 +1206,15 @@ fn expected_isin_suffix_is_ignored_for_verification() {
     .expect("report should build");
 
     assert_eq!(report.company.isin, "IT0003153621");
+}
+
+#[test]
+fn page_isin_suffix_is_ignored_for_verification() {
+    let payload = canonical_payload().replace("IT0003153621", "IT0003153621.AF");
+    let report = build_enrichment_report(&page(&payload), SOURCE, NOW, Some("IT0003153621"))
+        .expect("page-side ISIN suffix should be ignored for comparison");
+
+    assert_eq!(report.company.isin, "IT0003153621.AF");
 }
 
 #[test]
