@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use ureq::Agent;
 
 use crate::build_enrichment_report;
-use crate::report::{EnrichmentReport, sanitize_text};
+use crate::report::{EnrichmentReport, normalize_expected_isin, sanitize_text};
 use crate::source::{EnrichmentHostAllowlist, validate_fetch_target};
 
 /// Cap the enrichment page read at the network layer (matches the parser's page
@@ -152,10 +152,10 @@ impl MarketClient {
         &self.zero_commission_etfs_url
     }
 
-    /// Fetch and parse the enrichment report for a stock-page `identifier`.
-    /// Slugs use `/stocks/<identifier>`; market-code-like two-segment
-    /// venue/symbol identifiers use `/stock/<venue>/<symbol>`. `fineco_title`,
-    /// when present, adds a title match. `now_iso` stamps `captured_at`.
+    /// Fetch and parse the enrichment report for a venue-qualified ticker
+    /// `identifier`. `<venue>:<symbol>` is normalized to `<venue>/<symbol>`.
+    /// `expected_isin`, when present, verifies the parsed page. `now_iso` stamps
+    /// `captured_at`.
     ///
     /// # Errors
     /// - [`SafeError::invalid_request`] for an unsafe identifier, a non-pinned
@@ -164,21 +164,22 @@ impl MarketClient {
     pub fn fetch_enrichment(
         &self,
         identifier: &str,
-        fineco_title: Option<&str>,
+        expected_isin: Option<&str>,
         now_iso: &str,
     ) -> Result<EnrichmentReport, SafeError> {
-        validate_identifier(identifier)?;
+        let normalized_identifier = normalize_identifier(identifier)?;
+        let normalized_expected_isin = normalize_expected_isin(expected_isin)?;
         let url = format!(
             "{}{}",
             self.enrichment_base.trim_end_matches('/'),
-            enrichment_path(identifier)
+            enrichment_path(&normalized_identifier)
         );
         // Defense in depth: even though the base is trusted config, confirm the
         // built URL still hits a pinned host and a stock-page path.
         validate_fetch_target(&url, &self.allowlist)?;
 
         let html = self.get_text(&url)?;
-        build_enrichment_report(&html, &url, now_iso, fineco_title)
+        build_enrichment_report(&html, &url, now_iso, normalized_expected_isin.as_deref())
     }
 
     /// Fetch and parse the public zero-commission ETF list. `now_iso` stamps
@@ -289,55 +290,86 @@ impl EtfEntry {
     }
 }
 
-/// Validate a stock-page identifier. The identifier may be a slug or a
-/// market-code-like venue/symbol pair, but each character is restricted to the
-/// URL "unreserved" set plus `/`. This admits nothing that could escape the
-/// server-built stock-page route downstream — no scheme, userinfo,
-/// percent-encoding (`%`), backslash, query/fragment, whitespace, or control —
-/// and no empty/`.`/`..` path segment.
-fn validate_identifier(identifier: &str) -> Result<(), SafeError> {
-    let charset_ok = !identifier.is_empty() && identifier.chars().all(is_slug_char);
-    let segments_ok = identifier
-        .split('/')
-        .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
-    if !charset_ok || !segments_ok {
+/// Normalize a venue-qualified ticker into the one route shape the client
+/// builds: `<venue>/<symbol>`. ISINs and bare tickers are rejected here, before
+/// any network request, with actionable safe errors.
+fn normalize_identifier(identifier: &str) -> Result<String, SafeError> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return Err(SafeError::invalid_request("identifier must not be empty."));
+    }
+    if looks_like_isin_with_optional_suffix(identifier) {
         return Err(SafeError::invalid_request(
-            "Enrichment identifier is not a valid stock-page slug.",
+            "identifier must be a venue-qualified ticker; put ISIN values in expected_isin.",
         ));
     }
-    Ok(())
+    if looks_like_bare_ticker(identifier) {
+        return Err(SafeError::invalid_request(
+            "identifier must include a venue, for example LSE/VHYL; bare tickers are ambiguous.",
+        ));
+    }
+
+    let delimiter = match (identifier.contains('/'), identifier.contains(':')) {
+        (true, false) => '/',
+        (false, true) => ':',
+        _ => {
+            return Err(SafeError::invalid_request(
+                "identifier must be a venue-qualified ticker like LSE/VHYL or LSE:VHYL.",
+            ));
+        }
+    };
+    let mut segments = identifier.split(delimiter);
+    let (Some(venue), Some(symbol), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return Err(SafeError::invalid_request(
+            "identifier must be a venue-qualified ticker like LSE/VHYL or LSE:VHYL.",
+        ));
+    };
+    if !looks_like_market_code(venue) || !looks_like_market_code(symbol) {
+        return Err(SafeError::invalid_request(
+            "identifier must be a venue-qualified ticker like LSE/VHYL or LSE:VHYL.",
+        ));
+    }
+    Ok(format!(
+        "{}/{}",
+        venue.to_ascii_uppercase(),
+        symbol.to_ascii_uppercase()
+    ))
 }
 
 fn enrichment_path(identifier: &str) -> String {
-    if is_two_segment_identifier(identifier) {
-        format!("/stock/{identifier}")
-    } else {
-        format!("/stocks/{identifier}")
-    }
-}
-
-fn is_two_segment_identifier(identifier: &str) -> bool {
-    let mut segments = identifier.split('/');
-    let (Some(venue), Some(symbol), None) = (segments.next(), segments.next(), segments.next())
-    else {
-        return false;
-    };
-    looks_like_market_code(venue) && looks_like_market_code(symbol)
+    format!("/stock/{identifier}")
 }
 
 fn looks_like_market_code(segment: &str) -> bool {
-    segment
-        .chars()
-        .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    !segment.is_empty()
         && segment
             .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+            .any(|c| c.is_ascii_alphabetic() || c.is_ascii_digit())
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// The characters allowed in a slug: ASCII alphanumerics, the URL "unreserved"
-/// marks, and the segment separator `/`.
-fn is_slug_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/')
+fn looks_like_bare_ticker(identifier: &str) -> bool {
+    identifier
+        .chars()
+        .any(|c| c.is_ascii_alphabetic() || c.is_ascii_digit())
+        && identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn looks_like_isin_with_optional_suffix(identifier: &str) -> bool {
+    let isin = identifier
+        .split_once('.')
+        .map_or(identifier, |(isin, _)| isin);
+    let chars = isin.chars().collect::<Vec<_>>();
+    chars.len() == 12
+        && chars[0].is_ascii_alphabetic()
+        && chars[1].is_ascii_alphabetic()
+        && chars[2..11].iter().all(|c| c.is_ascii_alphanumeric())
+        && chars[11].is_ascii_digit()
 }
 
 /// Refuse to fetch over cleartext to a non-loopback host. The scheme is fixed

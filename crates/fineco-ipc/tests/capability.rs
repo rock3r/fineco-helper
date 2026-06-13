@@ -128,8 +128,8 @@ fn every_command_maps_to_its_capability() {
         ),
         (
             Request::MarketGetStockEnrichment(MarketEnrichmentParams {
-                identifier: "x".to_string(),
-                fineco_title: None,
+                identifier: "LSE/VHYL".to_string(),
+                expected_isin: None,
             }),
             Capability::MarketRead,
         ),

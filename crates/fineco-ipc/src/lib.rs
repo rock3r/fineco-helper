@@ -133,14 +133,14 @@ pub struct MarketEtfsParams {
     pub query: Option<String>,
 }
 
-/// Parameters for `market_get_stock_enrichment`: an instrument identifier (the
-/// server builds the allowlisted URL) and an optional Fineco title to match.
+/// Parameters for `market_get_stock_enrichment`: a venue-qualified ticker (the
+/// server builds the allowlisted URL) and an optional expected ISIN to verify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MarketEnrichmentParams {
     pub identifier: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fineco_title: Option<String>,
+    pub expected_isin: Option<String>,
 }
 
 impl Request {
@@ -206,8 +206,8 @@ impl Request {
                 if p.identifier.is_empty() {
                     return Err(SafeError::invalid_request("identifier must not be empty."));
                 }
-                if let Some(title) = &p.fineco_title {
-                    check(title)?;
+                if let Some(expected_isin) = &p.expected_isin {
+                    check(expected_isin)?;
                 }
             }
             Request::PortfolioGetHistory(p) => {

@@ -190,10 +190,12 @@ Product (`crates/`):
   `null` outside strings), and parses it with `serde_json` — there is no
   `eval`/`Function`/JS engine. Source URLs are restricted to a **SHA-256-pinned
   host** (`EnrichmentHostAllowlist` — hashes only, no plaintext host in source)
-  with a fixed stock-page route (`/stocks/<slug…>` or
-  `/stock/<venue>/<symbol>` for market-code-like pairs); the server builds the
-  URL from a configured base + a validated identifier (no client `url`, no
-  `validateSource`/`userAgent`).
+  with a fixed stock-page route. The MCP tool accepts a venue-qualified ticker
+  (`<venue>/<symbol>` or `<venue>:<symbol>`), normalizes it to
+  `/stock/<venue>/<symbol>`, and optionally verifies the parsed page against an
+  `expected_isin` (plain ISIN or ISIN plus suffix). The server builds exactly one
+  URL from a configured base + the validated identifier (no client `url`, no
+  lookup/guessing, no `validateSource`/`userAgent`).
   Output is bounded/sanitized. `MarketClient` uses `ureq`+rustls (redirects
   disabled). Depends on `fineco-core` (+ `serde`/`serde_json`/`sha2`).
 

@@ -19,7 +19,7 @@ fn owner_policy() -> Policy {
 }
 
 const ETF_PATH: &str = "/common-pvt/js/json/etf-zero/etf_piu_scambiati.json";
-const ENRICHMENT_ID: &str = "it/diversified-financials/syn-tip/synth-shares";
+const ENRICHMENT_ID: &str = "BIT/TIP";
 /// The market tools never reach the store socket; this path is never bound.
 const UNUSED_SOCKET: &str = "/tmp/fineco-gateway-market-unused.sock";
 
@@ -101,7 +101,18 @@ async fn etf_tool_applies_the_query_filter() {
 
 #[tokio::test]
 async fn enrichment_tool_answers_from_the_mock() {
-    let enrichment = spawn(mock_enrichment::route);
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
     let gateway = Gateway::new(UNUSED_SOCKET)
         .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
         .with_policy(owner_policy());
@@ -109,7 +120,7 @@ async fn enrichment_tool_answers_from_the_mock() {
     let report = gateway
         .market_get_stock_enrichment(Parameters(MarketEnrichmentParams {
             identifier: ENRICHMENT_ID.to_string(),
-            fineco_title: Some("Tamburi Investment Partners IT0003153621".to_string()),
+            expected_isin: Some("IT0003153621".to_string()),
         }))
         .await
         .expect("enrichment tool")
@@ -119,11 +130,7 @@ async fn enrichment_tool_answers_from_the_mock() {
         "SYNTHETIC Tamburi Investment Partners SpA"
     );
     assert_eq!(report.company.isin, "IT0003153621");
-    assert_eq!(report.title_match.expect("a match").verdict, "strong");
-    assert_eq!(
-        report.source_url,
-        format!("{enrichment}/stocks/{ENRICHMENT_ID}")
-    );
+    assert_eq!(report.source_url, format!("{enrichment}/stock/BIT/TIP"));
 }
 
 #[tokio::test]
@@ -139,7 +146,7 @@ async fn enrichment_tool_rejects_an_empty_identifier_before_any_request() {
     let err = match gateway
         .market_get_stock_enrichment(Parameters(MarketEnrichmentParams {
             identifier: String::new(),
-            fineco_title: None,
+            expected_isin: None,
         }))
         .await
     {
