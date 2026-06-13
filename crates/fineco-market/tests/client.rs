@@ -83,6 +83,59 @@ fn fetches_and_parses_enrichment_over_http() {
 }
 
 #[test]
+fn two_segment_identifier_fetches_singular_stock_page_path() {
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/LSE/VHYL" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let etf = spawn(mock_fineco::route);
+    let client = client_for(&enrichment, &format!("{etf}{ETF_PATH}"));
+
+    let report = client
+        .fetch_enrichment("LSE/VHYL", Some("VHYL"), NOW)
+        .expect("two-segment stock-page identifier should fetch /stock/");
+
+    assert_eq!(report.source_url, format!("{enrichment}/stock/LSE/VHYL"));
+    assert_eq!(report.company.ticker, "BIT:TIP");
+}
+
+#[test]
+fn lowercase_two_segment_slug_keeps_plural_stocks_path() {
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stocks/it/synth-shares" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let etf = spawn(mock_fineco::route);
+    let client = client_for(&enrichment, &format!("{etf}{ETF_PATH}"));
+
+    let report = client
+        .fetch_enrichment("it/synth-shares", Some("Synthetic Shares"), NOW)
+        .expect("two-segment slug should keep /stocks/");
+
+    assert_eq!(
+        report.source_url,
+        format!("{enrichment}/stocks/it/synth-shares")
+    );
+    assert_eq!(report.company.ticker, "BIT:TIP");
+}
+
+#[test]
 fn rejects_unsafe_identifier_before_any_request() {
     // Pointed at a dead port: the identifier guard must fire before connecting.
     let client = client_for("http://127.0.0.1:9", "http://127.0.0.1:9/etf");

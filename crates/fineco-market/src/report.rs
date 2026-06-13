@@ -1,6 +1,6 @@
 //! Build a bounded, structured enrichment report from the parsed query cache.
 //!
-//! Navigates the React-Query cache to the `company` entry, extracts the company
+//! Navigates the React-Query cache to a profile entry, extracts the company/fund
 //! overview, scores, and per-section metrics, and optionally scores a Fineco
 //! title match. All external free text and raw score/metric output is
 //! size-limited and reduced to primitives — never echoed unbounded.
@@ -16,6 +16,13 @@ pub(crate) const MAX_STR: usize = 4096;
 const MAX_SCORE_ENTRIES: usize = 64;
 /// Max metric entries kept per analysis section (mirrors the TS `slice(0, 16)`).
 const MAX_METRICS_PER_SECTION: usize = 16;
+/// React-Query profile keys observed for enrichment pages. Equities use
+/// `company`; ETF/fund pages can use fund-oriented keys with the same nested
+/// analysis shape.
+const PROFILE_QUERY_KEYS: [&str; 3] = ["company", "fund", "etf"];
+/// Raw-info object keys observed under `raw_data.data`.
+const COMPANY_RAW_INFO_KEYS: &[&str] = &["company_info"];
+const FUND_RAW_INFO_KEYS: &[&str] = &["fund_info", "asset_info"];
 /// The analysis sections surfaced as metrics, in order.
 const METRIC_SECTIONS: [&str; 6] = [
     "value",
@@ -25,6 +32,12 @@ const METRIC_SECTIONS: [&str; 6] = [
     "dividend",
     "management",
 ];
+
+#[derive(Clone, Copy)]
+struct ProfileCandidate<'a> {
+    kind: &'a str,
+    data: &'a Value,
+}
 
 /// The company overview extracted from the enrichment page.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -65,49 +78,32 @@ pub struct EnrichmentReport {
 /// validated `source_url`. If `fineco_title` is given, include a title match.
 ///
 /// # Errors
-/// Returns [`SafeError::invalid_request`] if the cache lacks a `company` entry.
+/// Returns [`SafeError::invalid_request`] if the cache lacks a recognized
+/// profile entry.
 pub(crate) fn build_report(
     state: &Value,
     source_url: &str,
     captured_at: &str,
     fineco_title: Option<&str>,
 ) -> Result<EnrichmentReport, SafeError> {
-    let company_root = query(state, "company")
-        .and_then(|data| data.get("data"))
-        .ok_or_else(|| SafeError::invalid_request("Enrichment page has no company data."))?;
+    let profile = profile_query(state, fineco_title)
+        .ok_or_else(|| SafeError::invalid_request("Enrichment page has no profile data."))?;
+    let profile_root = profile
+        .data
+        .get("data")
+        .ok_or_else(|| SafeError::invalid_request("Enrichment page has no profile data."))?;
 
-    let extended = company_root
+    let extended = profile_root
         .pointer("/analysis/data/extended/data")
         .unwrap_or(&Value::Null);
     let raw = extended.pointer("/raw_data/data").unwrap_or(&Value::Null);
     let analysis = extended.get("analysis").unwrap_or(&Value::Null);
     let scores_src = extended
         .get("scores")
-        .or_else(|| company_root.pointer("/score/data"))
+        .or_else(|| profile_root.pointer("/score/data"))
         .unwrap_or(&Value::Null);
 
-    let info = raw
-        .get("company_info")
-        .or_else(|| company_root.get("info"))
-        .unwrap_or(&Value::Null);
-
-    let company = CompanyOverview {
-        name: pick_str(info, "name")
-            .or_else(|| pick_str(company_root, "name"))
-            .unwrap_or_default(),
-        ticker: pick_str(info, "unique_symbol")
-            .or_else(|| pick_str(company_root, "unique_symbol"))
-            .unwrap_or_default(),
-        exchange: pick_str(info, "exchange_symbol")
-            .or_else(|| pick_str(company_root, "exchange_symbol"))
-            .unwrap_or_default(),
-        isin: pick_str(info, "isin_symbol")
-            .or_else(|| pick_str(company_root, "isin_symbol"))
-            .unwrap_or_default(),
-        country: pick_str(info, "country").unwrap_or_default(),
-        website: pick_str(info, "url").unwrap_or_default(),
-        description: pick_str(info, "description").unwrap_or_default(),
-    };
+    let company = company_overview(profile);
 
     let mut warnings = Vec::new();
     if company.name.is_empty() {
@@ -133,14 +129,185 @@ pub(crate) fn build_report(
     })
 }
 
-/// Find a React-Query cache entry by name and return its `state.data`.
-fn query<'a>(state: &'a Value, name: &str) -> Option<&'a Value> {
-    state
-        .get("queries")?
-        .as_array()?
+/// Find the best recognized company/fund profile cache entry and return its
+/// `state.data`. If the caller supplied a Fineco title, prefer the profile whose
+/// extracted display name/ticker/ISIN best matches it; otherwise keep the cache
+/// source order.
+fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<ProfileCandidate<'a>> {
+    let candidates = profile_queries(state);
+    let analysis_candidates = candidates
         .iter()
-        .find(|entry| entry.pointer("/queryKey/0").and_then(Value::as_str) == Some(name))?
-        .pointer("/state/data")
+        .copied()
+        .filter(|profile| profile_has_extended_analysis(*profile))
+        .collect::<Vec<_>>();
+    let preferred_fallback_candidates = if analysis_candidates.is_empty() {
+        &candidates
+    } else {
+        &analysis_candidates
+    };
+    let first_usable = preferred_fallback_candidates
+        .iter()
+        .copied()
+        .find(|profile| profile_is_usable(*profile))
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|profile| profile_is_usable(*profile))
+        })
+        .or_else(|| preferred_fallback_candidates.first().copied())
+        .or_else(|| candidates.first().copied());
+    let Some(title) = fineco_title.filter(|title| !tokens(title).is_empty()) else {
+        return first_usable;
+    };
+
+    let first_match = first_usable.map(|profile| {
+        let company = company_overview(profile);
+        let title_match = match_title(title, &company);
+        (profile, company, title_match)
+    });
+    let mut best = None;
+    let mut best_score = 0.0_f64;
+    let mut best_has_extended_analysis = false;
+    let mut best_has_identifier_match = false;
+    for candidate in candidates {
+        let company = company_overview(candidate);
+        let title_match = match_title(title, &company);
+        if !is_decisive_profile_match(&title_match, &company) {
+            continue;
+        }
+        if shorter_exact_name_would_replace_strong_first(
+            first_match.as_ref(),
+            candidate,
+            &company,
+            &title_match,
+        ) {
+            continue;
+        }
+        let score = title_match.score;
+        let has_extended_analysis = profile_has_extended_analysis(candidate);
+        let has_identifier_match = has_identifier_match(&title_match);
+        let should_replace = best.is_none()
+            || (score > best_score
+                && (!best_has_extended_analysis
+                    || has_extended_analysis
+                    || (has_identifier_match && !best_has_identifier_match)))
+            || (score == best_score && has_extended_analysis && !best_has_extended_analysis);
+        if should_replace {
+            best = Some(candidate);
+            best_score = score;
+            best_has_extended_analysis = has_extended_analysis;
+            best_has_identifier_match = has_identifier_match;
+        }
+    }
+    best.or(first_usable)
+}
+
+fn profile_queries(state: &Value) -> Vec<ProfileCandidate<'_>> {
+    state
+        .get("queries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let kind = entry.pointer("/queryKey/0").and_then(Value::as_str)?;
+            if !PROFILE_QUERY_KEYS.contains(&kind) {
+                return None;
+            }
+            let data = entry.pointer("/state/data")?;
+            Some(ProfileCandidate { kind, data })
+        })
+        .collect()
+}
+
+fn profile_has_extended_analysis(profile: ProfileCandidate<'_>) -> bool {
+    profile
+        .data
+        .pointer("/data/analysis/data/extended/data")
+        .is_some()
+}
+
+fn profile_is_usable(profile: ProfileCandidate<'_>) -> bool {
+    profile.data.get("data").is_some_and(|root| {
+        let raw = root
+            .pointer("/analysis/data/extended/data/raw_data/data")
+            .unwrap_or(&Value::Null);
+        raw_info_values(raw, profile.kind).any(has_display_field)
+            || root.get("info").is_some_and(has_display_field)
+            || has_display_field(root)
+    })
+}
+
+fn company_overview(profile: ProfileCandidate<'_>) -> CompanyOverview {
+    let root = profile.data.get("data").unwrap_or(&Value::Null);
+    let raw = root
+        .pointer("/analysis/data/extended/data/raw_data/data")
+        .unwrap_or(&Value::Null);
+    CompanyOverview {
+        name: pick_profile_str(raw, profile.kind, root, "name").unwrap_or_default(),
+        ticker: pick_profile_str(raw, profile.kind, root, "unique_symbol").unwrap_or_default(),
+        exchange: pick_profile_str(raw, profile.kind, root, "exchange_symbol").unwrap_or_default(),
+        isin: pick_profile_str(raw, profile.kind, root, "isin_symbol").unwrap_or_default(),
+        country: pick_profile_str(raw, profile.kind, root, "country").unwrap_or_default(),
+        website: pick_profile_str(raw, profile.kind, root, "url").unwrap_or_default(),
+        description: pick_profile_str(raw, profile.kind, root, "description").unwrap_or_default(),
+    }
+}
+
+fn pick_profile_str(raw: &Value, profile_kind: &str, root: &Value, key: &str) -> Option<String> {
+    pick_raw_str(raw, profile_kind, key)
+        .or_else(|| root.get("info").and_then(|info| pick_str(info, key)))
+        .or_else(|| pick_str(root, key))
+}
+
+fn pick_raw_str(raw: &Value, profile_kind: &str, key: &str) -> Option<String> {
+    raw_info_values(raw, profile_kind).find_map(|value| pick_str(value, key))
+}
+
+fn raw_info_values<'a>(
+    raw: &'a Value,
+    profile_kind: &str,
+) -> impl Iterator<Item = &'a Value> + use<'a> {
+    let mut values = raw_info_keys(profile_kind)
+        .iter()
+        .filter_map(|key| raw.get(key))
+        .filter(|value| raw_info_score(value) > 0)
+        .collect::<Vec<_>>();
+    values.sort_by_key(|value| std::cmp::Reverse(raw_info_score(value)));
+    values.into_iter()
+}
+
+fn raw_info_keys(profile_kind: &str) -> &'static [&'static str] {
+    match profile_kind {
+        "fund" | "etf" => FUND_RAW_INFO_KEYS,
+        _ => COMPANY_RAW_INFO_KEYS,
+    }
+}
+
+fn raw_info_score(value: &Value) -> usize {
+    let display_fields = ["name", "unique_symbol", "exchange_symbol", "isin_symbol"]
+        .into_iter()
+        .filter(|key| pick_str(value, key).is_some())
+        .count();
+    let non_empty_primitives = non_empty_primitive_count(value);
+    display_fields * 100 + non_empty_primitives
+}
+
+fn non_empty_primitive_count(value: &Value) -> usize {
+    value
+        .as_object()
+        .map(|map| {
+            map.values()
+                .filter(|value| is_primitive(value) && !clean_value(value).is_empty())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn has_display_field(value: &Value) -> bool {
+    ["name", "unique_symbol", "exchange_symbol", "isin_symbol"]
+        .into_iter()
+        .any(|key| pick_str(value, key).is_some())
 }
 
 /// Cleaned, length-bounded string for `object[key]`, or `None` if absent/empty.
@@ -285,6 +452,7 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
 
     let fineco_tokens = tokens(fineco_title);
     let source_tokens = tokens(&enrichment_title);
+    let company_name_tokens = tokens(&company.name);
     let overlap: Vec<String> = fineco_tokens
         .iter()
         .filter(|t| source_tokens.contains(*t))
@@ -300,6 +468,12 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
     let mut score = 0.0_f64;
     let mut reasons = Vec::new();
 
+    if contains_token_sequence(&fineco_tokens, &company_name_tokens)
+        || contains_token_sequence(&company_name_tokens, &fineco_tokens)
+    {
+        score += 0.4;
+        reasons.push("name match".to_string());
+    }
     if !company.isin.is_empty()
         && fineco_title
             .to_lowercase()
@@ -340,6 +514,54 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
     }
 }
 
+fn is_decisive_profile_match(title_match: &EnrichmentMatch, company: &CompanyOverview) -> bool {
+    let has_identifier_match = title_match
+        .reasons
+        .iter()
+        .any(|reason| reason == "ISIN match" || reason == "ticker match");
+    let fineco_tokens = tokens(&title_match.fineco_title);
+    let company_name_tokens = tokens(&company.name);
+    let has_strong_name_match = title_match.verdict == "strong"
+        && title_match
+            .reasons
+            .iter()
+            .any(|reason| reason == "name match")
+        && contains_token_sequence(&fineco_tokens, &company_name_tokens);
+
+    has_identifier_match || has_strong_name_match
+}
+
+fn shorter_exact_name_would_replace_strong_first(
+    first_match: Option<&(ProfileCandidate<'_>, CompanyOverview, EnrichmentMatch)>,
+    candidate: ProfileCandidate<'_>,
+    company: &CompanyOverview,
+    title_match: &EnrichmentMatch,
+) -> bool {
+    let Some((first_profile, first_company, first_title_match)) = first_match else {
+        return false;
+    };
+    if std::ptr::eq(candidate.data, first_profile.data) {
+        return false;
+    }
+    if first_title_match.verdict != "strong" || has_identifier_match(title_match) {
+        return false;
+    }
+
+    normalized_title_key(&title_match.fineco_title) == normalized_title_key(&company.name)
+        && tokens(&company.name).len() < tokens(&first_company.name).len()
+}
+
+fn has_identifier_match(title_match: &EnrichmentMatch) -> bool {
+    title_match
+        .reasons
+        .iter()
+        .any(|reason| reason == "ISIN match" || reason == "ticker match")
+}
+
+fn normalized_title_key(value: &str) -> String {
+    tokens(value).join(" ")
+}
+
 /// Lowercase alphanumeric tokens, dropping single-character tokens and
 /// stopwords. (No NFKD normalization — inputs here are ASCII tickers/ISINs and
 /// largely-Latin company names.)
@@ -353,6 +575,14 @@ fn tokens(value: &str) -> Vec<String> {
         .filter(|t| t.chars().count() > 1 && !STOPWORDS.contains(t))
         .map(str::to_string)
         .collect()
+}
+
+fn contains_token_sequence(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[cfg(test)]

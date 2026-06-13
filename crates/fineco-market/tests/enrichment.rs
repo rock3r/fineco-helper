@@ -98,6 +98,1041 @@ fn extracts_company_scores_and_metrics() {
 }
 
 #[test]
+fn extracts_fund_scores_and_metrics_from_etf_pages() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": {
+            "data": {
+              "data": {
+                "name": "Fallback ETF Name",
+                "unique_symbol": "LSE:VHYL",
+                "exchange_symbol": "LSE",
+                "isin_symbol": "IE00B8GKDB10",
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "fund_info": {
+                              "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                              "unique_symbol": "LSE:VHYL",
+                              "exchange_symbol": "LSE",
+                              "isin_symbol": "IE00B8GKDB10",
+                              "country": "Ireland",
+                              "url": "https://www.vanguard.example",
+                              "description": "Synthetic ETF profile."
+                            }
+                          }
+                        },
+                        "analysis": {
+                          "value": { "expense_ratio": 0.0029 },
+                          "future": {},
+                          "past": {},
+                          "health": {},
+                          "dividend": { "yield": 0.037 },
+                          "management": {}
+                        },
+                        "scores": { "value": 3, "dividend": 5, "total": 16 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF"),
+    )
+    .expect("fund-style ETF report should build");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+    assert_eq!(report.company.isin, "IE00B8GKDB10");
+    assert_eq!(report.company.country, "Ireland");
+    assert_eq!(
+        report.metrics["value"]["expense_ratio"],
+        serde_json::json!(0.0029)
+    );
+    assert_eq!(
+        report.metrics["dividend"]["yield"],
+        serde_json::json!(0.037)
+    );
+    assert_eq!(report.scores["total"], serde_json::json!(16));
+    assert_eq!(report.title_match.expect("a title match").verdict, "strong");
+}
+
+#[test]
+fn skips_empty_raw_info_entries_for_fund_pages() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": {
+            "data": {
+              "data": {
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "company_info": {},
+                            "fund_info": {
+                              "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                              "unique_symbol": "LSE:VHYL",
+                              "exchange_symbol": "LSE",
+                              "isin_symbol": "IE00B8GKDB10"
+                            }
+                          }
+                        },
+                        "analysis": {},
+                        "scores": {}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("fund info should not be shadowed by empty company info");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn sparse_company_info_does_not_shadow_richer_fund_info() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": {
+            "data": {
+              "data": {
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "company_info": {
+                              "unique_symbol": "LSE:PLACEHOLDER"
+                            },
+                            "fund_info": {
+                              "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                              "unique_symbol": "LSE:VHYL",
+                              "exchange_symbol": "LSE",
+                              "isin_symbol": "IE00B8GKDB10",
+                              "country": "Ireland",
+                              "url": "https://www.vanguard.example",
+                              "description": "Synthetic ETF profile."
+                            }
+                          }
+                        },
+                        "analysis": {},
+                        "scores": {}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("sparse placeholder should not shadow fund info");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+    assert_eq!(report.company.country, "Ireland");
+}
+
+#[test]
+fn fund_profile_prefers_fund_info_over_populated_company_info() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "global-income"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {
+                "company_info": {
+                  "name": "Global Asset Manager plc",
+                  "unique_symbol": "LSE:GAM",
+                  "exchange_symbol": "LSE",
+                  "isin_symbol": "GB0000000001",
+                  "country": "United Kingdom",
+                  "url": "https://manager.example",
+                  "description": "Synthetic manager profile."
+                },
+                "fund_info": {
+                  "name": "Global Income UCITS ETF",
+                  "unique_symbol": "LSE:GINC",
+                  "isin_symbol": "IE00B8GKDB10"
+                }
+              } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("fund profile should prefer fund metadata");
+
+    assert_eq!(report.company.name, "Global Income UCITS ETF");
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.company.isin, "IE00B8GKDB10");
+    assert_eq!(report.company.country, "");
+    assert_eq!(report.company.website, "");
+    assert_eq!(report.company.description, "");
+}
+
+#[test]
+fn company_profile_ignores_stale_fund_info() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "tip"],
+          "state": { "data": { "data": {
+            "name": "Fallback Company Name",
+            "unique_symbol": "BIT:FALLBACK",
+            "info": {
+              "name": "Info Company Name",
+              "unique_symbol": "BIT:INFO"
+            },
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Stale Fund Profile",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("company profile should ignore stale fund info");
+
+    assert_eq!(report.company.name, "Info Company Name");
+    assert_eq!(report.company.ticker, "BIT:INFO");
+}
+
+#[test]
+fn selects_the_profile_that_matches_the_fineco_title() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Company plc",
+            "unique_symbol": "LSE:OLD",
+            "isin_symbol": "GB0000000000",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": { "name": "Unrelated Company plc" } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "isin_symbol": "IE00B8GKDB10",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL",
+                "isin_symbol": "IE00B8GKDB10"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF"),
+    )
+    .expect("matching fund profile should win over stale company profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn skips_unusable_company_profile_without_a_fineco_title() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "placeholder"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {} } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("usable fund profile should win over empty company profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn preserves_react_query_order_when_no_fineco_title_is_supplied() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Company plc",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Unrelated Company plc",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("source-order fund profile should be selected");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn metadata_only_company_profile_does_not_shadow_usable_fund_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "country": "United Kingdom"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("metadata-only stale company profile should not shadow usable fund profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn fund_profile_merges_split_raw_metadata_fields() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {
+                "fund_info": {
+                  "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                  "unique_symbol": "LSE:VHYL",
+                  "isin_symbol": "IE00B8GKDB10"
+                },
+                "asset_info": {
+                  "country": "Ireland",
+                  "url": "https://www.vanguard.example",
+                  "description": "Synthetic split ETF metadata."
+                }
+              } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("split raw metadata should be merged field by field");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+    assert_eq!(report.company.country, "Ireland");
+    assert_eq!(report.company.website, "https://www.vanguard.example");
+    assert_eq!(report.company.description, "Synthetic split ETF metadata.");
+}
+
+#[test]
+fn fund_profile_prefers_richer_raw_metadata_object() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "income"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {
+                "fund_info": {
+                  "name": "Placeholder Income Fund"
+                },
+                "asset_info": {
+                  "name": "Global Income UCITS ETF",
+                  "unique_symbol": "LSE:GINC",
+                  "exchange_symbol": "LSE",
+                  "isin_symbol": "IE00SYNTH001",
+                  "country": "Ireland",
+                  "url": "https://www.example.com/global-income",
+                  "description": "Richer synthetic ETF metadata."
+                }
+              } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("richer raw metadata object should be preferred");
+
+    assert_eq!(report.company.name, "Global Income UCITS ETF");
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.company.exchange, "LSE");
+    assert_eq!(report.company.isin, "IE00SYNTH001");
+    assert_eq!(report.company.country, "Ireland");
+    assert_eq!(
+        report.company.website,
+        "https://www.example.com/global-income"
+    );
+    assert_eq!(report.company.description, "Richer synthetic ETF metadata.");
+}
+
+#[test]
+fn preserves_react_query_order_when_title_scores_tie() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Global Income Fund",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income Fund",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income Holdings plc",
+            "unique_symbol": "LSE:GLOB",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income Holdings plc",
+                "unique_symbol": "LSE:GLOB"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
+        .expect("source-order profile should win tied title scores");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+}
+
+#[test]
+fn generic_title_overlap_does_not_replace_the_first_usable_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income Fund",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income Fund",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
+        .expect("generic title overlap should not switch profiles");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+}
+
+#[test]
+fn short_exact_title_does_not_replace_a_more_specific_first_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": { "dividend": { "yield": 0.04 } },
+              "scores": { "total": 17 }
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": { "value": { "pe": 10 } },
+              "scores": { "total": 8 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
+        .expect("short title should keep the more specific first profile");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.scores["total"], serde_json::json!(17));
+}
+
+#[test]
+fn strong_name_match_can_replace_a_stale_first_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Vanguard Group plc",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Vanguard Group plc",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF USD Distributing"),
+    )
+    .expect("strong fund name match should replace stale first profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn metadata_only_profile_does_not_shadow_later_analysis_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:LIGHT"
+          } } }
+        },
+        {
+          "queryKey": ["fund", "full"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": { "dividend": { "yield": 0.04 } },
+              "scores": { "total": 17 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report =
+        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income UCITS ETF"))
+            .expect("full analysis profile should win over metadata-only cache entry");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.scores["total"], serde_json::json!(17));
+}
+
+#[test]
+fn exact_metadata_title_does_not_shadow_matching_analysis_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "full"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF USD Distributing Accumulating Hedged Class",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF USD Distributing Accumulating Hedged Class",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": { "dividend": { "yield": 0.04 } },
+              "scores": { "total": 17 }
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Global Income UCITS ETF GINC"),
+    )
+    .expect("matching full analysis profile should win over exact metadata shell");
+
+    assert_eq!(
+        report.company.name,
+        "Global Income UCITS ETF USD Distributing Accumulating Hedged Class"
+    );
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.scores["total"], serde_json::json!(17));
+}
+
+#[test]
+fn title_matched_metadata_profile_can_beat_stale_analysis_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Company plc",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Unrelated Company plc",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": { "value": { "pe": 10 } },
+              "scores": { "total": 8 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report =
+        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income UCITS ETF"))
+            .expect("title-matched metadata profile should beat stale analysis shell");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert!(report.scores.as_object().expect("scores object").is_empty());
+}
+
+#[test]
+fn identifier_matched_metadata_profile_beats_generic_analysis_match() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": { "value": { "pe": 10 } },
+              "scores": { "total": 8 }
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Global Income UCITS ETF GINC"),
+    )
+    .expect("identifier-matched metadata profile should beat generic analysis match");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert!(report.scores.as_object().expect("scores object").is_empty());
+}
+
+#[test]
+fn title_match_does_not_score_substring_tokens_as_name_matches() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "meta"],
+          "state": { "data": { "data": {
+            "name": "Meta",
+            "unique_symbol": "NasdaqGS:META",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": { "name": "Meta", "unique_symbol": "NasdaqGS:META" } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report =
+        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Metaverse Holdings ETF"))
+            .expect("report should build");
+    let title_match = report.title_match.expect("title match");
+
+    assert_eq!(title_match.score, 0.0);
+    assert!(
+        !title_match
+            .reasons
+            .iter()
+            .any(|reason| reason == "name match")
+    );
+}
+
+#[test]
+fn empty_fineco_title_does_not_create_a_name_match() {
+    let report = build_enrichment_report(&page(&canonical_payload()), SOURCE, NOW, Some(""))
+        .expect("report should build");
+    let title_match = report.title_match.expect("title match");
+
+    assert_eq!(title_match.score, 0.0);
+    assert!(title_match.reasons.is_empty());
+}
+
+#[test]
+fn blank_fineco_title_preserves_first_usable_profile_selection() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "tip"],
+          "state": { "data": { "data": {
+            "name": "SYNTHETIC Tamburi Investment Partners SpA",
+            "unique_symbol": "BIT:TIP",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "SYNTHETIC Tamburi Investment Partners SpA",
+                "unique_symbol": "BIT:TIP"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Fund",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Unrelated Fund",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("   "))
+        .expect("blank title should behave like no title for profile selection");
+
+    assert_eq!(report.company.ticker, "BIT:TIP");
+}
+
+#[test]
+fn no_title_falls_back_to_usable_metadata_after_empty_analysis_shell() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale-analysis"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {} },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "metadata"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("usable metadata profile should win when analysis shells are empty");
+
+    assert_eq!(report.company.name, "Global Income UCITS ETF");
+    assert_eq!(report.company.ticker, "LSE:GINC");
+}
+
+#[test]
+fn partial_recognized_profile_builds_a_warning_report() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "partial"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {} },
+              "analysis": { "value": { "pe": 12.3 } },
+              "scores": { "value": 4 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("partial recognized profile should still return a bounded report");
+
+    assert_eq!(report.company.name, "");
+    assert_eq!(report.metrics["value"]["pe"], serde_json::json!(12.3));
+    assert_eq!(report.scores["value"], serde_json::json!(4));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|item| item == "Missing company name.")
+    );
+}
+
+#[test]
+fn metadata_only_raw_info_augments_profile_root_display_fields() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "tip"],
+          "state": { "data": { "data": {
+            "name": "SYNTHETIC Tamburi Investment Partners SpA",
+            "unique_symbol": "BIT:TIP",
+            "exchange_symbol": "BIT",
+            "isin_symbol": "IT0003153621",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "country": "Italy",
+                "url": "https://www.tamburi.example",
+                "description": "Synthetic metadata-only raw profile."
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("metadata-only raw info should augment root display fields");
+
+    assert_eq!(
+        report.company.name,
+        "SYNTHETIC Tamburi Investment Partners SpA"
+    );
+    assert_eq!(report.company.ticker, "BIT:TIP");
+    assert_eq!(report.company.country, "Italy");
+    assert_eq!(report.company.website, "https://www.tamburi.example");
+    assert_eq!(
+        report.company.description,
+        "Synthetic metadata-only raw profile."
+    );
+}
+
+#[test]
 fn parse_is_data_only_not_execution() {
     // A metric value that looks like injected code is kept verbatim as data —
     // never interpreted. (Reaching this assertion at all means nothing ran it.)
@@ -220,8 +1255,10 @@ fn allowlist() -> EnrichmentHostAllowlist {
 fn accepts_allowlisted_https_stock_url() {
     assert!(validate_source_url(SOURCE, &allowlist()).is_ok());
     // A locale-prefixed path is accepted (the locale is stripped before the
-    // /stocks/ check).
+    // stock-page route check).
     assert!(validate_source_url("https://stocks.example/it/stocks/foo/bar", &allowlist()).is_ok());
+    assert!(validate_source_url("https://stocks.example/stock/LSE/VHYL", &allowlist()).is_ok());
+    assert!(validate_source_url("https://stocks.example/it/stock/LSE/VHYL", &allowlist()).is_ok());
 }
 
 #[test]
