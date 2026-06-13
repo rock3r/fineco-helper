@@ -604,6 +604,47 @@ fn partial_recognized_profile_builds_a_warning_report() {
 }
 
 #[test]
+fn metadata_only_raw_info_augments_profile_root_display_fields() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "tip"],
+          "state": { "data": { "data": {
+            "name": "SYNTHETIC Tamburi Investment Partners SpA",
+            "unique_symbol": "BIT:TIP",
+            "exchange_symbol": "BIT",
+            "isin_symbol": "IT0003153621",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "country": "Italy",
+                "url": "https://www.tamburi.example",
+                "description": "Synthetic metadata-only raw profile."
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("metadata-only raw info should augment root display fields");
+
+    assert_eq!(
+        report.company.name,
+        "SYNTHETIC Tamburi Investment Partners SpA"
+    );
+    assert_eq!(report.company.ticker, "BIT:TIP");
+    assert_eq!(report.company.country, "Italy");
+    assert_eq!(report.company.website, "https://www.tamburi.example");
+    assert_eq!(
+        report.company.description,
+        "Synthetic metadata-only raw profile."
+    );
+}
+
+#[test]
 fn parse_is_data_only_not_execution() {
     // A metric value that looks like injected code is kept verbatim as data —
     // never interpreted. (Reaching this assertion at all means nothing ran it.)

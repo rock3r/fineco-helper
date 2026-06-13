@@ -246,11 +246,19 @@ fn raw_info_score(value: &Value) -> usize {
         .into_iter()
         .filter(|key| pick_str(value, key).is_some())
         .count();
-    if display_fields == 0 {
-        0
-    } else {
-        display_fields * 100 + primitive_count(value)
-    }
+    let non_empty_primitives = non_empty_primitive_count(value);
+    display_fields * 100 + non_empty_primitives
+}
+
+fn non_empty_primitive_count(value: &Value) -> usize {
+    value
+        .as_object()
+        .map(|map| {
+            map.values()
+                .filter(|value| is_primitive(value) && !clean_value(value).is_empty())
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn has_display_field(value: &Value) -> bool {
