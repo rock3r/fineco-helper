@@ -190,8 +190,10 @@ Product (`crates/`):
   `null` outside strings), and parses it with `serde_json` — there is no
   `eval`/`Function`/JS engine. Source URLs are restricted to a **SHA-256-pinned
   host** (`EnrichmentHostAllowlist` — hashes only, no plaintext host in source)
-  with a `/stocks/` path; the server builds the URL from a configured base + a
-  validated slug identifier (no client `url`, no `validateSource`/`userAgent`).
+  with a fixed stock-page route (`/stocks/<slug…>` or
+  `/stock/<venue>/<symbol>` for market-code-like pairs); the server builds the
+  URL from a configured base + a validated identifier (no client `url`, no
+  `validateSource`/`userAgent`).
   Output is bounded/sanitized. `MarketClient` uses `ureq`+rustls (redirects
   disabled). Depends on `fineco-core` (+ `serde`/`serde_json`/`sha2`).
 
@@ -211,9 +213,9 @@ false`):
   transactions, tax) that return `401` with no data when unauthenticated, and
   the auth-free public ETF list. Serves canned synthetic fixtures.
 - **`e2e/mock-enrichment`** — mock third-party enrichment server: same lib+bin
-  shape; serves a canned synthetic stock page under the real `/stocks/<slug…>`
-  path. The page embeds a parseable `window.__REACT_QUERY_STATE__` plus a
-  never-run `<script>` for parse-not-execute assertions.
+  shape; serves a canned synthetic stock page under the slug route
+  (`/stocks/<slug…>`). The page embeds a parseable `window.__REACT_QUERY_STATE__`
+  plus a never-run `<script>` for parse-not-execute assertions.
 - **`e2e/smoke`** — Docker E2E driver: asserts the mock servers serve their
   fixtures over the network, and (when `GATEWAY_URL` is set) drives a real MCP
   session through the gateway — initialize, a policy-**granted** tool call

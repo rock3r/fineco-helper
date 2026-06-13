@@ -4,16 +4,15 @@
 //! allowed host(s) are pinned by **SHA-256** so no plaintext host needs to live
 //! in source — production supplies the hash (or a hashed-at-startup host from
 //! config), and tests inject the mock host. Every fetched/redirect URL must be
-//! HTTPS, carry no userinfo, hash into the allowlist, and have a `/stocks/`
-//! path. There is no client-supplied URL and no `validateSource` toggle.
+//! HTTPS, carry no userinfo, hash into the allowlist, and have a stock-page path.
+//! There is no client-supplied URL and no `validateSource` toggle.
 
 use std::collections::HashSet;
 
 use fineco_core::SafeError;
 use sha2::{Digest, Sha256};
 
-/// Locale path segments stripped before the `/stocks/` check (mirrors the TS
-/// `^/(de|en|…|tr)(?=/stocks/)` rule).
+/// Locale path segments stripped before the stock-page route check.
 const LOCALE_SEGMENTS: [&str; 10] = ["de", "en", "es", "fr", "it", "ja", "ko", "nl", "sv", "tr"];
 
 /// The set of allowed enrichment hosts, pinned by SHA-256 of the normalized
@@ -56,7 +55,7 @@ impl EnrichmentHostAllowlist {
 }
 
 /// Validate that `url` is an acceptable enrichment source: HTTPS, no userinfo,
-/// an allowlisted host, and a `/stocks/` path.
+/// an allowlisted host, and a stock-page path.
 ///
 /// # Errors
 /// Returns [`SafeError::invalid_request`] with a payload-free message for any
@@ -76,7 +75,7 @@ pub fn validate_source_url(
     check_authority_and_path(authority, path, allowlist)
 }
 
-/// Validates the host pin + `/stocks/` path for a URL the server built from a
+/// Validates the host pin + stock-page path for a URL the server built from a
 /// trusted, configured base. The transport requirement (https, or loopback http
 /// only for the local mock) is enforced separately at the request layer so it
 /// applies uniformly to every market fetch (see the client) — a misconfigured
@@ -91,7 +90,7 @@ pub(crate) fn validate_fetch_target(
     check_authority_and_path(authority, path, allowlist)
 }
 
-/// Shared host/path checks: no userinfo, an allowlisted host, a `/stocks/` path.
+/// Shared host/path checks: no userinfo, an allowlisted host, a stock-page path.
 fn check_authority_and_path(
     authority: &str,
     path: &str,
@@ -123,7 +122,7 @@ fn check_authority_and_path(
             "Enrichment source host is not allowed.",
         ));
     }
-    if !normalized_path(path).starts_with("/stocks/") {
+    if !is_stock_page_path(&normalized_path(path)) {
         return Err(SafeError::invalid_request(
             "Enrichment source URL does not look like a stock page.",
         ));
@@ -159,16 +158,21 @@ fn normalized_host(authority: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Strip a leading locale segment (`/it`, `/en`, …) when it precedes `/stocks/`.
+/// Strip a leading locale segment (`/it`, `/en`, …) when it precedes a stock
+/// page route.
 fn normalized_path(path: &str) -> String {
     for locale in LOCALE_SEGMENTS {
         if let Some(rest) = path.strip_prefix(&format!("/{locale}"))
-            && rest.starts_with("/stocks/")
+            && is_stock_page_path(rest)
         {
             return rest.to_string();
         }
     }
     path.to_string()
+}
+
+fn is_stock_page_path(path: &str) -> bool {
+    path.starts_with("/stocks/") || path.starts_with("/stock/")
 }
 
 /// Lowercase hex SHA-256 of `input`.

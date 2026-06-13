@@ -21,7 +21,8 @@ const MAX_METRICS_PER_SECTION: usize = 16;
 /// analysis shape.
 const PROFILE_QUERY_KEYS: [&str; 3] = ["company", "fund", "etf"];
 /// Raw-info object keys observed under `raw_data.data`.
-const RAW_INFO_KEYS: [&str; 3] = ["company_info", "fund_info", "asset_info"];
+const COMPANY_RAW_INFO_KEYS: &[&str] = &["company_info"];
+const FUND_RAW_INFO_KEYS: &[&str] = &["fund_info", "asset_info"];
 /// The analysis sections surfaced as metrics, in order.
 const METRIC_SECTIONS: [&str; 6] = [
     "value",
@@ -134,22 +135,69 @@ pub(crate) fn build_report(
 /// source order.
 fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<ProfileCandidate<'a>> {
     let candidates = profile_queries(state);
-    let first_usable = candidates
+    let analysis_candidates = candidates
+        .iter()
+        .copied()
+        .filter(|profile| profile_has_extended_analysis(*profile))
+        .collect::<Vec<_>>();
+    let preferred_fallback_candidates = if analysis_candidates.is_empty() {
+        &candidates
+    } else {
+        &analysis_candidates
+    };
+    let first_usable = preferred_fallback_candidates
         .iter()
         .copied()
         .find(|profile| profile_is_usable(*profile))
+        .or_else(|| {
+            candidates
+                .iter()
+                .copied()
+                .find(|profile| profile_is_usable(*profile))
+        })
+        .or_else(|| preferred_fallback_candidates.first().copied())
         .or_else(|| candidates.first().copied());
     let Some(title) = fineco_title.filter(|title| !tokens(title).is_empty()) else {
         return first_usable;
     };
 
+    let first_match = first_usable.map(|profile| {
+        let company = company_overview(profile);
+        let title_match = match_title(title, &company);
+        (profile, company, title_match)
+    });
     let mut best = None;
     let mut best_score = 0.0_f64;
+    let mut best_has_extended_analysis = false;
+    let mut best_has_identifier_match = false;
     for candidate in candidates {
-        let score = profile_match_score(candidate, title);
-        if score > best_score {
+        let company = company_overview(candidate);
+        let title_match = match_title(title, &company);
+        if !is_decisive_profile_match(&title_match, &company) {
+            continue;
+        }
+        if shorter_exact_name_would_replace_strong_first(
+            first_match.as_ref(),
+            candidate,
+            &company,
+            &title_match,
+        ) {
+            continue;
+        }
+        let score = title_match.score;
+        let has_extended_analysis = profile_has_extended_analysis(candidate);
+        let has_identifier_match = has_identifier_match(&title_match);
+        let should_replace = best.is_none()
+            || (score > best_score
+                && (!best_has_extended_analysis
+                    || has_extended_analysis
+                    || (has_identifier_match && !best_has_identifier_match)))
+            || (score == best_score && has_extended_analysis && !best_has_extended_analysis);
+        if should_replace {
             best = Some(candidate);
             best_score = score;
+            best_has_extended_analysis = has_extended_analysis;
+            best_has_identifier_match = has_identifier_match;
         }
     }
     best.or(first_usable)
@@ -172,6 +220,13 @@ fn profile_queries(state: &Value) -> Vec<ProfileCandidate<'_>> {
         .collect()
 }
 
+fn profile_has_extended_analysis(profile: ProfileCandidate<'_>) -> bool {
+    profile
+        .data
+        .pointer("/data/analysis/data/extended/data")
+        .is_some()
+}
+
 fn profile_is_usable(profile: ProfileCandidate<'_>) -> bool {
     profile.data.get("data").is_some_and(|root| {
         let raw = root
@@ -181,11 +236,6 @@ fn profile_is_usable(profile: ProfileCandidate<'_>) -> bool {
             || root.get("info").is_some_and(has_display_field)
             || has_display_field(root)
     })
-}
-
-fn profile_match_score(profile: ProfileCandidate<'_>, fineco_title: &str) -> f64 {
-    let company = company_overview(profile);
-    match_title(fineco_title, &company).score
 }
 
 fn company_overview(profile: ProfileCandidate<'_>) -> CompanyOverview {
@@ -218,16 +268,19 @@ fn raw_info_values<'a>(
     raw: &'a Value,
     profile_kind: &str,
 ) -> impl Iterator<Item = &'a Value> + use<'a> {
-    raw_info_keys(profile_kind)
-        .into_iter()
+    let mut values = raw_info_keys(profile_kind)
+        .iter()
         .filter_map(|key| raw.get(key))
         .filter(|value| raw_info_score(value) > 0)
+        .collect::<Vec<_>>();
+    values.sort_by_key(|value| std::cmp::Reverse(raw_info_score(value)));
+    values.into_iter()
 }
 
-fn raw_info_keys(profile_kind: &str) -> [&'static str; 3] {
+fn raw_info_keys(profile_kind: &str) -> &'static [&'static str] {
     match profile_kind {
-        "fund" | "etf" => ["fund_info", "asset_info", "company_info"],
-        _ => RAW_INFO_KEYS,
+        "fund" | "etf" => FUND_RAW_INFO_KEYS,
+        _ => COMPANY_RAW_INFO_KEYS,
     }
 }
 
@@ -459,6 +512,54 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
         verdict,
         reasons,
     }
+}
+
+fn is_decisive_profile_match(title_match: &EnrichmentMatch, company: &CompanyOverview) -> bool {
+    let has_identifier_match = title_match
+        .reasons
+        .iter()
+        .any(|reason| reason == "ISIN match" || reason == "ticker match");
+    let fineco_tokens = tokens(&title_match.fineco_title);
+    let company_name_tokens = tokens(&company.name);
+    let has_strong_name_match = title_match.verdict == "strong"
+        && title_match
+            .reasons
+            .iter()
+            .any(|reason| reason == "name match")
+        && contains_token_sequence(&fineco_tokens, &company_name_tokens);
+
+    has_identifier_match || has_strong_name_match
+}
+
+fn shorter_exact_name_would_replace_strong_first(
+    first_match: Option<&(ProfileCandidate<'_>, CompanyOverview, EnrichmentMatch)>,
+    candidate: ProfileCandidate<'_>,
+    company: &CompanyOverview,
+    title_match: &EnrichmentMatch,
+) -> bool {
+    let Some((first_profile, first_company, first_title_match)) = first_match else {
+        return false;
+    };
+    if std::ptr::eq(candidate.data, first_profile.data) {
+        return false;
+    }
+    if first_title_match.verdict != "strong" || has_identifier_match(title_match) {
+        return false;
+    }
+
+    normalized_title_key(&title_match.fineco_title) == normalized_title_key(&company.name)
+        && tokens(&company.name).len() < tokens(&first_company.name).len()
+}
+
+fn has_identifier_match(title_match: &EnrichmentMatch) -> bool {
+    title_match
+        .reasons
+        .iter()
+        .any(|reason| reason == "ISIN match" || reason == "ticker match")
+}
+
+fn normalized_title_key(value: &str) -> String {
+    tokens(value).join(" ")
 }
 
 /// Lowercase alphanumeric tokens, dropping single-character tokens and

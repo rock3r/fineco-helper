@@ -5,7 +5,7 @@
 //! Fineco endpoint. Stock enrichment is *parse-not-execute*: fetched HTML/JS is
 //! extracted and parsed strictly as data (`serde_json`) — there is no `eval`,
 //! `Function`, or JS engine anywhere here. Source URLs are restricted to an
-//! allowlisted, SHA-256-pinned host with a `/stocks/` path; there is no
+//! allowlisted, SHA-256-pinned host with a fixed stock-page route; there is no
 //! client-supplied URL and no `validateSource`/`userAgent` knob.
 
 mod client;

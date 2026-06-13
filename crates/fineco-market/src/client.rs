@@ -1,7 +1,7 @@
 //! The credential-free market HTTP client.
 //!
-//! Fetches stock-enrichment pages (server-built URL, host-pinned, `/stocks/`
-//! path, redirects disabled) and the public zero-commission ETF list. Holds no
+//! Fetches stock-enrichment pages (server-built URL, host-pinned stock-page
+//! route, redirects disabled) and the public zero-commission ETF list. Holds no
 //! credentials and never reaches an authenticated Fineco endpoint. Nothing here
 //! logs URLs, bodies, or responses; failures map to a [`SafeError`] envelope.
 
@@ -97,7 +97,7 @@ pub struct MarketClient {
 
 impl MarketClient {
     /// Build a client. `enrichment_base` is the scheme+host the server prepends
-    /// to `/stocks/<identifier>`; `allowlist` pins the acceptable host(s);
+    /// to a fixed stock-page route; `allowlist` pins the acceptable host(s);
     /// `zero_commission_etfs_url` is the public ETF list endpoint.
     #[must_use]
     pub fn new(
@@ -152,8 +152,9 @@ impl MarketClient {
         &self.zero_commission_etfs_url
     }
 
-    /// Fetch and parse the enrichment report for a stock-page `identifier` (the
-    /// `/stocks/` slug, e.g. `it/sector/exchange/company-slug`). `fineco_title`,
+    /// Fetch and parse the enrichment report for a stock-page `identifier`.
+    /// Slugs use `/stocks/<identifier>`; market-code-like two-segment
+    /// venue/symbol identifiers use `/stock/<venue>/<symbol>`. `fineco_title`,
     /// when present, adds a title match. `now_iso` stamps `captured_at`.
     ///
     /// # Errors
@@ -168,11 +169,12 @@ impl MarketClient {
     ) -> Result<EnrichmentReport, SafeError> {
         validate_identifier(identifier)?;
         let url = format!(
-            "{}/stocks/{identifier}",
-            self.enrichment_base.trim_end_matches('/')
+            "{}{}",
+            self.enrichment_base.trim_end_matches('/'),
+            enrichment_path(identifier)
         );
         // Defense in depth: even though the base is trusted config, confirm the
-        // built URL still hits a pinned host and a /stocks/ path.
+        // built URL still hits a pinned host and a stock-page path.
         validate_fetch_target(&url, &self.allowlist)?;
 
         let html = self.get_text(&url)?;
@@ -287,10 +289,10 @@ impl EtfEntry {
     }
 }
 
-/// Validate a stock-page identifier (the `/stocks/` slug). The slug is
-/// multi-segment (slashes allowed), but each character is restricted to the URL
-/// "unreserved" set plus `/`. This admits nothing that could escape the
-/// host/path or be normalized off `/stocks/` downstream — no scheme, userinfo,
+/// Validate a stock-page identifier. The identifier may be a slug or a
+/// market-code-like venue/symbol pair, but each character is restricted to the
+/// URL "unreserved" set plus `/`. This admits nothing that could escape the
+/// server-built stock-page route downstream — no scheme, userinfo,
 /// percent-encoding (`%`), backslash, query/fragment, whitespace, or control —
 /// and no empty/`.`/`..` path segment.
 fn validate_identifier(identifier: &str) -> Result<(), SafeError> {
@@ -304,6 +306,32 @@ fn validate_identifier(identifier: &str) -> Result<(), SafeError> {
         ));
     }
     Ok(())
+}
+
+fn enrichment_path(identifier: &str) -> String {
+    if is_two_segment_identifier(identifier) {
+        format!("/stock/{identifier}")
+    } else {
+        format!("/stocks/{identifier}")
+    }
+}
+
+fn is_two_segment_identifier(identifier: &str) -> bool {
+    let mut segments = identifier.split('/');
+    let (Some(venue), Some(symbol), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    looks_like_market_code(venue) && looks_like_market_code(symbol)
+}
+
+fn looks_like_market_code(segment: &str) -> bool {
+    segment
+        .chars()
+        .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
 }
 
 /// The characters allowed in a slug: ASCII alphanumerics, the URL "unreserved"

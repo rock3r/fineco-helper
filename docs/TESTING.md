@@ -30,9 +30,9 @@ Topology:
   issues a session cookie, cookie-gated private reads (positions, transactions,
   tax) that return `401` with no data when unauthenticated, the auth-free public
   ETF list, and `/healthz`. Canned synthetic fixtures in real Fineco shapes.
-- **`mock-enrichment`** — canned synthetic stock page under the real
-  `/stocks/<slug…>` path, embedding a parseable `window.__REACT_QUERY_STATE__`
-  plus a never-run `<script>`, + `/healthz`.
+- **`mock-enrichment`** — canned synthetic stock page under the slug route
+  (`/stocks/<slug…>`), embedding a parseable `window.__REACT_QUERY_STATE__` plus
+  a never-run `<script>`, + `/healthz`.
 - **`store-server`** + **`gateway`** (M4) — the real product binary as the
   two-process boundary: `store-server` (the `fineco-query` worker) owns the empty
   SQLite store and answers cached reads on a snapshot-query Unix socket in a
@@ -91,9 +91,11 @@ Implemented:
   and length-bounded, like the company free-text fields).
 - **Enrichment source allowlist** (gate: *callable only by identifier; fixed host
   allowlist*) → same file + `crates/fineco-market/tests/client.rs`: https + host
-  SHA-256 pin + `/stocks/` path; the client builds the URL server-side from a
-  validated slug (no client `url`), and an unsafe identifier or off-allowlist
-  host is rejected before any request.
+  SHA-256 pin + a fixed stock-page route (`/stocks/<slug…>` or
+  `/stock/<venue>/<symbol>` for market-code-like pairs); the client builds the
+  URL server-side from a validated identifier (no client `url`), and an unsafe
+  identifier or
+  off-allowlist host is rejected before any request.
 - **No generic-proxy / forbidden fields** (gate: *internal protocol is a command
   allowlist; no `url`/`sql`/`headers`/…*) → `crates/fineco-ipc/tests/protocol.rs`:
   unknown commands, proxy-shaped commands, smuggled envelope fields, and unknown

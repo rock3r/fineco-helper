@@ -312,6 +312,42 @@ fn fund_profile_prefers_fund_info_over_populated_company_info() {
     assert_eq!(report.company.name, "Global Income UCITS ETF");
     assert_eq!(report.company.ticker, "LSE:GINC");
     assert_eq!(report.company.isin, "IE00B8GKDB10");
+    assert_eq!(report.company.country, "");
+    assert_eq!(report.company.website, "");
+    assert_eq!(report.company.description, "");
+}
+
+#[test]
+fn company_profile_ignores_stale_fund_info() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "tip"],
+          "state": { "data": { "data": {
+            "name": "Fallback Company Name",
+            "unique_symbol": "BIT:FALLBACK",
+            "info": {
+              "name": "Info Company Name",
+              "unique_symbol": "BIT:INFO"
+            },
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Stale Fund Profile",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("company profile should ignore stale fund info");
+
+    assert_eq!(report.company.name, "Info Company Name");
+    assert_eq!(report.company.ticker, "BIT:INFO");
 }
 
 #[test]
@@ -525,6 +561,51 @@ fn fund_profile_merges_split_raw_metadata_fields() {
 }
 
 #[test]
+fn fund_profile_prefers_richer_raw_metadata_object() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "income"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {
+                "fund_info": {
+                  "name": "Placeholder Income Fund"
+                },
+                "asset_info": {
+                  "name": "Global Income UCITS ETF",
+                  "unique_symbol": "LSE:GINC",
+                  "exchange_symbol": "LSE",
+                  "isin_symbol": "IE00SYNTH001",
+                  "country": "Ireland",
+                  "url": "https://www.example.com/global-income",
+                  "description": "Richer synthetic ETF metadata."
+                }
+              } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("richer raw metadata object should be preferred");
+
+    assert_eq!(report.company.name, "Global Income UCITS ETF");
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.company.exchange, "LSE");
+    assert_eq!(report.company.isin, "IE00SYNTH001");
+    assert_eq!(report.company.country, "Ireland");
+    assert_eq!(
+        report.company.website,
+        "https://www.example.com/global-income"
+    );
+    assert_eq!(report.company.description, "Richer synthetic ETF metadata.");
+}
+
+#[test]
 fn preserves_react_query_order_when_title_scores_tie() {
     let payload = r#"{
       "queries": [
@@ -565,6 +646,301 @@ fn preserves_react_query_order_when_title_scores_tie() {
         .expect("source-order profile should win tied title scores");
 
     assert_eq!(report.company.ticker, "LSE:GINC");
+}
+
+#[test]
+fn generic_title_overlap_does_not_replace_the_first_usable_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income Fund",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income Fund",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
+        .expect("generic title overlap should not switch profiles");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+}
+
+#[test]
+fn short_exact_title_does_not_replace_a_more_specific_first_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": { "dividend": { "yield": 0.04 } },
+              "scores": { "total": 17 }
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": { "value": { "pe": 10 } },
+              "scores": { "total": 8 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income"))
+        .expect("short title should keep the more specific first profile");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.scores["total"], serde_json::json!(17));
+}
+
+#[test]
+fn strong_name_match_can_replace_a_stale_first_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Vanguard Group plc",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Vanguard Group plc",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "current"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF USD Distributing"),
+    )
+    .expect("strong fund name match should replace stale first profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn metadata_only_profile_does_not_shadow_later_analysis_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:LIGHT"
+          } } }
+        },
+        {
+          "queryKey": ["fund", "full"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": { "dividend": { "yield": 0.04 } },
+              "scores": { "total": 17 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report =
+        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income UCITS ETF"))
+            .expect("full analysis profile should win over metadata-only cache entry");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.scores["total"], serde_json::json!(17));
+}
+
+#[test]
+fn exact_metadata_title_does_not_shadow_matching_analysis_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "full"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF USD Distributing Accumulating Hedged Class",
+            "unique_symbol": "LSE:GINC",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Global Income UCITS ETF USD Distributing Accumulating Hedged Class",
+                "unique_symbol": "LSE:GINC"
+              } } },
+              "analysis": { "dividend": { "yield": 0.04 } },
+              "scores": { "total": 17 }
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Global Income UCITS ETF GINC"),
+    )
+    .expect("matching full analysis profile should win over exact metadata shell");
+
+    assert_eq!(
+        report.company.name,
+        "Global Income UCITS ETF USD Distributing Accumulating Hedged Class"
+    );
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert_eq!(report.scores["total"], serde_json::json!(17));
+}
+
+#[test]
+fn title_matched_metadata_profile_can_beat_stale_analysis_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Company plc",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Unrelated Company plc",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": { "value": { "pe": 10 } },
+              "scores": { "total": 8 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report =
+        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Global Income UCITS ETF"))
+            .expect("title-matched metadata profile should beat stale analysis shell");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert!(report.scores.as_object().expect("scores object").is_empty());
+}
+
+#[test]
+fn identifier_matched_metadata_profile_beats_generic_analysis_match() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Global Income",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Global Income",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": { "value": { "pe": 10 } },
+              "scores": { "total": 8 }
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "lightweight"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Global Income UCITS ETF GINC"),
+    )
+    .expect("identifier-matched metadata profile should beat generic analysis match");
+
+    assert_eq!(report.company.ticker, "LSE:GINC");
+    assert!(report.scores.as_object().expect("scores object").is_empty());
 }
 
 #[test]
@@ -651,6 +1027,37 @@ fn blank_fineco_title_preserves_first_usable_profile_selection() {
         .expect("blank title should behave like no title for profile selection");
 
     assert_eq!(report.company.ticker, "BIT:TIP");
+}
+
+#[test]
+fn no_title_falls_back_to_usable_metadata_after_empty_analysis_shell() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale-analysis"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {} },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "metadata"],
+          "state": { "data": { "data": {
+            "name": "Global Income UCITS ETF",
+            "unique_symbol": "LSE:GINC"
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("usable metadata profile should win when analysis shells are empty");
+
+    assert_eq!(report.company.name, "Global Income UCITS ETF");
+    assert_eq!(report.company.ticker, "LSE:GINC");
 }
 
 #[test]
@@ -848,8 +1255,10 @@ fn allowlist() -> EnrichmentHostAllowlist {
 fn accepts_allowlisted_https_stock_url() {
     assert!(validate_source_url(SOURCE, &allowlist()).is_ok());
     // A locale-prefixed path is accepted (the locale is stripped before the
-    // /stocks/ check).
+    // stock-page route check).
     assert!(validate_source_url("https://stocks.example/it/stocks/foo/bar", &allowlist()).is_ok());
+    assert!(validate_source_url("https://stocks.example/stock/LSE/VHYL", &allowlist()).is_ok());
+    assert!(validate_source_url("https://stocks.example/it/stock/LSE/VHYL", &allowlist()).is_ok());
 }
 
 #[test]
