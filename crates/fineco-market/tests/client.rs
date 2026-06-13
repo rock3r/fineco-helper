@@ -197,7 +197,7 @@ fn refuses_cleartext_to_a_non_loopback_host() {
         "http://127.0.0.1:9/etf",
     );
     let err = client
-        .fetch_enrichment("it/sector/exch/slug", None, NOW)
+        .fetch_enrichment("LSE/VHYL", None, NOW)
         .expect_err("cleartext to a non-loopback host must be rejected");
     assert_eq!(err.code(), "invalid_request");
 }
@@ -228,7 +228,7 @@ fn rejects_off_allowlist_host() {
         "http://127.0.0.1:9/etf",
     );
     let err = client
-        .fetch_enrichment("it/sector/exch/slug", None, NOW)
+        .fetch_enrichment("LSE/VHYL", None, NOW)
         .expect_err("off-allowlist host must be rejected");
     assert_eq!(err.code(), "invalid_request");
 }
