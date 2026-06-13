@@ -175,6 +175,182 @@ fn extracts_fund_scores_and_metrics_from_etf_pages() {
 }
 
 #[test]
+fn skips_empty_raw_info_entries_for_fund_pages() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": {
+            "data": {
+              "data": {
+                "analysis": {
+                  "data": {
+                    "extended": {
+                      "data": {
+                        "raw_data": {
+                          "data": {
+                            "company_info": {},
+                            "fund_info": {
+                              "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                              "unique_symbol": "LSE:VHYL",
+                              "exchange_symbol": "LSE",
+                              "isin_symbol": "IE00B8GKDB10"
+                            }
+                          }
+                        },
+                        "analysis": {},
+                        "scores": {}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("fund info should not be shadowed by empty company info");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn selects_the_profile_that_matches_the_fineco_title() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Company plc",
+            "unique_symbol": "LSE:OLD",
+            "isin_symbol": "GB0000000000",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": { "name": "Unrelated Company plc" } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "isin_symbol": "IE00B8GKDB10",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL",
+                "isin_symbol": "IE00B8GKDB10"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(
+        &page(payload),
+        SOURCE,
+        NOW,
+        Some("Vanguard FTSE All-World High Dividend Yield UCITS ETF"),
+    )
+    .expect("matching fund profile should win over stale company profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn skips_unusable_company_profile_without_a_fineco_title() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "placeholder"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {} } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("usable fund profile should win over empty company profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn title_match_does_not_score_substring_tokens_as_name_matches() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "meta"],
+          "state": { "data": { "data": {
+            "name": "Meta",
+            "unique_symbol": "NasdaqGS:META",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": { "name": "Meta", "unique_symbol": "NasdaqGS:META" } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report =
+        build_enrichment_report(&page(payload), SOURCE, NOW, Some("Metaverse Holdings ETF"))
+            .expect("report should build");
+    let title_match = report.title_match.expect("title match");
+
+    assert_eq!(title_match.score, 0.0);
+    assert!(
+        !title_match
+            .reasons
+            .iter()
+            .any(|reason| reason == "name match")
+    );
+}
+
+#[test]
+fn empty_fineco_title_does_not_create_a_name_match() {
+    let report = build_enrichment_report(&page(&canonical_payload()), SOURCE, NOW, Some(""))
+        .expect("report should build");
+    let title_match = report.title_match.expect("title match");
+
+    assert_eq!(title_match.score, 0.0);
+    assert!(title_match.reasons.is_empty());
+}
+
+#[test]
 fn parse_is_data_only_not_execution() {
     // A metric value that looks like injected code is kept verbatim as data —
     // never interpreted. (Reaching this assertion at all means nothing ran it.)

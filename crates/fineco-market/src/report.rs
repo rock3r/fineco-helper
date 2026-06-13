@@ -79,7 +79,7 @@ pub(crate) fn build_report(
     captured_at: &str,
     fineco_title: Option<&str>,
 ) -> Result<EnrichmentReport, SafeError> {
-    let profile_root = profile_query(state)
+    let profile_root = profile_query(state, fineco_title)
         .and_then(|data| data.get("data"))
         .ok_or_else(|| SafeError::invalid_request("Enrichment page has no profile data."))?;
 
@@ -93,9 +93,7 @@ pub(crate) fn build_report(
         .or_else(|| profile_root.pointer("/score/data"))
         .unwrap_or(&Value::Null);
 
-    let info = RAW_INFO_KEYS
-        .into_iter()
-        .find_map(|key| raw.get(key))
+    let info = raw_info(raw)
         .or_else(|| profile_root.get("info"))
         .unwrap_or(&Value::Null);
 
@@ -141,12 +139,75 @@ pub(crate) fn build_report(
     })
 }
 
-/// Find the first recognized company/fund profile cache entry and return its
-/// `state.data`.
-fn profile_query(state: &Value) -> Option<&Value> {
-    PROFILE_QUERY_KEYS
+/// Find the best recognized company/fund profile cache entry and return its
+/// `state.data`. If the caller supplied a Fineco title, prefer the profile whose
+/// extracted display name/ticker/ISIN best matches it; otherwise keep the source
+/// order for backward compatibility with equity pages.
+fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<&'a Value> {
+    let candidates = PROFILE_QUERY_KEYS
         .into_iter()
-        .find_map(|name| query(state, name))
+        .filter_map(|name| query(state, name))
+        .collect::<Vec<_>>();
+    let Some(title) = fineco_title else {
+        return candidates
+            .into_iter()
+            .find(|profile| profile_is_usable(profile));
+    };
+    candidates.into_iter().max_by(|left, right| {
+        profile_match_score(left, title).total_cmp(&profile_match_score(right, title))
+    })
+}
+
+fn profile_is_usable(profile: &Value) -> bool {
+    profile.get("data").is_some_and(|root| {
+        let raw = root
+            .pointer("/analysis/data/extended/data/raw_data/data")
+            .unwrap_or(&Value::Null);
+        raw_info(raw).is_some()
+            || root.get("info").is_some_and(has_display_field)
+            || has_display_field(root)
+    })
+}
+
+fn profile_match_score(profile: &Value, fineco_title: &str) -> f64 {
+    let root = profile.get("data").unwrap_or(&Value::Null);
+    let raw = root
+        .pointer("/analysis/data/extended/data/raw_data/data")
+        .unwrap_or(&Value::Null);
+    let info = raw_info(raw)
+        .or_else(|| root.get("info"))
+        .unwrap_or(&Value::Null);
+    let company = CompanyOverview {
+        name: pick_str(info, "name")
+            .or_else(|| pick_str(root, "name"))
+            .unwrap_or_default(),
+        ticker: pick_str(info, "unique_symbol")
+            .or_else(|| pick_str(root, "unique_symbol"))
+            .unwrap_or_default(),
+        exchange: pick_str(info, "exchange_symbol")
+            .or_else(|| pick_str(root, "exchange_symbol"))
+            .unwrap_or_default(),
+        isin: pick_str(info, "isin_symbol")
+            .or_else(|| pick_str(root, "isin_symbol"))
+            .unwrap_or_default(),
+        country: String::new(),
+        website: String::new(),
+        description: String::new(),
+    };
+    match_title(fineco_title, &company).score
+}
+
+fn raw_info(raw: &Value) -> Option<&Value> {
+    RAW_INFO_KEYS
+        .into_iter()
+        .filter_map(|key| raw.get(key))
+        .find(|value| has_display_field(value))
+}
+
+fn has_display_field(value: &Value) -> bool {
+    ["name", "unique_symbol", "exchange_symbol", "isin_symbol"]
+        .into_iter()
+        .any(|key| pick_str(value, key).is_some())
 }
 
 /// Find a React-Query cache entry by name and return its `state.data`.
@@ -301,8 +362,7 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
 
     let fineco_tokens = tokens(fineco_title);
     let source_tokens = tokens(&enrichment_title);
-    let normalized_fineco_title = normalize_title_text(fineco_title);
-    let normalized_company_name = normalize_title_text(&company.name);
+    let company_name_tokens = tokens(&company.name);
     let overlap: Vec<String> = fineco_tokens
         .iter()
         .filter(|t| source_tokens.contains(*t))
@@ -318,9 +378,8 @@ fn match_title(fineco_title: &str, company: &CompanyOverview) -> EnrichmentMatch
     let mut score = 0.0_f64;
     let mut reasons = Vec::new();
 
-    if !normalized_company_name.is_empty()
-        && (normalized_fineco_title.contains(&normalized_company_name)
-            || normalized_company_name.contains(&normalized_fineco_title))
+    if contains_token_sequence(&fineco_tokens, &company_name_tokens)
+        || contains_token_sequence(&company_name_tokens, &fineco_tokens)
     {
         score += 0.4;
         reasons.push("name match".to_string());
@@ -380,8 +439,12 @@ fn tokens(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn normalize_title_text(value: &str) -> String {
-    tokens(value).join(" ")
+fn contains_token_sequence(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[cfg(test)]
