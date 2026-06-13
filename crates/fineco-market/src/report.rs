@@ -141,17 +141,15 @@ pub(crate) fn build_report(
 
 /// Find the best recognized company/fund profile cache entry and return its
 /// `state.data`. If the caller supplied a Fineco title, prefer the profile whose
-/// extracted display name/ticker/ISIN best matches it; otherwise keep the source
-/// order for backward compatibility with equity pages.
+/// extracted display name/ticker/ISIN best matches it; otherwise keep the cache
+/// source order.
 fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<&'a Value> {
-    let candidates = PROFILE_QUERY_KEYS
-        .into_iter()
-        .filter_map(|name| query(state, name))
-        .collect::<Vec<_>>();
+    let candidates = profile_queries(state);
     let first_usable = candidates
         .iter()
         .copied()
-        .find(|profile| profile_is_usable(profile));
+        .find(|profile| profile_is_usable(profile))
+        .or_else(|| candidates.first().copied());
     let Some(title) = fineco_title.filter(|title| !tokens(title).is_empty()) else {
         return first_usable;
     };
@@ -162,6 +160,22 @@ fn profile_query<'a>(state: &'a Value, fineco_title: Option<&str>) -> Option<&'a
         })
         .filter(|profile| profile_match_score(profile, title) > 0.0)
         .or(first_usable)
+}
+
+fn profile_queries(state: &Value) -> Vec<&Value> {
+    state
+        .get("queries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .pointer("/queryKey/0")
+                .and_then(Value::as_str)
+                .is_some_and(|name| PROFILE_QUERY_KEYS.contains(&name))
+        })
+        .filter_map(|entry| entry.pointer("/state/data"))
+        .collect()
 }
 
 fn profile_is_usable(profile: &Value) -> bool {
@@ -214,16 +228,6 @@ fn has_display_field(value: &Value) -> bool {
     ["name", "unique_symbol", "exchange_symbol", "isin_symbol"]
         .into_iter()
         .any(|key| pick_str(value, key).is_some())
-}
-
-/// Find a React-Query cache entry by name and return its `state.data`.
-fn query<'a>(state: &'a Value, name: &str) -> Option<&'a Value> {
-    state
-        .get("queries")?
-        .as_array()?
-        .iter()
-        .find(|entry| entry.pointer("/queryKey/0").and_then(Value::as_str) == Some(name))?
-        .pointer("/state/data")
 }
 
 /// Cleaned, length-bounded string for `object[key]`, or `None` if absent/empty.

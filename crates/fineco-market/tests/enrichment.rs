@@ -308,6 +308,49 @@ fn skips_unusable_company_profile_without_a_fineco_title() {
 }
 
 #[test]
+fn preserves_react_query_order_when_no_fineco_title_is_supplied() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "name": "Unrelated Company plc",
+            "unique_symbol": "LSE:OLD",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "name": "Unrelated Company plc",
+                "unique_symbol": "LSE:OLD"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("source-order fund profile should be selected");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
 fn title_match_does_not_score_substring_tokens_as_name_matches() {
     let payload = r#"{
       "queries": [
@@ -391,6 +434,37 @@ fn blank_fineco_title_preserves_first_usable_profile_selection() {
         .expect("blank title should behave like no title for profile selection");
 
     assert_eq!(report.company.ticker, "BIT:TIP");
+}
+
+#[test]
+fn partial_recognized_profile_builds_a_warning_report() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "partial"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {} },
+              "analysis": { "value": { "pe": 12.3 } },
+              "scores": { "value": 4 }
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("partial recognized profile should still return a bounded report");
+
+    assert_eq!(report.company.name, "");
+    assert_eq!(report.metrics["value"]["pe"], serde_json::json!(12.3));
+    assert_eq!(report.scores["value"], serde_json::json!(4));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|item| item == "Missing company name.")
+    );
 }
 
 #[test]
