@@ -102,27 +102,7 @@ pub(crate) fn build_report(
         .or_else(|| profile_root.pointer("/score/data"))
         .unwrap_or(&Value::Null);
 
-    let info = raw_info_for(raw, profile.kind)
-        .or_else(|| profile_root.get("info"))
-        .unwrap_or(&Value::Null);
-
-    let company = CompanyOverview {
-        name: pick_str(info, "name")
-            .or_else(|| pick_str(profile_root, "name"))
-            .unwrap_or_default(),
-        ticker: pick_str(info, "unique_symbol")
-            .or_else(|| pick_str(profile_root, "unique_symbol"))
-            .unwrap_or_default(),
-        exchange: pick_str(info, "exchange_symbol")
-            .or_else(|| pick_str(profile_root, "exchange_symbol"))
-            .unwrap_or_default(),
-        isin: pick_str(info, "isin_symbol")
-            .or_else(|| pick_str(profile_root, "isin_symbol"))
-            .unwrap_or_default(),
-        country: pick_str(info, "country").unwrap_or_default(),
-        website: pick_str(info, "url").unwrap_or_default(),
-        description: pick_str(info, "description").unwrap_or_default(),
-    };
+    let company = company_overview(profile);
 
     let mut warnings = Vec::new();
     if company.name.is_empty() {
@@ -197,48 +177,58 @@ fn profile_is_usable(profile: ProfileCandidate<'_>) -> bool {
         let raw = root
             .pointer("/analysis/data/extended/data/raw_data/data")
             .unwrap_or(&Value::Null);
-        raw_info_for(raw, profile.kind).is_some()
+        raw_info_values(raw, profile.kind).any(has_display_field)
             || root.get("info").is_some_and(has_display_field)
             || has_display_field(root)
     })
 }
 
 fn profile_match_score(profile: ProfileCandidate<'_>, fineco_title: &str) -> f64 {
+    let company = company_overview(profile);
+    match_title(fineco_title, &company).score
+}
+
+fn company_overview(profile: ProfileCandidate<'_>) -> CompanyOverview {
     let root = profile.data.get("data").unwrap_or(&Value::Null);
     let raw = root
         .pointer("/analysis/data/extended/data/raw_data/data")
         .unwrap_or(&Value::Null);
-    let info = raw_info_for(raw, profile.kind)
-        .or_else(|| root.get("info"))
-        .unwrap_or(&Value::Null);
-    let company = CompanyOverview {
-        name: pick_str(info, "name")
-            .or_else(|| pick_str(root, "name"))
-            .unwrap_or_default(),
-        ticker: pick_str(info, "unique_symbol")
-            .or_else(|| pick_str(root, "unique_symbol"))
-            .unwrap_or_default(),
-        exchange: pick_str(info, "exchange_symbol")
-            .or_else(|| pick_str(root, "exchange_symbol"))
-            .unwrap_or_default(),
-        isin: pick_str(info, "isin_symbol")
-            .or_else(|| pick_str(root, "isin_symbol"))
-            .unwrap_or_default(),
-        country: String::new(),
-        website: String::new(),
-        description: String::new(),
-    };
-    match_title(fineco_title, &company).score
+    CompanyOverview {
+        name: pick_profile_str(raw, profile.kind, root, "name").unwrap_or_default(),
+        ticker: pick_profile_str(raw, profile.kind, root, "unique_symbol").unwrap_or_default(),
+        exchange: pick_profile_str(raw, profile.kind, root, "exchange_symbol").unwrap_or_default(),
+        isin: pick_profile_str(raw, profile.kind, root, "isin_symbol").unwrap_or_default(),
+        country: pick_profile_str(raw, profile.kind, root, "country").unwrap_or_default(),
+        website: pick_profile_str(raw, profile.kind, root, "url").unwrap_or_default(),
+        description: pick_profile_str(raw, profile.kind, root, "description").unwrap_or_default(),
+    }
 }
 
-fn raw_info_for<'a>(raw: &'a Value, profile_kind: &str) -> Option<&'a Value> {
-    let keys = match profile_kind {
+fn pick_profile_str(raw: &Value, profile_kind: &str, root: &Value, key: &str) -> Option<String> {
+    pick_raw_str(raw, profile_kind, key)
+        .or_else(|| root.get("info").and_then(|info| pick_str(info, key)))
+        .or_else(|| pick_str(root, key))
+}
+
+fn pick_raw_str(raw: &Value, profile_kind: &str, key: &str) -> Option<String> {
+    raw_info_values(raw, profile_kind).find_map(|value| pick_str(value, key))
+}
+
+fn raw_info_values<'a>(
+    raw: &'a Value,
+    profile_kind: &str,
+) -> impl Iterator<Item = &'a Value> + use<'a> {
+    raw_info_keys(profile_kind)
+        .into_iter()
+        .filter_map(|key| raw.get(key))
+        .filter(|value| raw_info_score(value) > 0)
+}
+
+fn raw_info_keys(profile_kind: &str) -> [&'static str; 3] {
+    match profile_kind {
         "fund" | "etf" => ["fund_info", "asset_info", "company_info"],
         _ => RAW_INFO_KEYS,
-    };
-    keys.into_iter()
-        .filter_map(|key| raw.get(key))
-        .find(|value| raw_info_score(value) > 0)
+    }
 }
 
 fn raw_info_score(value: &Value) -> usize {

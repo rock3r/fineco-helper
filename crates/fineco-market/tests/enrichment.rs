@@ -444,6 +444,87 @@ fn preserves_react_query_order_when_no_fineco_title_is_supplied() {
 }
 
 #[test]
+fn metadata_only_company_profile_does_not_shadow_usable_fund_profile() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["company", "stale"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "company_info": {
+                "country": "United Kingdom"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        },
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+            "unique_symbol": "LSE:VHYL",
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": { "fund_info": {
+                "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                "unique_symbol": "LSE:VHYL"
+              } } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("metadata-only stale company profile should not shadow usable fund profile");
+
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+}
+
+#[test]
+fn fund_profile_merges_split_raw_metadata_fields() {
+    let payload = r#"{
+      "queries": [
+        {
+          "queryKey": ["fund", "vhyl"],
+          "state": { "data": { "data": {
+            "analysis": { "data": { "extended": { "data": {
+              "raw_data": { "data": {
+                "fund_info": {
+                  "name": "Vanguard FTSE All-World High Dividend Yield UCITS ETF",
+                  "unique_symbol": "LSE:VHYL",
+                  "isin_symbol": "IE00B8GKDB10"
+                },
+                "asset_info": {
+                  "country": "Ireland",
+                  "url": "https://www.vanguard.example",
+                  "description": "Synthetic split ETF metadata."
+                }
+              } },
+              "analysis": {},
+              "scores": {}
+            } } } }
+          } } }
+        }
+      ]
+    }"#;
+
+    let report = build_enrichment_report(&page(payload), SOURCE, NOW, None)
+        .expect("split raw metadata should be merged field by field");
+
+    assert_eq!(
+        report.company.name,
+        "Vanguard FTSE All-World High Dividend Yield UCITS ETF"
+    );
+    assert_eq!(report.company.ticker, "LSE:VHYL");
+    assert_eq!(report.company.country, "Ireland");
+    assert_eq!(report.company.website, "https://www.vanguard.example");
+    assert_eq!(report.company.description, "Synthetic split ETF metadata.");
+}
+
+#[test]
 fn preserves_react_query_order_when_title_scores_tie() {
     let payload = r#"{
       "queries": [
