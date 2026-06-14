@@ -631,6 +631,29 @@ pub struct MarketRiskSection {
     pub beta_m36: Option<MarketField<f64>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketExternalCompanyOverview {
+    pub name: String,
+    pub ticker: String,
+    pub exchange: String,
+    pub isin: String,
+    pub country: String,
+    pub website: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketExternalEnrichmentSection {
+    pub data_class: String,
+    pub captured_at: String,
+    pub source_url: String,
+    pub company: MarketExternalCompanyOverview,
+    pub scores: serde_json::Value,
+    pub metrics: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// Normalized details sections. Missing sections mean not requested, not
 /// available, or not applicable; explicit warnings explain important absences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
@@ -655,6 +678,8 @@ pub struct MarketAssetSections {
     pub returns: Option<MarketReturnsSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<MarketRiskSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_enrichment: Option<MarketExternalEnrichmentSection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -872,6 +897,7 @@ fn market_details_section_supported_in_v0(section: MarketDetailsSection) -> bool
             | MarketDetailsSection::Returns
             | MarketDetailsSection::Risk
             | MarketDetailsSection::Ratios
+            | MarketDetailsSection::ExternalEnrichment
     )
 }
 

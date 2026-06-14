@@ -79,7 +79,10 @@ On a **dual-pin** deployment the two Access channels are scoped differently:
   `portfolio_get_history`, `portfolio_get_position_history`,
   `market_search_asset`, `market_get_asset_details`.
   Those are hidden from `tools/list` and refused by `tools/call` on the connector
-  channel.
+  channel. This also hides the `external_enrichment` details section by default,
+  because that section is available only through `market_get_asset_details`;
+  the standalone `market_get_stock_enrichment` wrapper remains the
+  connector-visible credential-free enrichment path.
 
 Everything else — `portfolio_get_freshness`, `portfolio_get_latest_shareable_report`,
 `portfolio_get_allocation_history`, `orders_get_latest_monitor`, both tax tools,

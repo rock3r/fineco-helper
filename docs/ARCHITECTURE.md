@@ -216,6 +216,14 @@ Product (`crates/`):
   `market_get_asset_details`; these require `market.authenticated.read` and are
   hidden from connector defaults. The checked-in deployment policy intentionally
   leaves that capability ungranted until market live-session gates are complete.
+  When stock details explicitly request `external_enrichment`, the gateway first
+  resolves/fetches the requested Fineco sections through market-control, then
+  appends the third-party enrichment section via the credential-free
+  `fineco-market` client. If `external_enrichment` is the only requested section,
+  the worker stops after Fineco search identity resolution rather than fetching
+  default quote/profile/core detail endpoints. The supplemental fetch emits its
+  own `external_enrichment` audit line and source entry; the credentialed worker
+  never calls the enrichment host.
   Market-control audit logs include only status metadata (login/session booleans),
   never cookies or session handles. The gateway has **no** `fineco-live` client —
   it cannot reach the live socket by any path. Depends on `fineco-core` + `fineco-ipc` + `fineco-market` +
@@ -239,6 +247,9 @@ Product (`crates/`):
   `expected_isin` (plain ISIN or ISIN plus suffix). The server builds exactly one
   URL from a configured base + the validated identifier (no client `url`, no
   lookup/guessing, no `validateSource`/`userAgent`).
+  The same report shape is also embedded in `market_get_asset_details` when a
+  stock details request includes `external_enrichment`; Fineco identity remains
+  canonical and cross-source identifier disagreements are bounded warnings.
   Output is bounded/sanitized. `MarketClient` uses `ureq`+rustls (redirects
   disabled). Depends on `fineco-core` (+ `serde`/`serde_json`/`sha2`).
 

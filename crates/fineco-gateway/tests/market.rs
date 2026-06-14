@@ -7,6 +7,7 @@
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
@@ -15,8 +16,8 @@ use fineco_ipc::{
     MarketAssetDetailsResult, MarketAssetIdentity, MarketAssetSections, MarketAssetType,
     MarketControlClient, MarketControlOutcome, MarketControlRequest, MarketDetailsParams,
     MarketDetailsSection, MarketEnrichmentParams, MarketEtfsParams, MarketField,
-    MarketSearchCandidate, MarketSearchGroup, MarketSearchParams, MarketSearchResult, Policy,
-    serve_market_control_blocking,
+    MarketSearchCandidate, MarketSearchGroup, MarketSearchParams, MarketSearchResult, MarketSource,
+    MarketWarning, Policy, serve_market_control_blocking,
 };
 use fineco_market::{EnrichmentHostAllowlist, MarketClient};
 use rmcp::handler::server::wrapper::Parameters;
@@ -30,6 +31,13 @@ fn owner_policy() -> Policy {
 fn owner_authenticated_market_policy() -> Policy {
     Policy::from_json(
         r#"{"version":1,"auth_ids":{"owner":{"capabilities":["market.authenticated.read"]}}}"#,
+    )
+    .expect("valid owner policy")
+}
+
+fn owner_all_market_policy() -> Policy {
+    Policy::from_json(
+        r#"{"version":1,"auth_ids":{"owner":{"capabilities":["market.read","market.authenticated.read"]}}}"#,
     )
     .expect("valid owner policy")
 }
@@ -142,6 +150,72 @@ fn sample_details_result(identifier: &str) -> MarketAssetDetailsResult {
             ),
             display_symbol: Some(MarketField::medium_string(
                 "VHYL.MI",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                "2026-06-14T09:30:00Z",
+            )),
+            currency: Some(MarketField::high_string(
+                "EUR",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                "2026-06-14T09:30:00Z",
+            )),
+        },
+        sections: MarketAssetSections::default(),
+        sources: vec![],
+        warnings: vec![],
+    }
+}
+
+fn sample_stock_details_result(identifier: &str) -> MarketAssetDetailsResult {
+    MarketAssetDetailsResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        captured_at: "2026-06-14T09:30:00Z".to_string(),
+        asset: MarketAssetIdentity {
+            identifier: identifier.to_string(),
+            fineco_key: MarketField::high_string(
+                "IT0003153621.BIT",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                "2026-06-14T09:30:00Z",
+            ),
+            asset_type: MarketField::high(
+                MarketAssetType::Stock,
+                None,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                None,
+                "2026-06-14T09:30:00Z",
+            ),
+            name: None,
+            isin: Some(MarketField::high_string(
+                "IT0003153621",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                "2026-06-14T09:30:00Z",
+            )),
+            venue: MarketField::high_string(
+                "BIT",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                "2026-06-14T09:30:00Z",
+            ),
+            symbol: MarketField::medium_string(
+                "TIP",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                "2026-06-14T09:30:00Z",
+            ),
+            display_symbol: Some(MarketField::medium_string(
+                "TIP.MI",
                 "fineco",
                 "authenticated_market",
                 "search.global",
@@ -335,6 +409,508 @@ async fn authenticated_market_details_routes_through_the_controller_socket() {
 
     assert_eq!(result.data_class, "authenticated_market");
     assert_eq!(result.asset.fineco_key.value, "IE00B8GKDB10.AFF");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn asset_details_can_fold_stock_external_enrichment_outside_the_worker() {
+    let enrichment_hits = Arc::new(AtomicU32::new(0));
+    let enrichment_hits_for_server = Arc::clone(&enrichment_hits);
+    let enrichment = spawn(move |req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            enrichment_hits_for_server.fetch_add(1, Ordering::SeqCst);
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+                body: String::new(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                assert_eq!(params.identifier, "BIT/TIP");
+                assert_eq!(params.expected_isin.as_deref(), Some("IT0003153621"));
+                assert_eq!(
+                    params.sections,
+                    Some(vec![
+                        MarketDetailsSection::Identity,
+                        MarketDetailsSection::Stock
+                    ])
+                );
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(sample_stock_details_result(&params.identifier)),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+        });
+    });
+
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let result = gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![
+                MarketDetailsSection::Identity,
+                MarketDetailsSection::Stock,
+                MarketDetailsSection::ExternalEnrichment,
+            ]),
+        }))
+        .await
+        .expect("details with external enrichment")
+        .0;
+
+    let external = result
+        .sections
+        .external_enrichment
+        .expect("external enrichment section");
+    assert_eq!(external.data_class, "external_enrichment");
+    assert_eq!(
+        external.company.name,
+        "SYNTHETIC Tamburi Investment Partners SpA"
+    );
+    assert_eq!(external.company.isin, "IT0003153621");
+    assert_eq!(external.source_url, format!("{enrichment}/stock/BIT/TIP"));
+    assert_eq!(enrichment_hits.load(Ordering::SeqCst), 1);
+    assert!(result.sources.iter().any(|source| {
+        source.data_class == "external_enrichment"
+            && source.source_ref == format!("{enrichment}/stock/BIT/TIP")
+    }));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn folded_external_enrichment_matches_the_wrapper_payload() {
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+                body: String::new(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                assert_eq!(
+                    params.sections,
+                    Some(vec![MarketDetailsSection::Identity]),
+                    "external-only details must ask the worker for identity only"
+                );
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(sample_stock_details_result(&params.identifier)),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+        });
+    });
+
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_all_market_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let wrapper = gateway
+        .market_get_stock_enrichment(Parameters(MarketEnrichmentParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+        }))
+        .await
+        .expect("wrapper enrichment")
+        .0;
+    let folded = gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![MarketDetailsSection::ExternalEnrichment]),
+        }))
+        .await
+        .expect("folded enrichment")
+        .0
+        .sections
+        .external_enrichment
+        .expect("external enrichment section");
+
+    assert_eq!(folded.company.name, wrapper.company.name);
+    assert_eq!(folded.company.ticker, wrapper.company.ticker);
+    assert_eq!(folded.company.exchange, wrapper.company.exchange);
+    assert_eq!(folded.company.isin, wrapper.company.isin);
+    assert_eq!(folded.company.country, wrapper.company.country);
+    assert_eq!(folded.company.website, wrapper.company.website);
+    assert_eq!(folded.company.description, wrapper.company.description);
+    assert_eq!(folded.scores, wrapper.scores);
+    assert_eq!(folded.metrics, wrapper.metrics);
+    assert_eq!(folded.warnings, wrapper.warnings);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn asset_details_external_enrichment_still_requires_authenticated_market_read() {
+    let enrichment_hits = Arc::new(AtomicU32::new(0));
+    let enrichment_hits_for_server = Arc::clone(&enrichment_hits);
+    let enrichment = spawn(move |_req| {
+        enrichment_hits_for_server.fetch_add(1, Ordering::SeqCst);
+        httptiny::Response::not_found()
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(
+            "/tmp/fineco-gateway-market-control-dead.sock",
+        ));
+
+    let err = match gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![MarketDetailsSection::ExternalEnrichment]),
+        }))
+        .await
+    {
+        Ok(_) => panic!("details external_enrichment must require authenticated market read"),
+        Err(err) => err,
+    };
+
+    assert!(err.message.contains("policy"), "message: {}", err.message);
+    assert_eq!(enrichment_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn asset_details_rejects_over_limit_sections_before_stripping_external_enrichment() {
+    let enrichment_hits = Arc::new(AtomicU32::new(0));
+    let enrichment_hits_for_server = Arc::clone(&enrichment_hits);
+    let enrichment = spawn(move |_req| {
+        enrichment_hits_for_server.fetch_add(1, Ordering::SeqCst);
+        httptiny::Response::not_found()
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(
+            "/tmp/fineco-gateway-market-control-dead.sock",
+        ));
+
+    let err = match gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+            ]),
+        }))
+        .await
+    {
+        Ok(_) => panic!("over-limit original sections must be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(err.message.contains("sections"), "message: {}", err.message);
+    assert_eq!(enrichment_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn asset_details_authorizes_before_validating_external_enrichment_sections() {
+    let enrichment_hits = Arc::new(AtomicU32::new(0));
+    let enrichment_hits_for_server = Arc::clone(&enrichment_hits);
+    let enrichment = spawn(move |_req| {
+        enrichment_hits_for_server.fetch_add(1, Ordering::SeqCst);
+        httptiny::Response::not_found()
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(
+            "/tmp/fineco-gateway-market-control-dead.sock",
+        ));
+
+    let err = match gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
+            ]),
+        }))
+        .await
+    {
+        Ok(_) => panic!("unauthorized details must be denied before validation"),
+        Err(err) => err,
+    };
+
+    assert!(err.message.contains("policy"), "message: {}", err.message);
+    assert_eq!(enrichment_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn asset_details_warns_when_external_enrichment_identity_disagrees() {
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+                body: String::new(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                let mut result = sample_stock_details_result(&params.identifier);
+                result.asset.isin.as_mut().expect("isin").value = "GB0000000000".to_string();
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(result),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+        });
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let result = gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: None,
+            sections: Some(vec![MarketDetailsSection::ExternalEnrichment]),
+        }))
+        .await
+        .expect("details with disagreement warning")
+        .0;
+
+    assert!(result.warnings.iter().any(|warning| {
+        warning.code == "external_enrichment_isin_disagreement"
+            && warning.message.contains("Fineco identity is canonical")
+    }));
+    assert!(result.sections.external_enrichment.is_some());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn asset_details_keeps_fineco_details_when_external_enrichment_fails() {
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(sample_stock_details_result(&params.identifier)),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+        });
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market(market_client(
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9/etf",
+        ))
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let result = gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![MarketDetailsSection::ExternalEnrichment]),
+        }))
+        .await
+        .expect("Fineco details should survive supplemental enrichment failure")
+        .0;
+
+    assert_eq!(result.asset.identifier, "BIT/TIP");
+    assert!(result.sections.external_enrichment.is_none());
+    assert!(result.warnings.iter().any(|warning| {
+        warning.code.starts_with("external_enrichment_")
+            && warning.message.contains("Fineco details are returned")
+    }));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn asset_details_does_not_warn_for_external_exchange_suffix() {
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+                body: String::new(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                let mut result = sample_stock_details_result(&params.identifier);
+                result.asset.symbol.value = "TIP.MI".to_string();
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(result),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+        });
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let result = gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![MarketDetailsSection::ExternalEnrichment]),
+        }))
+        .await
+        .expect("details with external exchange suffix")
+        .0;
+
+    assert!(result.sections.external_enrichment.is_some());
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "external_enrichment_symbol_disagreement")
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn asset_details_external_enrichment_keeps_warning_and_source_caps() {
+    let enrichment = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/stock/BIT/TIP" {
+            mock_enrichment::route(&httptiny::Request {
+                method: req.method.clone(),
+                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
+                headers: req.headers.clone(),
+                body: String::new(),
+            })
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                let mut result = sample_stock_details_result(&params.identifier);
+                result.asset.isin.as_mut().expect("isin").value = "GB0000000000".to_string();
+                result.warnings = (0..fineco_ipc::MAX_WARNINGS)
+                    .map(|idx| MarketWarning {
+                        code: format!("worker_warning_{idx}"),
+                        message: "bounded worker warning".to_string(),
+                    })
+                    .collect();
+                result.sources = (0..fineco_ipc::MAX_SOURCES)
+                    .map(|idx| MarketSource {
+                        source: "fineco".to_string(),
+                        data_class: "authenticated_market".to_string(),
+                        source_ref: format!("worker-source-{idx}"),
+                        captured_at: "2026-06-14T09:30:00Z".to_string(),
+                    })
+                    .collect();
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(result),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+        });
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let result = gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: None,
+            sections: Some(vec![MarketDetailsSection::ExternalEnrichment]),
+        }))
+        .await
+        .expect("details with capped gateway additions")
+        .0;
+
+    assert_eq!(result.warnings.len(), fineco_ipc::MAX_WARNINGS);
+    assert_eq!(result.warnings[0].code, "worker_warning_0");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "external_enrichment_isin_disagreement")
+    );
+    assert_eq!(result.sources.len(), fineco_ipc::MAX_SOURCES);
+    assert_eq!(result.sources[0].source_ref, "worker-source-0");
+    assert!(
+        !result
+            .sources
+            .iter()
+            .any(|source| source.data_class == "external_enrichment")
+    );
+    assert!(result.sections.external_enrichment.is_some());
     let _ = std::fs::remove_file(&path);
 }
 

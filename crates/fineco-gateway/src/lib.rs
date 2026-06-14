@@ -19,11 +19,12 @@ use crate::access::AuthChannel;
 use fineco_ipc::{
     AllocationHistoryDto, Capability, Client, FreshnessReportDto, FullSnapshotDto, HistoryParams,
     MarketAssetDetailsResult, MarketControlClient, MarketControlOutcome, MarketControlRequest,
-    MarketDetailsParams, MarketEnrichmentParams, MarketEtfsParams, MarketSearchParams,
-    MarketSearchResult, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams, Policy, PortfolioHistoryDto,
-    PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams, RefreshClient, RefreshOutcome,
-    RefreshRequest, Request, ResponseBody, SafeErrorDto, ShareableReportDto,
-    TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
+    MarketDetailsParams, MarketDetailsSection, MarketEnrichmentParams, MarketEtfsParams,
+    MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketSearchParams,
+    MarketSearchResult, MarketSource, MarketWarning, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams,
+    Policy, PortfolioHistoryDto, PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams,
+    RefreshClient, RefreshOutcome, RefreshRequest, Request, ResponseBody, SafeErrorDto,
+    ShareableReportDto, TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
 };
 use fineco_market::{EnrichmentReport, MarketClient, ZeroCommissionEtfs};
 use rmcp::handler::server::wrapper::Parameters;
@@ -444,12 +445,7 @@ impl Gateway {
         &self,
         Parameters(params): Parameters<MarketDetailsParams>,
     ) -> Result<Json<MarketAssetDetailsResult>, ErrorData> {
-        self.market_control_call(MarketControlRequest::MarketGetAssetDetails(params))
-            .await
-            .and_then(|outcome| match outcome {
-                MarketControlOutcome::Details { result, .. } => Ok(Json(*result)),
-                MarketControlOutcome::Search { .. } => Err(unexpected()),
-            })
+        self.market_asset_details_call(params).await.map(Json)
     }
 
     #[tool(
@@ -820,6 +816,181 @@ impl Gateway {
         result
     }
 
+    async fn market_asset_details_call(
+        &self,
+        params: MarketDetailsParams,
+    ) -> Result<MarketAssetDetailsResult, ErrorData> {
+        let tool = "market_get_asset_details";
+        let data_class = Capability::MarketAuthenticatedRead.audit_data_class();
+        let start = std::time::Instant::now();
+        let needs_external =
+            wants_details_section(&params, MarketDetailsSection::ExternalEnrichment);
+        let dispatched = match self.authorize(Capability::MarketAuthenticatedRead) {
+            Err(err) => Err(("policy_denied".to_string(), err)),
+            Ok(()) => match params.validate() {
+                Err(err) => Err(audit_market_error(err)),
+                Ok(()) => {
+                    let fineco_params = details_params_for_fineco_worker(&params);
+                    self.market_control_dispatch(MarketControlRequest::MarketGetAssetDetails(
+                        fineco_params,
+                    ))
+                    .await
+                }
+            },
+        };
+        let result = match dispatched {
+            Ok(MarketControlOutcome::Details {
+                result: details,
+                session,
+            }) => {
+                let mut details = details;
+                let append_result = if needs_external {
+                    self.append_external_enrichment(&params, &mut details).await
+                } else {
+                    Ok(())
+                };
+                match append_result {
+                    Ok(()) => match details.validate_response_size() {
+                        Ok(()) => Ok((*details, Some(session))),
+                        Err(err) => Err((audit_market_error(err), Some(session))),
+                    },
+                    Err(err) => Err((err, Some(session))),
+                }
+            }
+            Ok(MarketControlOutcome::Search { .. }) => Err((
+                (
+                    "controller_protocol_error".to_string(),
+                    ErrorData::internal_error("market request failed", None),
+                ),
+                None,
+            )),
+            Err(err) => Err((err, None)),
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let (outcome, error_code, session_status, response) = match result {
+            Ok((details, session)) => ("ok", None, session, Ok(details)),
+            Err(((code, err), session)) => ("error", Some(code), session, Err(err)),
+        };
+        audit::emit(&audit::AuditRecord {
+            ts: fineco_core::now_iso8601_utc(),
+            auth_id: OWNER_AUTH_ID,
+            tool,
+            data_class,
+            outcome,
+            error_code,
+            duration_ms,
+            result_count: response.as_ref().ok().map(|_| 1),
+            login_performed: session_status.map(|status| status.login_performed),
+            session_reused: session_status.map(|status| status.session_reused),
+            session_evicted: session_status.map(|status| status.session_evicted),
+            reused_session_401_recovered: session_status
+                .map(|status| status.reused_session_401_recovered),
+        });
+        response
+    }
+
+    async fn append_external_enrichment(
+        &self,
+        params: &MarketDetailsParams,
+        details: &mut MarketAssetDetailsResult,
+    ) -> Result<(), (String, ErrorData)> {
+        if details.asset.asset_type.value != fineco_ipc::MarketAssetType::Stock {
+            push_bounded_details_warning(
+                &mut details.warnings,
+                MarketWarning {
+                    code: "external_enrichment_unsupported_asset_type".to_string(),
+                    message: "external_enrichment is available for stock details only.".to_string(),
+                },
+            );
+            return Ok(());
+        }
+        let market = match self.market() {
+            Ok(market) => market,
+            Err(_) => {
+                push_bounded_details_warning(
+                    &mut details.warnings,
+                    MarketWarning {
+                        code: "external_enrichment_unconfigured".to_string(),
+                        message: "External enrichment is not configured; Fineco details are returned without that supplemental section.".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        let identifier = details.asset.identifier.clone();
+        let expected_isin = params.expected_isin.clone();
+        let now = fineco_core::now_iso8601_utc();
+        let start = std::time::Instant::now();
+        let report_result = tokio::task::spawn_blocking(move || {
+            market.fetch_enrichment(&identifier, expected_isin.as_deref(), &now)
+        })
+        .await
+        .map_err(|_| fineco_core::SafeError::internal())
+        .and_then(std::convert::identity);
+        let report = match report_result {
+            Ok(report) => {
+                emit_external_enrichment_audit("ok", None, start.elapsed(), Some(1));
+                report
+            }
+            Err(err) => {
+                emit_external_enrichment_audit(
+                    "error",
+                    Some(err.code().to_string()),
+                    start.elapsed(),
+                    None,
+                );
+                push_bounded_details_warning(
+                    &mut details.warnings,
+                    MarketWarning {
+                        code: format!("external_enrichment_{}", err.code()),
+                        message: format!(
+                            "External enrichment was unavailable; Fineco details are returned without that supplemental section. {}",
+                            err.safe_message()
+                        ),
+                    },
+                );
+                return Ok(());
+            }
+        };
+
+        if let Some(fineco_isin) = details.asset.isin.as_ref()
+            && !report.company.isin.is_empty()
+            && comparable_isin(&fineco_isin.value) != comparable_isin(&report.company.isin)
+        {
+            push_bounded_details_warning(
+                &mut details.warnings,
+                MarketWarning {
+                    code: "external_enrichment_isin_disagreement".to_string(),
+                    message: "Fineco and external enrichment ISIN values disagree; Fineco identity is canonical.".to_string(),
+                },
+            );
+        }
+        if !report.company.ticker.is_empty()
+            && comparable_symbol(&details.asset.symbol.value)
+                != comparable_symbol(&report.company.ticker)
+        {
+            push_bounded_details_warning(
+                &mut details.warnings,
+                MarketWarning {
+                    code: "external_enrichment_symbol_disagreement".to_string(),
+                    message: "Fineco and external enrichment ticker values disagree; Fineco identity is canonical.".to_string(),
+                },
+            );
+        }
+
+        push_bounded_details_source(
+            &mut details.sources,
+            MarketSource {
+                source: "external_enrichment".to_string(),
+                data_class: "external_enrichment".to_string(),
+                source_ref: report.source_url.clone(),
+                captured_at: report.captured_at.clone(),
+            },
+        );
+        details.sections.external_enrichment = Some(external_enrichment_section(report));
+        Ok(())
+    }
+
     /// Authenticated market-control dispatch core: authorize
     /// `market.authenticated.read`, validate bounds, then forward to the
     /// controller socket.
@@ -897,6 +1068,125 @@ fn audit_market_error(err: fineco_core::SafeError) -> (String, ErrorData) {
     (dto.code.clone(), error_from_dto(dto))
 }
 
+fn wants_details_section(params: &MarketDetailsParams, section: MarketDetailsSection) -> bool {
+    params
+        .sections
+        .as_ref()
+        .is_some_and(|sections| sections.contains(&section))
+}
+
+fn details_params_for_fineco_worker(params: &MarketDetailsParams) -> MarketDetailsParams {
+    let mut params = params.clone();
+    if let Some(sections) = &mut params.sections {
+        sections.retain(|section| *section != MarketDetailsSection::ExternalEnrichment);
+        if sections.is_empty() {
+            sections.push(MarketDetailsSection::Identity);
+        }
+    }
+    params
+}
+
+fn emit_external_enrichment_audit(
+    outcome: &'static str,
+    error_code: Option<String>,
+    duration: std::time::Duration,
+    result_count: Option<usize>,
+) {
+    audit::emit(&audit::AuditRecord {
+        ts: fineco_core::now_iso8601_utc(),
+        auth_id: OWNER_AUTH_ID,
+        tool: "market_get_asset_details.external_enrichment",
+        data_class: "external_enrichment",
+        outcome,
+        error_code,
+        duration_ms: duration.as_millis() as u64,
+        result_count,
+        login_performed: None,
+        session_reused: None,
+        session_evicted: None,
+        reused_session_401_recovered: None,
+    });
+}
+
+fn external_enrichment_section(report: EnrichmentReport) -> MarketExternalEnrichmentSection {
+    MarketExternalEnrichmentSection {
+        data_class: "external_enrichment".to_string(),
+        captured_at: report.captured_at,
+        source_url: report.source_url,
+        company: MarketExternalCompanyOverview {
+            name: report.company.name,
+            ticker: report.company.ticker,
+            exchange: report.company.exchange,
+            isin: report.company.isin,
+            country: report.company.country,
+            website: report.company.website,
+            description: report.company.description,
+        },
+        scores: report.scores,
+        metrics: report.metrics,
+        warnings: report.warnings,
+    }
+}
+
+fn comparable_isin(value: &str) -> Option<String> {
+    fineco_core::normalize_expected_isin(value).ok()
+}
+
+fn comparable_symbol(value: &str) -> String {
+    let trimmed = value.trim();
+    let without_venue = trimmed
+        .rsplit_once(['/', ':'])
+        .and_then(|(venue, symbol)| {
+            if symbol.len() > 1 && is_known_fineco_venue(venue) {
+                Some(symbol)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(trimmed);
+    let maybe_symbol = without_venue
+        .split_once('.')
+        .and_then(|(symbol, suffix)| {
+            if symbol.chars().all(|ch| ch.is_ascii_uppercase())
+                && suffix.chars().all(|ch| ch.is_ascii_uppercase())
+                && is_known_exchange_suffix(suffix)
+            {
+                Some(symbol)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(without_venue);
+    maybe_symbol
+        .chars()
+        .filter(|ch| !matches!(ch, '.' | '/' | ':' | '-' | '_' | ' '))
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn is_known_fineco_venue(value: &str) -> bool {
+    matches!(
+        value,
+        "AFF" | "AMEX" | "BIT" | "CFDC" | "EURONEXTNL" | "MOT" | "NASDAQ" | "NYSE" | "XETRA"
+    )
+}
+
+fn is_known_exchange_suffix(value: &str) -> bool {
+    matches!(value, "AS" | "DE" | "FRA" | "L" | "MI" | "O" | "PA")
+}
+
+fn push_bounded_details_warning(warnings: &mut Vec<MarketWarning>, warning: MarketWarning) {
+    if warnings.len() < fineco_ipc::MAX_WARNINGS {
+        warnings.push(warning);
+    }
+}
+
+fn push_bounded_details_source(sources: &mut Vec<MarketSource>, source: MarketSource) {
+    if sources.len() < fineco_ipc::MAX_SOURCES {
+        sources.push(source);
+    }
+}
+
 fn validate_market_control_outcome(
     request: &MarketControlRequest,
     outcome: MarketControlOutcome,
@@ -950,4 +1240,22 @@ fn error_from_dto(dto: SafeErrorDto) -> ErrorData {
 /// only possible on a protocol mismatch, surfaced as a safe internal error.
 fn unexpected() -> ErrorData {
     ErrorData::internal_error("unexpected worker response", None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::comparable_symbol;
+
+    #[test]
+    fn comparable_symbol_treats_slash_and_dot_share_classes_as_equivalent() {
+        assert_eq!(comparable_symbol("BRK/B"), comparable_symbol("BRK.B"));
+        assert_eq!(comparable_symbol("BRK/PR"), comparable_symbol("BRK.PR"));
+        assert_eq!(comparable_symbol("NYSE/BRK.B"), comparable_symbol("BRK/B"));
+    }
+
+    #[test]
+    fn comparable_symbol_strips_exchange_suffixes_but_not_share_classes() {
+        assert_eq!(comparable_symbol("TIP.MI"), "TIP");
+        assert_eq!(comparable_symbol("BRK.B"), "BRKB");
+    }
 }
