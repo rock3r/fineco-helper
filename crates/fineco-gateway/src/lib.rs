@@ -3,9 +3,10 @@
 //! Serves the read-only cached tool surface over Streamable HTTP (rmcp), bound
 //! to loopback. It holds no credentials, no DB handle, and no live socket:
 //! private cached reads go over the snapshot-query socket via
-//! [`fineco_ipc::Client`], and the market tools call the credential-free
-//! `fineco-market` path in-process. This crate must never depend on
-//! `fineco-store` or `fineco-worker`.
+//! [`fineco_ipc::Client`]; credential-free market tools call `fineco-market`
+//! in-process; authenticated market reads go through the controller over the
+//! market-control socket. This crate must never depend on `fineco-store`,
+//! `fineco-worker`, or `fineco-live`.
 
 pub mod access;
 pub mod audit;
@@ -17,10 +18,12 @@ use std::sync::Arc;
 use crate::access::AuthChannel;
 use fineco_ipc::{
     AllocationHistoryDto, Capability, Client, FreshnessReportDto, FullSnapshotDto, HistoryParams,
-    MarketEnrichmentParams, MarketEtfsParams, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams,
-    Policy, PortfolioHistoryDto, PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams,
-    RefreshClient, RefreshOutcome, RefreshRequest, Request, ResponseBody, SafeErrorDto,
-    ShareableReportDto, TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
+    MarketAssetDetailsResult, MarketControlClient, MarketControlOutcome, MarketControlRequest,
+    MarketDetailsParams, MarketEnrichmentParams, MarketEtfsParams, MarketSearchParams,
+    MarketSearchResult, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams, Policy, PortfolioHistoryDto,
+    PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams, RefreshClient, RefreshOutcome,
+    RefreshRequest, Request, ResponseBody, SafeErrorDto, ShareableReportDto,
+    TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
 };
 use fineco_market::{EnrichmentReport, MarketClient, ZeroCommissionEtfs};
 use rmcp::handler::server::wrapper::Parameters;
@@ -41,11 +44,13 @@ pub type GatewayService = StreamableHttpService<ScopedGateway, LocalSessionManag
 /// The default connector (email/OAuth) tool allowlist: every tool EXCEPT the four
 /// detailed-portfolio tools that expose absolute euro values
 /// (`portfolio_get_latest_snapshot_summary`, `portfolio_get_latest_full_snapshot`,
-/// `portfolio_get_history`, `portfolio_get_position_history`). This is an EXPLICIT
-/// allowlist, not "all minus four": a newly-added tool is NOT visible to connectors
-/// until it is added here (fail-safe). Per-deployment override via
-/// `FINECO_CONNECTOR_TOOLS`. A test asserts every name here is a real tool and that
-/// the four detailed-portfolio tools are absent.
+/// `portfolio_get_history`, `portfolio_get_position_history`) plus
+/// the authenticated market tools (`market_search_asset`,
+/// `market_get_asset_details`). This is an EXPLICIT allowlist, not "all minus
+/// blocked": a newly-added tool is NOT visible to connectors until it is added
+/// here (fail-safe). Per-deployment override via `FINECO_CONNECTOR_TOOLS`. A
+/// test asserts every name here is a real tool and that the default-blocked tools
+/// are absent.
 pub const DEFAULT_CONNECTOR_TOOLS: &[&str] = &[
     "portfolio_get_freshness",
     "portfolio_get_latest_shareable_report",
@@ -165,6 +170,9 @@ pub struct Gateway {
     /// "not configured" error. Held behind `Arc` so async tools can move a clone
     /// into `spawn_blocking`.
     refresh_client: Option<Arc<RefreshClient>>,
+    /// Authenticated market-control client, reaching the controller-owned socket
+    /// for Fineco instrument search/details. This is NOT the live socket.
+    market_control_client: Option<Arc<MarketControlClient>>,
     /// Allowed `Origin` values for DNS-rebinding protection (M6). Empty leaves
     /// Origin validation off (rmcp still validates `Host` to loopback by
     /// default); the remote deployment sets the Cloudflare/client origins.
@@ -413,6 +421,38 @@ impl Gateway {
     }
 
     #[tool(
+        name = "market_search_asset",
+        description = "Authenticated Fineco instrument search by ticker, ISIN, or name. Returns normalized, source-attributed candidates grouped by asset type; `limit` is 1..=30."
+    )]
+    pub async fn market_search_asset(
+        &self,
+        Parameters(params): Parameters<MarketSearchParams>,
+    ) -> Result<Json<MarketSearchResult>, ErrorData> {
+        self.market_control_call(MarketControlRequest::MarketSearchAsset(params))
+            .await
+            .and_then(|outcome| match outcome {
+                MarketControlOutcome::Search { result, .. } => Ok(Json(result)),
+                MarketControlOutcome::Details { .. } => Err(unexpected()),
+            })
+    }
+
+    #[tool(
+        name = "market_get_asset_details",
+        description = "Authenticated Fineco stock/ETF details for a venue-qualified identifier such as NASDAQ/AAPL or AFF/VHYL. Defaults to lightweight identity/listing/quote/profile/core asset sections; heavy ETF sections and stock ratios require explicit section names."
+    )]
+    pub async fn market_get_asset_details(
+        &self,
+        Parameters(params): Parameters<MarketDetailsParams>,
+    ) -> Result<Json<MarketAssetDetailsResult>, ErrorData> {
+        self.market_control_call(MarketControlRequest::MarketGetAssetDetails(params))
+            .await
+            .and_then(|outcome| match outcome {
+                MarketControlOutcome::Details { result, .. } => Ok(Json(*result)),
+                MarketControlOutcome::Search { .. } => Err(unexpected()),
+            })
+    }
+
+    #[tool(
         name = "private_portfolio_refresh_live_sensitive",
         description = "HIGH-SENSITIVITY, owner-only: trigger a LIVE Fineco refresh of the portfolio (logs in to Fineco; rate-limited by cooldown and a daily budget). Returns operation/snapshot status only — never values; read the refreshed data afterward via the cached portfolio tools."
     )]
@@ -459,6 +499,7 @@ impl Gateway {
             policy: None,
             allowed_origins: Vec::new(),
             refresh_client: None,
+            market_control_client: None,
             connector_allowlist: None,
         }
     }
@@ -500,6 +541,15 @@ impl Gateway {
     #[must_use]
     pub fn with_refresh_client(mut self, refresh_client: RefreshClient) -> Self {
         self.refresh_client = Some(Arc::new(refresh_client));
+        self
+    }
+
+    /// Attach the authenticated market-control client. Without it the
+    /// authenticated market tools return a safe "not configured" error. The
+    /// client targets the controller-owned socket, never `fineco-live.sock`.
+    #[must_use]
+    pub fn with_market_control_client(mut self, client: MarketControlClient) -> Self {
+        self.market_control_client = Some(Arc::new(client));
         self
     }
 
@@ -610,6 +660,10 @@ impl Gateway {
             error_code,
             duration_ms,
             result_count,
+            login_performed: None,
+            session_reused: None,
+            session_evicted: None,
+            reused_session_401_recovered: None,
         });
         result
     }
@@ -668,6 +722,10 @@ impl Gateway {
             error_code,
             duration_ms,
             result_count,
+            login_performed: None,
+            session_reused: None,
+            session_evicted: None,
+            reused_session_401_recovered: None,
         });
         result
     }
@@ -706,6 +764,93 @@ impl Gateway {
         }
     }
 
+    /// Forward authenticated market-data reads to the controller-owned
+    /// market-control socket (on the blocking pool, since the client is
+    /// blocking), emitting the audit record. The gateway validates and
+    /// authorizes first, and it has no live-socket client.
+    async fn market_control_call(
+        &self,
+        request: MarketControlRequest,
+    ) -> Result<MarketControlOutcome, ErrorData> {
+        let tool = request.audit_tool();
+        let data_class = request.required_capability().audit_data_class();
+        let start = std::time::Instant::now();
+        let dispatched = self.market_control_dispatch(request).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let (outcome, error_code, result_count, session, result) = match dispatched {
+            Ok(MarketControlOutcome::Search { result, session }) => {
+                let count = Some(
+                    result
+                        .groups
+                        .iter()
+                        .map(|group| group.candidates.len())
+                        .sum(),
+                );
+                (
+                    "ok",
+                    None,
+                    count,
+                    Some(session),
+                    Ok(MarketControlOutcome::Search { result, session }),
+                )
+            }
+            Ok(MarketControlOutcome::Details { result, session }) => (
+                "ok",
+                None,
+                Some(1),
+                Some(session),
+                Ok(MarketControlOutcome::Details { result, session }),
+            ),
+            Err((code, err)) => ("error", Some(code), None, None, Err(err)),
+        };
+        audit::emit(&audit::AuditRecord {
+            ts: fineco_core::now_iso8601_utc(),
+            auth_id: OWNER_AUTH_ID,
+            tool,
+            data_class,
+            outcome,
+            error_code,
+            duration_ms,
+            result_count,
+            login_performed: session.map(|status| status.login_performed),
+            session_reused: session.map(|status| status.session_reused),
+            session_evicted: session.map(|status| status.session_evicted),
+            reused_session_401_recovered: session.map(|status| status.reused_session_401_recovered),
+        });
+        result
+    }
+
+    /// Authenticated market-control dispatch core: authorize
+    /// `market.authenticated.read`, validate bounds, then forward to the
+    /// controller socket.
+    async fn market_control_dispatch(
+        &self,
+        request: MarketControlRequest,
+    ) -> Result<MarketControlOutcome, (String, ErrorData)> {
+        if let Err(err) = self.authorize(request.required_capability()) {
+            return Err(("policy_denied".to_string(), err));
+        }
+        if let Err(err) = request.validate() {
+            let dto = SafeErrorDto::from(&err);
+            return Err((dto.code.clone(), error_from_dto(dto)));
+        }
+        let Some(client) = self.market_control_client.clone() else {
+            return Err((
+                "market_control_unconfigured".to_string(),
+                ErrorData::internal_error("authenticated market reads are not configured", None),
+            ));
+        };
+        let expected = request.clone();
+        match tokio::task::spawn_blocking(move || client.call(&request)).await {
+            Err(_) => Err((
+                "controller_unavailable".to_string(),
+                ErrorData::internal_error("market request failed", None),
+            )),
+            Ok(Err(dto)) => Err((dto.code.clone(), error_from_dto(dto))),
+            Ok(Ok(outcome)) => validate_market_control_outcome(&expected, outcome),
+        }
+    }
+
     /// Run a market-tool body, emit its audit record (tool, data class, outcome,
     /// duration, result count), and return the result. `data_class` is the tool's
     /// plan §"Data Classes" label — the two market tools share `MarketRead` but are
@@ -735,6 +880,10 @@ impl Gateway {
             error_code,
             duration_ms,
             result_count,
+            login_performed: None,
+            session_reused: None,
+            session_evicted: None,
+            reused_session_401_recovered: None,
         });
         result.map(|(value, _)| value).map_err(|(_, err)| err)
     }
@@ -746,6 +895,34 @@ impl Gateway {
 fn audit_market_error(err: fineco_core::SafeError) -> (String, ErrorData) {
     let dto = SafeErrorDto::from(&err);
     (dto.code.clone(), error_from_dto(dto))
+}
+
+fn validate_market_control_outcome(
+    request: &MarketControlRequest,
+    outcome: MarketControlOutcome,
+) -> Result<MarketControlOutcome, (String, ErrorData)> {
+    let matches_request = matches!(
+        (request, &outcome),
+        (
+            MarketControlRequest::MarketSearchAsset(_),
+            MarketControlOutcome::Search { .. }
+        ) | (
+            MarketControlRequest::MarketGetAssetDetails(_),
+            MarketControlOutcome::Details { .. }
+        )
+    );
+    if !matches_request {
+        return Err((
+            "controller_protocol_error".to_string(),
+            ErrorData::internal_error("market request failed", None),
+        ));
+    }
+    if let MarketControlOutcome::Details { result, .. } = &outcome {
+        result
+            .validate_response_size()
+            .map_err(audit_market_error)?;
+    }
+    Ok(outcome)
 }
 
 /// Retain only ETFs whose description, issuer, or instrument id contains `query`

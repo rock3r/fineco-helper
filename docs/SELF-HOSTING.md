@@ -107,7 +107,9 @@ Copy each template, fill it in, and set the owner/mode from
 Then the **capability policy** — copy [`../deploy/policy.json`](../deploy/policy.json)
 to `/etc/fineco/policy.json` (`0640 root:fineco-policy`) and grant your auth id the
 capabilities you want (start with cached reads; add `*.live.refresh` only when
-you're ready, ideally one area first).
+you're ready, ideally one area first; add `market.authenticated.read` only after
+the market live-session gate has been reviewed clean and you intentionally want
+on-demand Fineco-backed instrument search).
 
 ### 5. Cloudflare Tunnel + Access
 
@@ -160,7 +162,9 @@ The bundled `cloudflared` unit runs `/usr/bin/cloudflared` — install the
 Verify: all units `active`; the gateway boots (it fails closed without a valid
 Access config); `cloudflared` registers; an authenticated MCP `initialize` to your
 public hostname returns HTTP 200; a cached read works. Live refresh works once the
-worker credential + a `*.live.refresh` capability are in place.
+worker credential + a `*.live.refresh` capability are in place. Fineco-backed
+market reads also need the worker credential, but keep them dark until the full
+market live-session gate is green.
 
 ### 8. Backups (strongly recommended)
 

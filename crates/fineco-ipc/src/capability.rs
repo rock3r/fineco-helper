@@ -31,6 +31,9 @@ pub enum Capability {
     /// Public market reads (ETF list, third-party enrichment).
     #[serde(rename = "market.read")]
     MarketRead,
+    /// Authenticated Fineco market-data reads (instrument search/details).
+    #[serde(rename = "market.authenticated.read")]
+    MarketAuthenticatedRead,
     /// Cached portfolio reads that expose owner-only absolute values.
     #[serde(rename = "portfolio.cached.full_read")]
     PortfolioCachedFullRead,
@@ -62,6 +65,7 @@ impl Capability {
     pub fn as_str(self) -> &'static str {
         match self {
             Capability::MarketRead => "market.read",
+            Capability::MarketAuthenticatedRead => "market.authenticated.read",
             Capability::PortfolioCachedFullRead => "portfolio.cached.full_read",
             Capability::PortfolioShareableRead => "portfolio.shareable.read",
             Capability::OrdersCachedRead => "orders.cached.read",
@@ -81,6 +85,7 @@ impl Capability {
     pub fn audit_data_class(self) -> &'static str {
         match self {
             Capability::MarketRead => "public_market",
+            Capability::MarketAuthenticatedRead => "authenticated_market",
             Capability::PortfolioShareableRead => "shareable_private",
             Capability::PortfolioCachedFullRead
             | Capability::OrdersCachedRead

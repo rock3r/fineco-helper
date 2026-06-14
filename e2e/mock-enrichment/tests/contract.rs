@@ -9,6 +9,7 @@ fn get(path: &str) -> httptiny::Response {
         method: "GET".to_string(),
         path: path.to_string(),
         headers: Vec::new(),
+        body: String::new(),
     })
 }
 

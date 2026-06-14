@@ -1,0 +1,31 @@
+{
+  "descrizione": "Apple Inc. designs, manufactures, and markets devices and related services.",
+  "reutersSector": "Technology",
+  "reutersIndustry": "Consumer Electronics",
+  "ticker": "AAPL",
+  "priceCurrency": "USD",
+  "exchange": "NASDAQ",
+  "range52wH": 317.4,
+  "range52wL": 195.07,
+  "range52wHDate": "2026-06-08",
+  "range52wLDate": "2025-06-18",
+  "perc1W": -5.27,
+  "perc3M": 16.39,
+  "perc6M": 4.61,
+  "perc1Y": 46.14,
+  "capitalizzazione": 4275930.0,
+  "dividendo": 1.02,
+  "pe": 35.35,
+  "eps": 8.23,
+  "roe": 140.9,
+  "divYield": 0.37,
+  "recommendationSummary": {
+    "priceTarget": {
+      "currencyCode": "USD",
+      "mean": 313.15
+    },
+    "recommendation": {
+      "numberOfRecommendations": 49
+    }
+  }
+}

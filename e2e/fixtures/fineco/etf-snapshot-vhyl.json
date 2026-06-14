@@ -1,0 +1,43 @@
+{
+  "etfetcs": [
+    {
+      "id": "IE00B8GKDB10.AFF",
+      "ticker": "VHYL",
+      "isinCusip": "IE00B8GKDB10",
+      "venueSystem": "AFF",
+      "type": "ETF",
+      "description": "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis",
+      "shortDescription": "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis",
+      "inceptionDate": "2013-05-21T00:00:00",
+      "assetNetAssetValues": {
+        "currencyId": "EUR",
+        "dayEndDate": "2026-06-12T00:00:00",
+        "dayEndValue": 8580218432.79
+      },
+      "costiGestioneOngoingCharge": 0.32,
+      "costiGestioneActualManagementFee": 0.29,
+      "ratingMS": 4,
+      "lastNAV": {
+        "date": "2026-06-12T00:00:00",
+        "value": 78.80314
+      },
+      "investmentStrategy": "This Fund seeks to track the performance of the Index.",
+      "returnsCumulativeDayEnd": {
+        "currencyId": "EUR",
+        "date": "2026-06-12T00:00:00",
+        "returnD1": 1.488324,
+        "returnM12": 26.858085
+      },
+      "riskStatistics": {
+        "date": "2026-06-12T00:00:00",
+        "standardDeviationM36": 11.2,
+        "sharpeRatioM36": 0.8,
+        "betaM36": 1.01
+      },
+      "benchmarkMS": "FTSE All-World High Dividend Yield Index",
+      "issuer": "Vanguard",
+      "ucits": true,
+      "category": "Azionari globali"
+    }
+  ]
+}

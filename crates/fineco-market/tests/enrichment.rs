@@ -1190,7 +1190,10 @@ fn long_text_and_wide_sections_are_bounded() {
 
     let report =
         build_enrichment_report(&page(&payload), SOURCE, NOW, None).expect("report should build");
-    assert_eq!(report.company.description.chars().count(), 4096);
+    assert_eq!(
+        report.company.description.chars().count(),
+        fineco_core::MAX_TEXT_FIELD_CHARS
+    );
     let value_section = report.metrics["value"].as_object().expect("value object");
     assert_eq!(value_section.len(), 16);
 }

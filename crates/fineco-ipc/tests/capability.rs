@@ -55,6 +55,29 @@ fn a_narrow_policy_denies_ungranted_capabilities() {
 }
 
 #[test]
+fn authenticated_market_read_is_distinct_from_public_market_read() {
+    let json = r#"{
+        "version": 1,
+        "auth_ids": {
+            "owner": {
+                "capabilities": ["market.authenticated.read"]
+            }
+        }
+    }"#;
+    let policy = Policy::from_json(json).expect("valid policy");
+    assert!(policy.allows(OWNER_AUTH_ID, Capability::MarketAuthenticatedRead));
+    assert!(!policy.allows(OWNER_AUTH_ID, Capability::MarketRead));
+    assert_eq!(
+        Capability::MarketAuthenticatedRead.as_str(),
+        "market.authenticated.read"
+    );
+    assert_eq!(
+        Capability::MarketAuthenticatedRead.audit_data_class(),
+        "authenticated_market"
+    );
+}
+
+#[test]
 fn generic_or_wildcard_capabilities_are_rejected() {
     for bad in ["admin", "private.read", "fineco.proxy", "*", "portfolio.*"] {
         let json =

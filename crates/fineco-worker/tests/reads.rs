@@ -6,6 +6,10 @@
 use std::net::TcpListener;
 use std::thread;
 
+use fineco_ipc::{
+    MarketAssetDetailsLiveFetcher, MarketAssetType, MarketDetailsParams, MarketDetailsSection,
+    MarketSearchLiveFetcher, MarketSearchParams,
+};
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_worker::{FinecoEndpoints, FinecoWorker, StaticCredentialSource};
 
@@ -132,6 +136,30 @@ fn login_failure_surfaces_a_safe_error() {
 }
 
 #[test]
+fn market_search_login_failure_uses_a_market_error_code() {
+    let base = spawn_mock_fineco();
+    let worker = FinecoWorker::new(
+        FinecoEndpoints::for_base(&format!("{base}/nonexistent-prefix")),
+        Box::new(StaticCredentialSource::new(
+            "synthetic-user",
+            "synthetic-pass",
+        )),
+    );
+    let err = worker
+        .fetch_market_search(
+            &MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(5),
+            },
+            NOW,
+        )
+        .expect_err("market login against a missing endpoint must fail");
+    assert_eq!(err.code(), "market_unexpected_response");
+    assert!(!err.safe_message().contains("SYNTHETIC"));
+}
+
+#[test]
 fn refuses_cleartext_to_a_non_loopback_host() {
     // A misconfigured http endpoint to a real host must fail closed before the
     // credential or cookie is ever sent — never leak over cleartext.
@@ -233,4 +261,160 @@ fn fetches_tax_minus_by_year() {
     assert_eq!(rows[0].year, 2026);
     assert_eq!(rows[0].minus_residue, Some(500.0));
     assert_eq!(rows[0].expiration_date.as_deref(), Some("2030-12-31"));
+}
+
+#[test]
+fn logs_in_and_fetches_authenticated_market_search() {
+    let base = spawn_mock_fineco();
+    let live = worker_for(&base)
+        .fetch_market_search(
+            &MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(10),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("market search fetch should succeed");
+    let result = live.result;
+
+    assert_eq!(result.query, "VHYL");
+    assert_eq!(result.data_class, "authenticated_market");
+    assert_eq!(result.source, "fineco.search.global");
+    assert_eq!(result.groups.len(), 1);
+    assert_eq!(result.groups[0].asset_type, MarketAssetType::Etf);
+    assert_eq!(result.groups[0].candidates.len(), 2);
+    assert_eq!(result.groups[0].candidates[1].identifier, "AFF/VHYL");
+    assert_eq!(result.groups[0].candidates[1].symbol, "VHYL");
+    assert_eq!(result.groups[0].candidates[1].display_symbol, "VHYL.MI");
+    assert_eq!(
+        result.groups[0].candidates[1].fineco_key,
+        "IE00B8GKDB10.AFF"
+    );
+    assert!(live.session.login_performed);
+    assert!(!live.session.session_reused);
+}
+
+#[test]
+fn logs_in_and_fetches_authenticated_etf_details() {
+    let base = spawn_mock_fineco();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10.AFF".to_string()),
+                sections: Some(vec![
+                    MarketDetailsSection::Identity,
+                    MarketDetailsSection::Listing,
+                    MarketDetailsSection::Quote,
+                    MarketDetailsSection::Profile,
+                    MarketDetailsSection::Etf,
+                    MarketDetailsSection::Holdings,
+                    MarketDetailsSection::Exposures,
+                    MarketDetailsSection::Returns,
+                    MarketDetailsSection::Risk,
+                ]),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("ETF details fetch should succeed");
+    let result = live.result;
+
+    assert_eq!(result.schema_version, 1);
+    assert_eq!(result.data_class, "authenticated_market");
+    assert_eq!(result.asset.identifier, "AFF/VHYL");
+    assert_eq!(result.asset.fineco_key.value, "IE00B8GKDB10.AFF");
+    assert_eq!(result.asset.isin.expect("isin").value, "IE00B8GKDB10");
+    let quote = result.sections.quote.expect("quote");
+    assert_eq!(
+        quote.last.expect("last").as_of.as_deref(),
+        Some("2026-06-12T15:35:29Z")
+    );
+    let etf = result.sections.etf.expect("etf");
+    assert_eq!(etf.ongoing_charge.expect("ongoing charge").value, 0.32);
+    assert_eq!(
+        etf.management_fee.expect("management fee").unit.as_deref(),
+        Some("percent")
+    );
+    let holdings = result.sections.holdings.expect("holdings");
+    assert_eq!(holdings.len(), 2);
+    assert_eq!(holdings[0].name.value, "Microsoft Corp");
+    assert!(holdings[0].weight.value >= holdings[1].weight.value);
+    let exposures = result.sections.exposures.expect("exposures");
+    assert_eq!(exposures.asset_allocation[0].label.value, "Azioni");
+    assert_eq!(exposures.regions[0].label.value, "Stati Uniti");
+    let returns = result.sections.returns.expect("returns");
+    assert!(returns.cumulative.iter().any(|row| row.period == "12M"));
+    let risk = result.sections.risk.expect("risk");
+    assert_eq!(risk.beta_m36.expect("beta").value, 1.01);
+    assert!(live.session.login_performed);
+}
+
+#[test]
+fn logs_in_and_fetches_authenticated_stock_details() {
+    let base = spawn_mock_fineco();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "NASDAQ/AAPL".to_string(),
+                expected_isin: Some("US0378331005".to_string()),
+                sections: Some(vec![
+                    MarketDetailsSection::Identity,
+                    MarketDetailsSection::Listing,
+                    MarketDetailsSection::Quote,
+                    MarketDetailsSection::Profile,
+                    MarketDetailsSection::Stock,
+                    MarketDetailsSection::Ratios,
+                ]),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("stock details fetch should succeed");
+    let result = live.result;
+
+    assert_eq!(result.schema_version, 1);
+    assert_eq!(result.data_class, "authenticated_market");
+    assert_eq!(result.asset.identifier, "NASDAQ/AAPL");
+    assert_eq!(result.asset.fineco_key.value, "US0378331005.NASDAQ");
+    assert_eq!(result.asset.asset_type.value, MarketAssetType::Stock);
+    assert_eq!(result.asset.isin.expect("isin").value, "US0378331005");
+    assert_eq!(result.asset.symbol.value, "AAPL");
+    let profile = result.sections.profile.expect("profile");
+    assert_eq!(profile.sector.expect("sector").value, "Technology");
+    assert_eq!(
+        profile.industry.expect("industry").value,
+        "Consumer Electronics"
+    );
+    let quote = result.sections.quote.expect("quote");
+    assert_eq!(
+        quote.last.expect("last").as_of.as_deref(),
+        Some("2026-06-12T20:00:00Z")
+    );
+    let stock = result.sections.stock.expect("stock");
+    assert_eq!(stock.pe.expect("pe").value, 35.35);
+    assert_eq!(
+        stock.target_price.expect("target").unit.as_deref(),
+        Some("USD")
+    );
+    let ratios = result.sections.ratios.expect("ratios");
+    assert!(ratios.ratios.iter().any(|row| row.name.value == "NPRICE"));
+    assert!(live.session.login_performed);
+}
+
+#[test]
+fn unsupported_asset_details_stop_after_resolution() {
+    let base = spawn_mock_fineco();
+    let err = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "MOT/T56094".to_string(),
+                expected_isin: Some("IT0005560948.MOT".to_string()),
+                sections: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect_err("unsupported details should fail closed after search resolution");
+
+    assert_eq!(err.code(), "market_unsupported_asset_type");
+    assert!(err.safe_message().contains("bond"));
 }

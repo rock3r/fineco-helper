@@ -254,7 +254,7 @@ async fn a_narrow_policy_denies_ungranted_tools_but_allows_granted_ones() {
 }
 
 #[test]
-fn default_connector_allowlist_is_valid_and_excludes_detailed_portfolio() {
+fn default_connector_allowlist_is_valid_and_excludes_default_blocked_tools() {
     use fineco_gateway::DEFAULT_CONNECTOR_TOOLS;
     let all: std::collections::HashSet<String> = Gateway::tool_names().into_iter().collect();
     // Every default-allowlisted tool is a real registered tool (catches a typo).
@@ -264,13 +264,15 @@ fn default_connector_allowlist_is_valid_and_excludes_detailed_portfolio() {
             "default connector tool '{name}' is not a registered MCP tool"
         );
     }
-    // The four detailed-portfolio (absolute-€) tools are real tools, and NONE of
-    // them is in the default connector allowlist.
+    // The sensitive/owner-only-by-default tools are real tools, and NONE of them
+    // is in the default connector allowlist.
     for blocked in [
         "portfolio_get_latest_snapshot_summary",
         "portfolio_get_latest_full_snapshot",
         "portfolio_get_history",
         "portfolio_get_position_history",
+        "market_search_asset",
+        "market_get_asset_details",
     ] {
         assert!(
             all.contains(blocked),
@@ -278,17 +280,17 @@ fn default_connector_allowlist_is_valid_and_excludes_detailed_portfolio() {
         );
         assert!(
             !DEFAULT_CONNECTOR_TOOLS.contains(&blocked),
-            "{blocked} must be blocked for connectors (it exposes absolute values)"
+            "{blocked} must be blocked for connectors by default"
         );
     }
-    // The default is exactly "every tool minus those four". This assertion is a
+    // The default is exactly "every tool minus those blocked tools". This assertion is a
     // forcing function: adding a tool breaks it until you DECIDE — list the new tool
-    // in DEFAULT_CONNECTOR_TOOLS, or add it to the blocked four (and update this
+    // in DEFAULT_CONNECTOR_TOOLS, or add it to the blocked set (and update this
     // count). The connector filter itself is allowlist-based at runtime (a tool
     // absent from the resolved allowlist is hidden), so the posture is fail-safe.
     assert_eq!(
         DEFAULT_CONNECTOR_TOOLS.len(),
-        all.len() - 4,
-        "the default allowlist should be every tool except the four detailed-portfolio tools"
+        all.len() - 6,
+        "the default allowlist should be every tool except the default-blocked tools"
     );
 }

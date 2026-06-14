@@ -24,7 +24,14 @@ pub use credentials::{
 };
 pub use endpoints::FinecoEndpoints;
 
-use fineco_core::{SafeError, validate_order_request, validate_tax_range};
+use fineco_core::{
+    SafeError, normalize_expected_isin, sanitize_text, validate_order_request, validate_tax_range,
+};
+use fineco_ipc::{
+    MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher, MarketAssetDetailsLiveResult,
+    MarketAssetType, MarketDetailsParams, MarketDetailsSection, MarketSearchCandidate,
+    MarketSearchLiveFetcher, MarketSearchLiveResult, MarketSearchParams, MarketSessionStatus,
+};
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder};
 use serde::Serialize;
@@ -35,6 +42,10 @@ use zeroize::Zeroizing;
 /// Cap on an authenticated JSON response body, so a hostile/buggy upstream
 /// cannot drive unbounded memory in the sole credential-holding process.
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Total attempts for one authenticated market endpoint call after a single
+/// Fineco login. Retries are local to the worker so they do not multiply logins.
+const MARKET_RETRY_ATTEMPTS: u32 = 3;
 
 /// Upper bound on a single Fineco request (connect + transfer). A bank endpoint
 /// that accepts the connection but stalls must surface as `fineco_timeout` and
@@ -83,6 +94,8 @@ const PORTFOLIO_REFERER: &str = "https://finecobank.com/pvt/portfolio/trading-su
 const ORDERS_REFERER: &str = "https://finecobank.com/pvt/portfolio/order-monitor/shares";
 const TAX_REFERER: &str =
     "https://finecobank.com/pvt/portfolio/report/tax-carry-forward/current-month";
+const MARKET_SEARCH_REFERER: &str = "https://finecobank.com/pvt/home";
+const MARKET_DETAILS_REFERER: &str = "https://finecobank.com/pvt/trading/etf/scheda";
 
 /// Origin/Referer the reference sends on the home preflight and the login POST
 /// (the public site), distinct from the private reads' `finecobank.com` origin.
@@ -230,6 +243,19 @@ impl FinecoWorker {
         cookie: &str,
         referer: &str,
     ) -> Result<T, SafeError> {
+        self.get_json_mapped(url, cookie, referer, SafeError::from_upstream_status)
+    }
+
+    /// Authenticated GET returning parsed JSON, with caller-provided safe status
+    /// mapping. Authenticated market reads need market-specific error codes while
+    /// refresh reads keep the historic live-refresh codes.
+    fn get_json_mapped<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        cookie: &str,
+        referer: &str,
+        map_status: fn(u16) -> SafeError,
+    ) -> Result<T, SafeError> {
         // Never replay the session cookie over cleartext to a non-loopback host.
         ensure_secure_transport(url)?;
         let request = with_headers(
@@ -243,7 +269,7 @@ impl FinecoWorker {
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(SafeError::from_upstream_status(status));
+            return Err(map_status(status));
         }
         // Read the body to a string FIRST, then parse — do NOT use `read_json`,
         // which would collapse a stalled body-read **timeout** into a generic
@@ -260,6 +286,59 @@ impl FinecoWorker {
             .read_to_string()
             .map_err(map_transport_error)?;
         serde_json::from_str::<T>(&body).map_err(|_| SafeError::internal())
+    }
+
+    fn get_market_json<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        cookie: &str,
+        referer: &str,
+    ) -> Result<T, SafeError> {
+        with_market_retry(|| self.get_json_mapped(url, cookie, referer, market_status_error))
+    }
+
+    /// Authenticated POST returning parsed JSON, with caller-provided safe
+    /// status mapping. Used for Fineco static instrument search, whose request
+    /// body is server-built from a fixed field allowlist.
+    fn post_json_mapped<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        cookie: &str,
+        referer: &str,
+        map_status: fn(u16) -> SafeError,
+    ) -> Result<T, SafeError> {
+        ensure_secure_transport(url)?;
+        let request = with_headers(
+            with_headers(self.agent.post(url), BROWSER_HEADERS),
+            PRIVATE_READ_HEADERS,
+        )
+        .header("Cookie", cookie)
+        .header("Referer", referer)
+        .header("Accept", "application/json, text/plain, */*");
+        let json = serde_json::to_string(body).map_err(|_| SafeError::internal())?;
+        let mut response = request.send(&json).map_err(map_transport_error)?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(map_status(status));
+        }
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_JSON_BYTES)
+            .read_to_string()
+            .map_err(map_transport_error)?;
+        serde_json::from_str::<T>(&body).map_err(|_| SafeError::internal())
+    }
+
+    fn post_market_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        cookie: &str,
+        referer: &str,
+    ) -> Result<T, SafeError> {
+        with_market_retry(|| self.post_json_mapped(url, body, cookie, referer, market_status_error))
     }
 }
 
@@ -339,6 +418,428 @@ impl TaxFetcher for FinecoWorker {
     }
 }
 
+impl MarketSearchLiveFetcher for FinecoWorker {
+    /// Search Fineco's authenticated global instrument list by ticker, ISIN, or
+    /// name, returning normalized candidates only.
+    ///
+    /// # Errors
+    /// Auth/upstream/internal envelopes on login, fetch, or parse failure; or
+    /// [`SafeError::invalid_request`] if params are out of bounds.
+    fn fetch_market_search(
+        &self,
+        params: &MarketSearchParams,
+        now_iso: &str,
+    ) -> Result<MarketSearchLiveResult, SafeError> {
+        params.validate()?;
+        let cookie = self.login().map_err(market_login_error)?;
+        let url = format!(
+            "{}?term={}",
+            self.endpoints.global_search,
+            percent_encode_query_component(&params.query)
+        );
+        let response: parse::MarketSearchResponse =
+            self.get_market_json(&url, &cookie, MARKET_SEARCH_REFERER)?;
+        Ok(MarketSearchLiveResult {
+            result: parse::to_market_search(response, params, now_iso),
+            session: MarketSessionStatus::fresh_login(),
+        })
+    }
+}
+
+impl MarketAssetDetailsLiveFetcher for FinecoWorker {
+    /// Resolve a venue-qualified Fineco identifier and return normalized ETF
+    /// details. M-3 supports ETFs; stocks are added by the stock slice.
+    ///
+    /// # Errors
+    /// Market safe errors on validation/auth/resolution/upstream failures.
+    fn fetch_market_asset_details(
+        &self,
+        params: &MarketDetailsParams,
+        now_iso: &str,
+    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
+        params.validate()?;
+        let parsed = ParsedMarketIdentifier::parse(&params.identifier)?;
+        let cookie = self.login().map_err(market_login_error)?;
+        let mut candidate = None;
+        for query in details_search_terms(&parsed.symbol) {
+            let search_params = MarketSearchParams {
+                query,
+                asset_type: None,
+                limit: Some(fineco_ipc::MAX_TOTAL_CANDIDATES),
+            };
+            let search_url = format!(
+                "{}?term={}",
+                self.endpoints.global_search,
+                percent_encode_query_component(&search_params.query)
+            );
+            let search_response: parse::MarketSearchResponse =
+                self.get_market_json(&search_url, &cookie, MARKET_SEARCH_REFERER)?;
+            let search = parse::to_market_search(search_response, &search_params, now_iso);
+            match resolve_market_candidate(&search, &parsed, params) {
+                Ok(resolved) => {
+                    candidate = Some(resolved);
+                    break;
+                }
+                Err(error) if error.code() == "market_not_found" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let candidate = candidate.ok_or_else(SafeError::market_not_found)?;
+        if !matches!(
+            candidate.asset_type,
+            MarketAssetType::Etf | MarketAssetType::Stock
+        ) {
+            return Err(SafeError::market_unsupported_asset_type_for(
+                candidate.asset_type.as_str(),
+                &candidate.identifier,
+            ));
+        }
+
+        let static_body = StaticSearchRequest::for_instrument(&candidate.fineco_key);
+        let static_response: parse::StaticSearchResponse = self.post_market_json(
+            &self.endpoints.static_search,
+            &static_body,
+            &cookie,
+            MARKET_DETAILS_REFERER,
+        )?;
+        verify_static_identity(
+            &static_response,
+            &candidate,
+            params.expected_isin.as_deref(),
+        )?;
+        let snapshot_url = format!(
+            "{}?instruments={}",
+            self.endpoints.instruments_snapshot,
+            percent_encode_query_component(&candidate.fineco_key)
+        );
+        let snapshot_response: parse::SnapshotResponse =
+            self.get_market_json(&snapshot_url, &cookie, MARKET_DETAILS_REFERER)?;
+
+        let result = match candidate.asset_type {
+            MarketAssetType::Etf => {
+                let etf_snapshot_url =
+                    etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "snapshot");
+                let etf_snapshot: parse::EtfQueryResponse =
+                    self.get_market_json(&etf_snapshot_url, &cookie, MARKET_DETAILS_REFERER)?;
+
+                let etf_composition = if wants_any_section(
+                    params,
+                    &[
+                        MarketDetailsSection::Holdings,
+                        MarketDetailsSection::Exposures,
+                    ],
+                ) {
+                    let url = etf_query_url(
+                        &self.endpoints.etf_query,
+                        &candidate.fineco_key,
+                        "composition",
+                    );
+                    Some(self.get_market_json(&url, &cookie, MARKET_DETAILS_REFERER)?)
+                } else {
+                    None
+                };
+
+                let etf_returns = if wants_section(params, MarketDetailsSection::Returns) {
+                    let url =
+                        etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "returns");
+                    Some(self.get_market_json(&url, &cookie, MARKET_DETAILS_REFERER)?)
+                } else {
+                    None
+                };
+
+                parse::to_market_asset_details(
+                    params,
+                    &candidate,
+                    parse::MarketDetailsInputs {
+                        static_response,
+                        snapshot_response,
+                        etf_snapshot,
+                        etf_composition,
+                        etf_returns,
+                    },
+                    now_iso,
+                )?
+            }
+            MarketAssetType::Stock => {
+                let (instr_id, venue) = fineco_key_parts(&candidate.fineco_key)?;
+                let stock_snapshot_url =
+                    stock_details_url(&self.endpoints.stock_snapshot, venue, instr_id);
+                let stock_snapshot: parse::StockSnapshotResponse =
+                    self.get_market_json(&stock_snapshot_url, &cookie, MARKET_DETAILS_REFERER)?;
+                let stock_reports = if wants_section(params, MarketDetailsSection::Ratios) {
+                    let url = stock_details_url(&self.endpoints.stock_reports, venue, instr_id);
+                    Some(self.get_market_json(&url, &cookie, MARKET_DETAILS_REFERER)?)
+                } else {
+                    None
+                };
+                parse::to_stock_asset_details(
+                    params,
+                    &candidate,
+                    parse::StockDetailsInputs {
+                        static_response,
+                        snapshot_response,
+                        stock_snapshot,
+                        stock_reports,
+                    },
+                    now_iso,
+                )?
+            }
+            _ => {
+                return Err(SafeError::market_unsupported_asset_type_for(
+                    candidate.asset_type.as_str(),
+                    &candidate.identifier,
+                ));
+            }
+        };
+        result.validate_response_size()?;
+        Ok(MarketAssetDetailsLiveResult {
+            result,
+            session: MarketSessionStatus::fresh_login(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ParsedMarketIdentifier {
+    venue: String,
+    symbol: String,
+}
+
+impl ParsedMarketIdentifier {
+    fn parse(identifier: &str) -> Result<Self, SafeError> {
+        let (venue, symbol) = identifier
+            .split_once('/')
+            .or_else(|| identifier.split_once(':'))
+            .ok_or_else(|| SafeError::invalid_request("identifier must be venue-qualified."))?;
+        Ok(Self {
+            venue: venue.to_ascii_uppercase(),
+            symbol: symbol.to_ascii_uppercase(),
+        })
+    }
+}
+
+fn resolve_market_candidate(
+    search: &fineco_ipc::MarketSearchResult,
+    parsed: &ParsedMarketIdentifier,
+    params: &MarketDetailsParams,
+) -> Result<MarketSearchCandidate, SafeError> {
+    let expected_isin = params
+        .expected_isin
+        .as_deref()
+        .map(normalize_expected_isin)
+        .transpose()?;
+    let mut survivors = Vec::new();
+    for group in &search.groups {
+        for candidate in &group.candidates {
+            if candidate.venue.eq_ignore_ascii_case(&parsed.venue)
+                && symbols_equivalent(&candidate.symbol, &parsed.symbol)
+                && expected_isin.as_ref().is_none_or(|expected| {
+                    candidate
+                        .isin
+                        .as_ref()
+                        .is_some_and(|isin| isin.eq_ignore_ascii_case(expected))
+                })
+            {
+                survivors.push(candidate.clone());
+            }
+        }
+    }
+    match survivors.len() {
+        0 => Err(SafeError::market_not_found()),
+        1 => Ok(survivors.remove(0)),
+        _ => Err(SafeError::market_ambiguous_identifier_with_suggestions(
+            &ambiguity_suggestions(&survivors),
+        )),
+    }
+}
+
+fn ambiguity_suggestions(candidates: &[MarketSearchCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .take(MAX_AMBIGUITY_SUGGESTIONS)
+        .map(|candidate| {
+            let isin = candidate.isin.as_deref().unwrap_or("no_isin");
+            sanitize_text(&format!(
+                "{} ({}, {isin})",
+                candidate.identifier,
+                candidate.asset_type.as_str()
+            ))
+        })
+        .collect()
+}
+
+fn verify_static_identity(
+    static_response: &parse::StaticSearchResponse,
+    candidate: &MarketSearchCandidate,
+    expected_isin: Option<&str>,
+) -> Result<(), SafeError> {
+    let Some(expected_isin) = expected_isin else {
+        return Ok(());
+    };
+    let expected_isin = normalize_expected_isin(expected_isin)?;
+    let Some(static_instr_id) = parse::static_instrument_id(static_response, &candidate.fineco_key)
+    else {
+        return Err(SafeError::market_unexpected_response());
+    };
+    if static_instr_id.eq_ignore_ascii_case(&expected_isin) {
+        Ok(())
+    } else {
+        Err(SafeError::market_unexpected_response())
+    }
+}
+
+fn symbols_equivalent(candidate: &str, requested: &str) -> bool {
+    normalize_symbol(candidate) == normalize_symbol(requested)
+}
+
+fn details_search_terms(symbol: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    push_unique_search_term(&mut terms, symbol);
+    let spaced = symbol
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '.' | '/' | '-' | '_') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    push_unique_search_term(&mut terms, &spaced);
+    if let Some((root, _)) = symbol.split_once(['.', '/', '-', '_']) {
+        push_unique_search_term(&mut terms, root);
+    }
+    let compact = normalize_symbol(symbol);
+    push_unique_search_term(&mut terms, &compact);
+    terms
+}
+
+fn push_unique_search_term(terms: &mut Vec<String>, value: &str) {
+    let term = sanitize_text(value).to_ascii_uppercase();
+    if !term.is_empty() && !terms.iter().any(|existing| existing == &term) {
+        terms.push(term);
+    }
+}
+
+fn normalize_symbol(symbol: &str) -> String {
+    symbol
+        .chars()
+        .filter(|ch| !matches!(ch, '.' | '/' | '-' | '_' | ' '))
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+#[derive(Serialize)]
+struct StaticSearchRequest<'a> {
+    instruments: [&'a str; 1],
+    fields: &'static [&'static str],
+    #[serde(rename = "withWarnings")]
+    with_warnings: bool,
+}
+
+impl<'a> StaticSearchRequest<'a> {
+    fn for_instrument(instrument: &'a str) -> Self {
+        Self {
+            instruments: [instrument],
+            fields: &[
+                "instrId",
+                "venueSystem",
+                "description",
+                "symbol",
+                "instrTyp",
+                "newType",
+                "ricReuters",
+                "currencyCd",
+                "issueDate",
+                "issuer",
+                "preferredVenue",
+                "kidIt",
+                "kidEn",
+                "esgTaxonomy",
+                "topQuality",
+                "categoryId",
+            ],
+            with_warnings: true,
+        }
+    }
+}
+
+fn wants_section(params: &MarketDetailsParams, section: MarketDetailsSection) -> bool {
+    params
+        .sections
+        .as_ref()
+        .is_some_and(|sections| sections.contains(&section))
+}
+
+fn wants_any_section(params: &MarketDetailsParams, sections: &[MarketDetailsSection]) -> bool {
+    sections
+        .iter()
+        .copied()
+        .any(|section| wants_section(params, section))
+}
+
+fn etf_query_url(base: &str, fineco_key: &str, view: &str) -> String {
+    format!(
+        "{base}?type=ETF&ids={}&view={view}",
+        percent_encode_query_component(fineco_key)
+    )
+}
+
+fn fineco_key_parts(fineco_key: &str) -> Result<(&str, &str), SafeError> {
+    fineco_key
+        .rsplit_once('.')
+        .ok_or_else(SafeError::market_unexpected_response)
+}
+
+fn stock_details_url(base: &str, venue: &str, instr_id: &str) -> String {
+    format!(
+        "{base}/{}/{}",
+        percent_encode_query_component(venue),
+        percent_encode_query_component(instr_id)
+    )
+}
+
+fn with_market_retry<T>(mut op: impl FnMut() -> Result<T, SafeError>) -> Result<T, SafeError> {
+    let mut attempt = 1u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_market_retryable(&error) && attempt < MARKET_RETRY_ATTEMPTS => {
+                attempt += 1;
+            }
+            Err(error) => return Err(market_login_error(error)),
+        }
+    }
+}
+
+fn is_market_retryable(error: &SafeError) -> bool {
+    matches!(
+        error.code(),
+        "market_upstream_failure" | "fineco_timeout" | "fineco_upstream_error"
+    ) && error.retryable()
+}
+
+fn market_login_error(error: SafeError) -> SafeError {
+    match error.code() {
+        "auth_required" => SafeError::market_auth_required(),
+        "rate_limited" => SafeError::market_rate_limited(),
+        "fineco_timeout" => SafeError::market_upstream_failure(),
+        "fineco_upstream_error" if error.retryable() => SafeError::market_upstream_failure(),
+        "fineco_upstream_error" => SafeError::market_unexpected_response(),
+        "not_found" => SafeError::market_unexpected_response(),
+        _ => error,
+    }
+}
+
+fn market_status_error(status: u16) -> SafeError {
+    match status {
+        401 | 403 => SafeError::market_auth_required(),
+        429 => SafeError::market_rate_limited(),
+        500..=599 => SafeError::market_upstream_failure(),
+        _ => SafeError::market_unexpected_response(),
+    }
+}
+
 /// Apply a fixed set of `(name, value)` headers to a request builder.
 fn with_headers<B>(
     mut builder: ureq::RequestBuilder<B>,
@@ -386,6 +887,22 @@ fn ensure_secure_transport(url: &str) -> Result<(), SafeError> {
             "Fineco endpoint must use https.",
         ))
     }
+}
+
+fn percent_encode_query_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{byte:02X}");
+            }
+        }
+    }
+    out
 }
 
 /// Map a ureq transport error to a safe envelope. The error's `Display` may
@@ -531,8 +1048,17 @@ fn random_below(bound: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::synthetic_public_cookies;
-    use super::{FinecoEndpoints, FinecoWorker, StaticCredentialSource};
+    use super::{
+        FinecoEndpoints, FinecoWorker, MARKET_RETRY_ATTEMPTS, ParsedMarketIdentifier,
+        StaticCredentialSource, details_search_terms, market_status_error,
+        resolve_market_candidate, with_market_retry,
+    };
+    use super::{market_login_error, synthetic_public_cookies};
+    use fineco_core::SafeError;
+    use fineco_ipc::{
+        MarketAssetType, MarketDetailsParams, MarketSearchCandidate, MarketSearchGroup,
+        MarketSearchResult,
+    };
     use std::collections::HashMap;
 
     /// The credentialed worker must NEVER honor a proxy from the environment:
@@ -553,6 +1079,176 @@ mod tests {
             worker.agent.config().proxy().is_none(),
             "the credentialed worker must not honor a proxy from the environment"
         );
+    }
+
+    #[test]
+    fn resolver_accepts_dotted_expected_isin_suffixes() {
+        let search = search_result(vec![candidate(
+            "AFF/VHYL",
+            "VHYL",
+            "IE00B8GKDB10",
+            MarketAssetType::Etf,
+        )]);
+        let parsed = ParsedMarketIdentifier {
+            venue: "AFF".to_string(),
+            symbol: "VHYL".to_string(),
+        };
+        let resolved = resolve_market_candidate(
+            &search,
+            &parsed,
+            &MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10.AFF".to_string()),
+                sections: None,
+            },
+        )
+        .expect("dotted expected_isin should compare by normalized ISIN");
+
+        assert_eq!(resolved.identifier, "AFF/VHYL");
+    }
+
+    #[test]
+    fn ambiguous_resolver_error_includes_bounded_candidate_suggestions() {
+        let search = search_result(vec![
+            candidate("AFF/VHYL", "VHYL", "IE00B8GKDB10", MarketAssetType::Etf),
+            candidate("AFF/VHYL", "VHYL", "IE00B8GKDB11", MarketAssetType::Etf),
+        ]);
+        let parsed = ParsedMarketIdentifier {
+            venue: "AFF".to_string(),
+            symbol: "VHYL".to_string(),
+        };
+
+        let err = resolve_market_candidate(
+            &search,
+            &parsed,
+            &MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: None,
+                sections: None,
+            },
+        )
+        .expect_err("two hard-filter survivors must fail closed");
+
+        assert_eq!(err.code(), "market_ambiguous_identifier");
+        assert!(err.safe_message().contains("AFF/VHYL"));
+        assert!(err.safe_message().contains("IE00B8GKDB10"));
+        assert!(!err.safe_message().contains('\n'));
+    }
+
+    #[test]
+    fn resolver_matrix_covers_common_symbols_and_share_classes() {
+        for (identifier, candidate_symbol, isin, asset_type) in [
+            (
+                "NASDAQ/AAPL",
+                "AAPL",
+                "US0378331005",
+                MarketAssetType::Stock,
+            ),
+            ("AFF/VHYL", "VHYL", "IE00B8GKDB10", MarketAssetType::Etf),
+            ("AFF/ENEL", "ENEL", "IT0003128367", MarketAssetType::Stock),
+            ("AFF/ISP", "ISP", "IT0000072618", MarketAssetType::Stock),
+            (
+                "NYSE/BRK.B",
+                "BRK/B",
+                "US0846707026",
+                MarketAssetType::Stock,
+            ),
+            ("XETRA/BMW3", "BMW3", "DE0005190037", MarketAssetType::Stock),
+            ("XETRA/VUAA", "VUAA", "IE00BFMXXD54", MarketAssetType::Etf),
+            (
+                "MOT/T56094",
+                "T56094",
+                "IT0005560948",
+                MarketAssetType::Bond,
+            ),
+        ] {
+            let (venue, symbol) = identifier.split_once('/').expect("qualified");
+            let search = search_result(vec![candidate(
+                identifier,
+                candidate_symbol,
+                isin,
+                asset_type,
+            )]);
+            let parsed = ParsedMarketIdentifier {
+                venue: venue.to_string(),
+                symbol: symbol.to_string(),
+            };
+            let resolved = resolve_market_candidate(
+                &search,
+                &parsed,
+                &MarketDetailsParams {
+                    identifier: identifier.to_string(),
+                    expected_isin: Some(format!("{isin}.{venue}")),
+                    sections: None,
+                },
+            )
+            .expect("one hard-filter survivor should resolve");
+
+            assert_eq!(resolved.identifier, identifier);
+            assert_eq!(resolved.isin.as_deref(), Some(isin));
+        }
+    }
+
+    #[test]
+    fn details_search_terms_cover_share_class_aliases() {
+        assert_eq!(
+            details_search_terms("BRK.B"),
+            vec!["BRK.B", "BRK B", "BRK", "BRKB"]
+        );
+        assert_eq!(
+            details_search_terms("BRK/B"),
+            vec!["BRK/B", "BRK B", "BRK", "BRKB"]
+        );
+    }
+
+    #[test]
+    fn static_identity_mismatch_fails_closed() {
+        let static_response = serde_json::from_str(
+            r#"{"IE00B8GKDB10.AFF":{"instrId":"IE00B8GKDB11","venueSystem":"AFF"}}"#,
+        )
+        .expect("static response");
+        let candidate = candidate("AFF/VHYL", "VHYL", "IE00B8GKDB10", MarketAssetType::Etf);
+
+        let err =
+            super::verify_static_identity(&static_response, &candidate, Some("IE00B8GKDB10.AFF"))
+                .expect_err("static identity mismatch must fail closed");
+
+        assert_eq!(err.code(), "market_unexpected_response");
+    }
+
+    fn search_result(candidates: Vec<MarketSearchCandidate>) -> MarketSearchResult {
+        MarketSearchResult {
+            query: "VHYL".to_string(),
+            data_class: "authenticated_market".to_string(),
+            source: "fineco.search.global".to_string(),
+            captured_at: "2026-06-14T09:30:00Z".to_string(),
+            groups: vec![MarketSearchGroup {
+                asset_type: MarketAssetType::Etf,
+                result_count: candidates.len(),
+                candidates,
+            }],
+        }
+    }
+
+    fn candidate(
+        identifier: &str,
+        symbol: &str,
+        isin: &str,
+        asset_type: MarketAssetType,
+    ) -> MarketSearchCandidate {
+        let venue = identifier.split_once('/').expect("qualified").0;
+        MarketSearchCandidate {
+            fineco_key: format!("{isin}.{venue}"),
+            identifier: identifier.to_string(),
+            name: "Synthetic candidate".to_string(),
+            venue: venue.to_string(),
+            symbol: symbol.to_string(),
+            display_symbol: format!("{symbol}.MI"),
+            isin: Some(isin.to_string()),
+            currency: Some("EUR".to_string()),
+            asset_type,
+            preferred: false,
+        }
     }
 
     /// Split a `name=value; name=value` cookie header into a name→value map.
@@ -639,5 +1335,95 @@ mod tests {
         // Repeated logins must not reuse identical cookie values (less bot-like);
         // the random UUID/base64 parts make a collision astronomically unlikely.
         assert_ne!(synthetic_public_cookies(), synthetic_public_cookies());
+    }
+
+    #[test]
+    fn authenticated_market_statuses_map_to_market_error_codes() {
+        assert_eq!(market_status_error(401).code(), "market_auth_required");
+        assert_eq!(market_status_error(403).code(), "market_auth_required");
+        assert_eq!(market_status_error(429).code(), "market_rate_limited");
+        assert_eq!(market_status_error(500).code(), "market_upstream_failure");
+        assert!(market_status_error(500).retryable());
+        assert_eq!(
+            market_status_error(418).code(),
+            "market_unexpected_response"
+        );
+        assert!(!market_status_error(418).retryable());
+    }
+
+    #[test]
+    fn authenticated_market_login_failures_map_to_market_error_codes() {
+        assert_eq!(
+            market_login_error(SafeError::auth_required()).code(),
+            "market_auth_required"
+        );
+        assert_eq!(
+            market_login_error(SafeError::rate_limited()).code(),
+            "market_rate_limited"
+        );
+        assert_eq!(
+            market_login_error(SafeError::fineco_timeout()).code(),
+            "market_upstream_failure"
+        );
+        assert_eq!(
+            market_login_error(SafeError::from_upstream_status(500)).code(),
+            "market_upstream_failure"
+        );
+        assert_eq!(
+            market_login_error(SafeError::from_upstream_status(418)).code(),
+            "market_unexpected_response"
+        );
+        assert_eq!(
+            market_login_error(SafeError::not_found()).code(),
+            "market_unexpected_response"
+        );
+    }
+
+    #[test]
+    fn market_retry_retries_only_retryable_market_upstream_failures() {
+        let attempts = std::cell::Cell::new(0u32);
+        let out = with_market_retry(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < MARKET_RETRY_ATTEMPTS {
+                Err(SafeError::market_upstream_failure())
+            } else {
+                Ok("ok")
+            }
+        })
+        .expect("retry succeeds");
+
+        assert_eq!(out, "ok");
+        assert_eq!(attempts.get(), MARKET_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn market_retry_maps_timeout_after_exhaustion() {
+        let attempts = std::cell::Cell::new(0u32);
+        let err: SafeError = with_market_retry(|| -> Result<(), SafeError> {
+            attempts.set(attempts.get() + 1);
+            Err(SafeError::fineco_timeout())
+        })
+        .expect_err("timeout exhausts");
+
+        assert_eq!(attempts.get(), MARKET_RETRY_ATTEMPTS);
+        assert_eq!(err.code(), "market_upstream_failure");
+    }
+
+    #[test]
+    fn market_retry_does_not_retry_auth_or_rate_limit() {
+        for error in [
+            SafeError::market_auth_required(),
+            SafeError::market_rate_limited(),
+        ] {
+            let attempts = std::cell::Cell::new(0u32);
+            let err: SafeError = with_market_retry(|| -> Result<(), SafeError> {
+                attempts.set(attempts.get() + 1);
+                Err(error.clone())
+            })
+            .expect_err("non-upstream error propagates");
+
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(err.code(), error.code());
+        }
     }
 }

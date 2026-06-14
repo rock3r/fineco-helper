@@ -63,6 +63,7 @@ fn fetches_and_parses_enrichment_over_http() {
                 method: req.method.clone(),
                 path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
                 headers: req.headers.clone(),
+                body: String::new(),
             })
         } else {
             httptiny::Response::not_found()
@@ -95,6 +96,7 @@ fn qualified_identifier_fetches_singular_stock_page_path() {
                 method: req.method.clone(),
                 path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
                 headers: req.headers.clone(),
+                body: String::new(),
             })
         } else {
             httptiny::Response::not_found()
@@ -120,6 +122,7 @@ fn colon_qualified_identifier_is_normalized_to_slash_route() {
                 method: req.method.clone(),
                 path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
                 headers: req.headers.clone(),
+                body: String::new(),
             })
         } else {
             httptiny::Response::not_found()
@@ -279,6 +282,7 @@ fn enrichment_fetch_sends_browser_headers() {
                 method: req.method.clone(),
                 path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
                 headers: req.headers.clone(),
+                body: String::new(),
             })
         } else {
             httptiny::Response::not_found()

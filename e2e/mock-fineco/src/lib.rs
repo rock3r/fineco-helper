@@ -25,6 +25,30 @@ const TAX_CARRY_FORWARD: &str = include_str!("../../fixtures/fineco/tax-carry-fo
 const TAX_MINUS: &str = include_str!("../../fixtures/fineco/tax-minus.json");
 /// Canned synthetic zero-commission ETF list (public_market data class).
 const ZERO_COMMISSION_ETFS: &str = include_str!("../../fixtures/fineco/zero-commission-etfs.json");
+/// Canned synthetic global instrument-search fixture.
+const GLOBAL_SEARCH_VHYL: &str = include_str!("../../fixtures/fineco/global-search-vhyl.json");
+/// Canned synthetic stock global-search fixture.
+const GLOBAL_SEARCH_AAPL: &str = include_str!("../../fixtures/fineco/global-search-aapl.json");
+/// Canned synthetic unsupported bond global-search fixture.
+const GLOBAL_SEARCH_T56094: &str = include_str!("../../fixtures/fineco/global-search-t56094.json");
+/// Canned synthetic static instrument fixture.
+const STATIC_SEARCH_VHYL: &str = include_str!("../../fixtures/fineco/static-search-vhyl.json");
+/// Canned synthetic stock static instrument fixture.
+const STATIC_SEARCH_AAPL: &str = include_str!("../../fixtures/fineco/static-search-aapl.json");
+/// Canned synthetic instrument snapshot fixture.
+const SNAPSHOT_VHYL: &str = include_str!("../../fixtures/fineco/snapshot-vhyl.json");
+/// Canned synthetic stock instrument quote fixture.
+const SNAPSHOT_AAPL: &str = include_str!("../../fixtures/fineco/snapshot-aapl.json");
+/// Canned synthetic ETF snapshot fixture.
+const ETF_SNAPSHOT_VHYL: &str = include_str!("../../fixtures/fineco/etf-snapshot-vhyl.json");
+/// Canned synthetic ETF composition fixture.
+const ETF_COMPOSITION_VHYL: &str = include_str!("../../fixtures/fineco/etf-composition-vhyl.json");
+/// Canned synthetic ETF returns fixture.
+const ETF_RETURNS_VHYL: &str = include_str!("../../fixtures/fineco/etf-returns-vhyl.json");
+/// Canned synthetic stock profile/snapshot fixture.
+const STOCK_SNAPSHOT_AAPL: &str = include_str!("../../fixtures/fineco/stock-snapshot-aapl.json");
+/// Canned synthetic stock reports fixture.
+const STOCK_REPORTS_AAPL: &str = include_str!("../../fixtures/fineco/stock-reports-aapl.json");
 
 /// Path of the public, no-auth zero-commission ETF list (mirrors the real
 /// `images.finecobank.com` JSON path).
@@ -95,6 +119,55 @@ pub fn route(req: &Request) -> Response {
         // Private reads — gated behind the session cookie.
         ("GET", "/v1/private/tol/positions/summary") => private(req, PORTFOLIO),
         ("GET", "/v1/private/tol/transactions") => private(req, TRANSACTIONS),
+        ("GET", "/v1/private/tol/stocklists/search/global") => {
+            if req.path.contains("term=VHYL") {
+                return private(req, GLOBAL_SEARCH_VHYL);
+            }
+            if req.path.contains("term=AAPL") {
+                return private(req, GLOBAL_SEARCH_AAPL);
+            }
+            if req.path.contains("term=T56094") {
+                return private(req, GLOBAL_SEARCH_T56094);
+            }
+            Response::json(400, "{\"error\":\"unexpected search term\"}")
+        }
+        ("POST", "/v1/private/tol/instruments/static/search") => {
+            if req.body.contains("IE00B8GKDB10.AFF") {
+                return private(req, STATIC_SEARCH_VHYL);
+            }
+            if req.body.contains("US0378331005.NASDAQ") {
+                return private(req, STATIC_SEARCH_AAPL);
+            }
+            Response::json(400, "{\"error\":\"unexpected static search body\"}")
+        }
+        ("GET", "/v1/private/tol/instruments/snapshot") => {
+            if req.path.contains("instruments=IE00B8GKDB10.AFF") {
+                return private(req, SNAPSHOT_VHYL);
+            }
+            if req.path.contains("instruments=US0378331005.NASDAQ") {
+                return private(req, SNAPSHOT_AAPL);
+            }
+            Response::json(400, "{\"error\":\"unexpected snapshot instrument\"}")
+        }
+        ("GET", "/v1/private/tol/etf/query") => {
+            if !req.path.contains("ids=IE00B8GKDB10.AFF") {
+                return Response::json(400, "{\"error\":\"unexpected etf id\"}");
+            }
+            if req.path.contains("view=snapshot") {
+                return private(req, ETF_SNAPSHOT_VHYL);
+            }
+            if req.path.contains("view=composition") {
+                return private(req, ETF_COMPOSITION_VHYL);
+            }
+            if req.path.contains("view=returns") {
+                return private(req, ETF_RETURNS_VHYL);
+            }
+            Response::json(400, "{\"error\":\"unexpected etf view\"}")
+        }
+        ("GET", "/v1/private/snapshot/NASDAQ/US0378331005") => private(req, STOCK_SNAPSHOT_AAPL),
+        ("GET", "/v1/private/snapshot/reports/NASDAQ/US0378331005") => {
+            private(req, STOCK_REPORTS_AAPL)
+        }
         ("GET", "/v1/private/tax-carry-forward/search") => private(req, TAX_CARRY_FORWARD),
         ("GET", "/v1/private/tax-carry-forward/minus") => private(req, TAX_MINUS),
 

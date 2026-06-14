@@ -339,16 +339,18 @@ fn dual_pin_base() -> Vec<(&'static str, &'static str)> {
 }
 
 #[test]
-fn connector_allowlist_defaults_to_everything_but_detailed_portfolio_under_dual_pin() {
+fn connector_allowlist_defaults_to_everything_but_default_blocked_tools_under_dual_pin() {
     let config = GatewayConfig::from_env(env_from(&dual_pin_base())).expect("config");
     let allow = config
         .connector_allowlist
         .expect("dual-pin sets a connector allowlist");
     assert!(allow.contains(&"portfolio_get_latest_shareable_report".to_string()));
     assert!(allow.contains(&"private_portfolio_refresh_live_sensitive".to_string()));
-    // The four detailed-portfolio tools are excluded by default.
+    // The detailed-portfolio tools and authenticated Fineco market search are
+    // excluded by default.
     assert!(!allow.contains(&"portfolio_get_latest_full_snapshot".to_string()));
     assert!(!allow.contains(&"portfolio_get_history".to_string()));
+    assert!(!allow.contains(&"market_search_asset".to_string()));
 }
 
 #[test]
@@ -513,6 +515,30 @@ fn gateway_config_reads_the_refresh_socket() {
         config.refresh_socket_path.as_deref(),
         Some(std::path::Path::new("/run/fineco/refresh.sock"))
     );
+    assert!(
+        config.market_control_socket_path.is_none(),
+        "authenticated market control is explicit-only until its live-session controls land"
+    );
+}
+
+#[test]
+fn gateway_config_reads_market_control_socket_only_when_explicit() {
+    let base = [
+        ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),
+        ("FINECO_POLICY_PATH", POLICY_PATH),
+        ("FINECO_ACCESS_DISABLED", "true"),
+        ("FINECO_REFRESH_SOCKET", "/run/fineco/refresh.sock"),
+    ];
+    let config = GatewayConfig::from_env(env_from(&base)).expect("config");
+    assert!(config.market_control_socket_path.is_none());
+
+    let mut explicit = base.to_vec();
+    explicit.push(("FINECO_MARKET_CONTROL_SOCKET", "/run/fineco/market.sock"));
+    let config = GatewayConfig::from_env(env_from(&explicit)).expect("config");
+    assert_eq!(
+        config.market_control_socket_path.as_deref(),
+        Some(std::path::Path::new("/run/fineco/market.sock"))
+    );
 }
 
 #[test]
@@ -582,11 +608,34 @@ fn store_server_config_pairs_refresh_and_live_sockets_and_treats_blanks_as_unset
     both.push(("FINECO_LIVE_SOCKET", "/run/fineco/live.sock"));
     let config = StoreServerConfig::from_env(env_from(&both)).expect("both set");
     assert!(config.refresh_socket_path.is_some() && config.live_socket_path.is_some());
+    assert!(config.market_control_socket_path.is_none());
+
+    // Authenticated market reads are an explicit opt-in, not implied by refresh.
+    both.push((
+        "FINECO_MARKET_CONTROL_SOCKET",
+        "/run/fineco/market-control.sock",
+    ));
+    let config = StoreServerConfig::from_env(env_from(&both)).expect("market control set");
+    assert_eq!(
+        config.market_control_socket_path.as_deref(),
+        Some(std::path::Path::new("/run/fineco/market-control.sock"))
+    );
 
     // Exactly one REAL path set -> partial config fails closed.
     let mut partial = base.to_vec();
     partial.push(("FINECO_REFRESH_SOCKET", "/run/fineco/refresh.sock"));
     assert!(StoreServerConfig::from_env(env_from(&partial)).is_err());
+
+    // Market-control without the controller's full refresh/live socket pair still
+    // fails closed; it is served by the same controller block in this milestone.
+    let mut market_without_live = base.to_vec();
+    market_without_live.push(("FINECO_MARKET_CONTROL_SOCKET", "/run/fineco/market.sock"));
+    assert!(StoreServerConfig::from_env(env_from(&market_without_live)).is_err());
+
+    let mut market_without_refresh = base.to_vec();
+    market_without_refresh.push(("FINECO_MARKET_CONTROL_SOCKET", "/run/fineco/market.sock"));
+    market_without_refresh.push(("FINECO_LIVE_SOCKET", "/run/fineco/live.sock"));
+    assert!(StoreServerConfig::from_env(env_from(&market_without_refresh)).is_err());
 }
 
 /// Build a store-server config from the required vars plus an optional socket
@@ -885,6 +934,7 @@ fn store_server_refuses_to_take_over_a_live_socket() {
         policy_path: policy_path.clone(),
         socket_mode: 0o600,
         refresh_socket_path: None,
+        market_control_socket_path: None,
         live_socket_path: None,
         refresh_socket_mode: 0o600,
     };
@@ -916,6 +966,7 @@ fn store_server_refuses_a_non_socket_query_path_without_deleting_it() {
         policy_path: policy_path.clone(),
         socket_mode: 0o600,
         refresh_socket_path: None,
+        market_control_socket_path: None,
         live_socket_path: None,
         refresh_socket_mode: 0o600,
     };
@@ -953,6 +1004,7 @@ fn store_server_applies_a_configured_group_socket_mode() {
         policy_path: policy_path.clone(),
         socket_mode: 0o660, // shared-IPC-group topology
         refresh_socket_path: None,
+        market_control_socket_path: None,
         live_socket_path: None,
         refresh_socket_mode: 0o600,
     };
@@ -1014,6 +1066,7 @@ fn store_server_answers_a_client_over_the_socket() {
         policy_path: policy_path.clone(),
         socket_mode: 0o600,
         refresh_socket_path: None,
+        market_control_socket_path: None,
         live_socket_path: None,
         refresh_socket_mode: 0o600,
     };
@@ -1129,6 +1182,116 @@ impl fineco_refresh::TaxFetcher for FakeLiveWorker {
     }
 }
 
+impl fineco_live::MarketSearchLiveFetcher for FakeLiveWorker {
+    fn fetch_market_search(
+        &self,
+        params: &fineco_ipc::MarketSearchParams,
+        now_iso: &str,
+    ) -> Result<fineco_ipc::MarketSearchLiveResult, fineco_core::SafeError> {
+        Ok(fineco_ipc::MarketSearchLiveResult {
+            result: fineco_ipc::MarketSearchResult {
+                query: params.query.clone(),
+                data_class: "authenticated_market".to_string(),
+                source: "fineco.search.global".to_string(),
+                captured_at: now_iso.to_string(),
+                groups: vec![fineco_ipc::MarketSearchGroup {
+                    asset_type: fineco_ipc::MarketAssetType::Etf,
+                    result_count: 1,
+                    candidates: vec![fineco_ipc::MarketSearchCandidate {
+                        fineco_key: "IE00B8GKDB10.AFF".to_string(),
+                        identifier: "AFF/VHYL".to_string(),
+                        name: "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis"
+                            .to_string(),
+                        venue: "AFF".to_string(),
+                        symbol: "VHYL".to_string(),
+                        display_symbol: "VHYL.MI".to_string(),
+                        isin: Some("IE00B8GKDB10".to_string()),
+                        currency: Some("EUR".to_string()),
+                        asset_type: fineco_ipc::MarketAssetType::Etf,
+                        preferred: true,
+                    }],
+                }],
+            },
+            session: fineco_ipc::MarketSessionStatus::fresh_login(),
+        })
+    }
+}
+
+impl fineco_live::MarketAssetDetailsLiveFetcher for FakeLiveWorker {
+    fn fetch_market_asset_details(
+        &self,
+        params: &fineco_ipc::MarketDetailsParams,
+        now_iso: &str,
+    ) -> Result<fineco_ipc::MarketAssetDetailsLiveResult, fineco_core::SafeError> {
+        Ok(fineco_ipc::MarketAssetDetailsLiveResult {
+            result: fineco_ipc::MarketAssetDetailsResult {
+                schema_version: 1,
+                data_class: "authenticated_market".to_string(),
+                captured_at: now_iso.to_string(),
+                asset: fineco_ipc::MarketAssetIdentity {
+                    identifier: params.identifier.clone(),
+                    fineco_key: fineco_ipc::MarketField::high_string(
+                        "IE00B8GKDB10.AFF",
+                        "fineco",
+                        "authenticated_market",
+                        "search.global",
+                        now_iso,
+                    ),
+                    asset_type: fineco_ipc::MarketField::high(
+                        fineco_ipc::MarketAssetType::Etf,
+                        None,
+                        "fineco",
+                        "authenticated_market",
+                        "search.global",
+                        None,
+                        now_iso,
+                    ),
+                    name: None,
+                    isin: Some(fineco_ipc::MarketField::high_string(
+                        "IE00B8GKDB10",
+                        "fineco",
+                        "authenticated_market",
+                        "search.global",
+                        now_iso,
+                    )),
+                    venue: fineco_ipc::MarketField::high_string(
+                        "AFF",
+                        "fineco",
+                        "authenticated_market",
+                        "search.global",
+                        now_iso,
+                    ),
+                    symbol: fineco_ipc::MarketField::medium_string(
+                        "VHYL",
+                        "fineco",
+                        "authenticated_market",
+                        "search.global",
+                        now_iso,
+                    ),
+                    display_symbol: Some(fineco_ipc::MarketField::medium_string(
+                        "VHYL.MI",
+                        "fineco",
+                        "authenticated_market",
+                        "search.global",
+                        now_iso,
+                    )),
+                    currency: Some(fineco_ipc::MarketField::high_string(
+                        "EUR",
+                        "fineco",
+                        "authenticated_market",
+                        "search.global",
+                        now_iso,
+                    )),
+                },
+                sections: fineco_ipc::MarketAssetSections::default(),
+                sources: vec![],
+                warnings: vec![],
+            },
+            session: fineco_ipc::MarketSessionStatus::fresh_login(),
+        })
+    }
+}
+
 #[test]
 fn private_worker_serves_a_live_fetch_and_keeps_the_socket_owner_only() {
     use fineco_refresh::PortfolioFetcher;
@@ -1241,6 +1404,7 @@ fn store_server_refresh_controller_drives_a_live_refresh_end_to_end() {
         policy_path: policy_path.clone(),
         socket_mode: 0o600,
         refresh_socket_path: Some(refresh_socket.clone()),
+        market_control_socket_path: None,
         live_socket_path: Some(live_socket.clone()),
         refresh_socket_mode: 0o600,
     };
@@ -1293,6 +1457,158 @@ fn store_server_refresh_controller_drives_a_live_refresh_end_to_end() {
 }
 
 #[test]
+fn store_server_market_control_routes_authenticated_search_to_live_worker() {
+    use fineco_ipc::{
+        MarketAssetType, MarketControlClient, MarketControlOutcome, MarketControlRequest,
+        MarketSearchParams,
+    };
+
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let db_path = dir.join(format!("fineco-helper-mctrl-{pid}.sqlite"));
+    let query_socket = dir.join(format!("fineco-helper-mctrl-{pid}-q.sock"));
+    let refresh_socket = dir.join(format!("fineco-helper-mctrl-{pid}-r.sock"));
+    let market_socket = dir.join(format!("fineco-helper-mctrl-{pid}-m.sock"));
+    let live_socket = dir.join(format!("fineco-helper-mctrl-{pid}-l.sock"));
+    let policy_path = dir.join(format!("fineco-helper-mctrl-{pid}.policy.json"));
+    for path in [
+        &db_path,
+        &query_socket,
+        &refresh_socket,
+        &market_socket,
+        &live_socket,
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::write(
+        &policy_path,
+        r#"{"version":1,"auth_ids":{"owner":{"capabilities":["market.authenticated.read"]}}}"#,
+    )
+    .expect("write market policy");
+
+    let live_serve = live_socket.clone();
+    thread::spawn(move || {
+        let _ = serve_live(&FakeLiveWorker, &live_serve, 0o600);
+    });
+    let mut worker_up = false;
+    for _ in 0..200 {
+        if live_socket.exists() {
+            worker_up = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(worker_up, "the fake worker must bind fineco-live.sock");
+
+    let config = StoreServerConfig {
+        db_path: db_path.clone(),
+        socket_path: query_socket.clone(),
+        policy_path: policy_path.clone(),
+        socket_mode: 0o600,
+        refresh_socket_path: Some(refresh_socket.clone()),
+        market_control_socket_path: Some(market_socket.clone()),
+        live_socket_path: Some(live_socket.clone()),
+        refresh_socket_mode: 0o600,
+    };
+    thread::spawn(move || {
+        let _ = run_store_server(config);
+    });
+
+    let client = MarketControlClient::new(&market_socket);
+    let mut outcome = None;
+    for _ in 0..200 {
+        match client.call(&MarketControlRequest::MarketSearchAsset(
+            MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(5),
+            },
+        )) {
+            Ok(o) => {
+                outcome = Some(o);
+                break;
+            }
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    match outcome.expect("market-control answered within the retry window") {
+        MarketControlOutcome::Search { result, session } => {
+            assert!(session.login_performed);
+            assert_eq!(result.query, "VHYL");
+            assert_eq!(
+                result.groups[0].candidates[0].fineco_key,
+                "IE00B8GKDB10.AFF"
+            );
+        }
+        MarketControlOutcome::Details { .. } => panic!("wrong market-control outcome"),
+    }
+
+    for path in [
+        &db_path,
+        &query_socket,
+        &refresh_socket,
+        &market_socket,
+        &live_socket,
+        &policy_path,
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn store_server_rejects_direct_market_control_config_without_refresh_control_socket() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let db_path = dir.join(format!("fineco-helper-mctrl-only-{pid}.sqlite"));
+    let query_socket = dir.join(format!("fineco-helper-mctrl-only-{pid}-q.sock"));
+    let market_socket = dir.join(format!("fineco-helper-mctrl-only-{pid}-m.sock"));
+    let live_socket = dir.join(format!("fineco-helper-mctrl-only-{pid}-l.sock"));
+    let policy_path = dir.join(format!("fineco-helper-mctrl-only-{pid}.policy.json"));
+    for path in [
+        &db_path,
+        &query_socket,
+        &market_socket,
+        &live_socket,
+        &policy_path,
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::write(
+        &policy_path,
+        r#"{"version":1,"auth_ids":{"owner":{"capabilities":["market.authenticated.read"]}}}"#,
+    )
+    .expect("write market policy");
+
+    let config = StoreServerConfig {
+        db_path: db_path.clone(),
+        socket_path: query_socket.clone(),
+        policy_path: policy_path.clone(),
+        socket_mode: 0o600,
+        refresh_socket_path: None,
+        market_control_socket_path: Some(market_socket.clone()),
+        live_socket_path: Some(live_socket.clone()),
+        refresh_socket_mode: 0o600,
+    };
+    let message = run_store_server(config)
+        .expect_err("market-control without refresh-control must fail closed")
+        .to_string();
+    assert!(
+        message.contains("refresh-control") && message.contains("fineco-live"),
+        "message: {message}"
+    );
+
+    for path in [
+        &db_path,
+        &query_socket,
+        &market_socket,
+        &live_socket,
+        &policy_path,
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
 fn store_server_applies_a_configured_refresh_socket_mode() {
     // The multi-user LXC topology shares refresh-control.sock with the gateway via
     // the fineco-ipc-refresh group → 0660. Prove the store-server applies the
@@ -1317,6 +1633,7 @@ fn store_server_applies_a_configured_refresh_socket_mode() {
         policy_path: policy_path.clone(),
         socket_mode: 0o600,
         refresh_socket_path: Some(refresh_socket.clone()),
+        market_control_socket_path: None,
         live_socket_path: Some(live_socket.clone()),
         refresh_socket_mode: 0o660, // shared fineco-ipc-refresh group topology
     };

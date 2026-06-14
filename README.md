@@ -43,10 +43,24 @@ Cached reads (instant, from the local store):
 - `orders_get_latest_monitor`
 - `tax_get_latest_carry_forward`, `tax_get_latest_minus_by_year`
 
-Market reads (fetched **live**, credential-free — no Fineco login, not from the store):
+Public/credential-free market reads (not from the store):
 
 - `market_get_zero_commission_etfs` (the public ETF list),
   `market_get_stock_enrichment` (third-party stock enrichment, parse-not-execute)
+
+Authenticated Fineco market reads (controller-mediated live Fineco login):
+
+- `market_search_asset` (Fineco instrument search by ticker, ISIN, or name;
+  implemented as a typed controller path, but intentionally not granted by the
+  checked-in deployment policy until the market live-session gate has been
+  reviewed clean and the owner intentionally enables it)
+- `market_get_asset_details` (Fineco stock/ETF details for a venue-qualified
+  identifier, with source-wrapped identity/listing/quote/profile/core
+  stock-or-ETF data and explicit heavy holdings/exposures/returns/risk/ratios
+  sections;
+  implemented as a typed controller path, but intentionally not granted by the
+  checked-in deployment policy until the market live-session gate has been
+  reviewed clean and the owner intentionally enables it)
 
 Gated live refresh (a real, rate-limited Fineco login; returns status only — read the
 refreshed values via the cached tools afterward):
@@ -60,7 +74,8 @@ refreshed values via the cached tools afterward):
 - **Deployment (Proxmox LXC) reference:** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 - **ChatGPT & Claude connectors:** [`docs/CONNECTORS.md`](docs/CONNECTORS.md) — remote
   MCP over OAuth-via-Cloudflare-Access, with the connector channel scoped to a
-  configurable tool allowlist (the absolute-€ detailed-portfolio tools off by default)
+  configurable tool allowlist (the absolute-€ detailed-portfolio tools and
+  authenticated market reads off by default)
 - **Testing + E2E:** [`docs/TESTING.md`](docs/TESTING.md)
 - **All docs:** [`docs/README.md`](docs/README.md)
 

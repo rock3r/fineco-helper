@@ -12,6 +12,7 @@ fn req(method: &str, path: &str, headers: Vec<(String, String)>) -> Response {
         method: method.to_string(),
         path: path.to_string(),
         headers,
+        body: String::new(),
     })
 }
 
@@ -234,6 +235,7 @@ fn cookieless(method: &str, path: &str, headers: Vec<(String, String)>) -> Respo
         method: method.to_string(),
         path: path.to_string(),
         headers,
+        body: String::new(),
     })
 }
 

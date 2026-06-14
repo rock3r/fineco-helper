@@ -7,7 +7,8 @@
 # Each alert is derived ONLY from a payload-free source — see
 # docs/LIVE-REFRESH-GATES.md for the full map:
 #   - gateway audit journal  (budget exhausted / repeated LIVE-REFRESH auth_required /
-#                             circuit opened / refresh spike)
+#                             circuit opened / refresh spike / authenticated-market
+#                             auth/upstream/circuit/recovered-session events)
 #   - refresh one-shot journal (scheduled portfolio refresh failed — read on the same
 #                             cursor as the gateway journal)
 #   - nftables deny COUNTER  (private-worker egress deny)
@@ -69,12 +70,17 @@ REFRESH_UNIT="fineco-refresh-portfolio.service"
 # The three live-refresh MCP tools — the audit lines whose error codes these
 # alerts key on (so a cached-read auth error never trips the live-refresh alerts).
 REFRESH_TOOL='tool["= :]+private_[a-z]+_refresh_live_sensitive'
+# Authenticated Fineco market tools. Keep this explicit so public-market ETF-list
+# or cached/private tools cannot trip market live-session alerts.
+MARKET_TOOL='tool["= :]+market_(search_asset|get_asset_details|get_indices)'
 
 # Thresholds: alert when the count of NEW matching events in this run's window
 # reaches N. Override any of these in /etc/fineco/alert.env.
 EGRESS_MIN="${FINECO_ALERT_EGRESS_MIN:-1}"
 GATEWAY_EGRESS_MIN="${FINECO_ALERT_GATEWAY_EGRESS_MIN:-1}"
 AUTHFAIL_MIN="${FINECO_ALERT_AUTHFAIL_MIN:-3}"
+MARKET_AUTHFAIL_MIN="${FINECO_ALERT_MARKET_AUTHFAIL_MIN:-3}"
+MARKET_UPSTREAM_MIN="${FINECO_ALERT_MARKET_UPSTREAM_MIN:-3}"
 SPIKE_MIN="${FINECO_ALERT_SPIKE_MIN:-6}"
 RESTART_MIN="${FINECO_ALERT_RESTART_MIN:-3}"
 ALERT_COMMAND="${FINECO_ALERT_COMMAND:-logger -t fineco-alert}"
@@ -228,11 +234,35 @@ count_refresh_authfail() {
     printf '%s\n' "$new" | grep -E -- "$REFRESH_TOOL" \
         | grep -c -E -- 'error_code["= :]+auth_required' || true
 }
+count_market_authfail() {
+    if [ -z "$new" ]; then printf 0; return; fi
+    printf '%s\n' "$new" | grep -E -- "$MARKET_TOOL" \
+        | grep -c -E -- 'error_code["= :]+market_auth_required' || true
+}
+count_market_upstream() {
+    if [ -z "$new" ]; then printf 0; return; fi
+    printf '%s\n' "$new" | grep -E -- "$MARKET_TOOL" \
+        | grep -c -E -- 'error_code["= :]+(market_upstream_failure|fineco_timeout|fineco_upstream_error)' || true
+}
+count_market_circuit() {
+    if [ -z "$new" ]; then printf 0; return; fi
+    printf '%s\n' "$new" | grep -E -- "$MARKET_TOOL" \
+        | grep -c -E -- 'error_code["= :]+market_circuit_open' || true
+}
+count_market_recovered_session() {
+    if [ -z "$new" ]; then printf 0; return; fi
+    printf '%s\n' "$new" | grep -E -- "$MARKET_TOOL" \
+        | grep -c -E -- 'reused_session_401_recovered["= :]+true' || true
+}
 
 budget="$(count 'error_code["= :]+refresh_budget_exhausted')"
 authfail="$(count_refresh_authfail)"
 circuit="$(count 'error_code["= :]+refresh_circuit_open')"
 spike="$(count "$REFRESH_TOOL")"
+market_authfail="$(count_market_authfail)"
+market_upstream="$(count_market_upstream)"
+market_circuit="$(count_market_circuit)"
+market_recovered_session="$(count_market_recovered_session)"
 # The scheduled-refresh one-shot prints `fineco-helper: refresh failed: …` on any
 # failure (SCA, timeout, a gate denial) before exiting non-zero. Threshold 1: a
 # once-a-day unattended refresh failing even once is worth a ping (the day's refresh
@@ -253,6 +283,18 @@ if [ "$spike" -ge "$SPIKE_MIN" ]; then
 fi
 if [ "$refresh_fail" -ge 1 ]; then
     notify "scheduled portfolio refresh failed ($refresh_fail in window)"
+fi
+if [ "$market_authfail" -ge "$MARKET_AUTHFAIL_MIN" ]; then
+    notify "repeated Fineco authenticated-market auth failures ($market_authfail in window)"
+fi
+if [ "$market_upstream" -ge "$MARKET_UPSTREAM_MIN" ]; then
+    notify "authenticated-market upstream failures ($market_upstream in window)"
+fi
+if [ "$market_circuit" -ge 1 ]; then
+    notify "authenticated-market circuit breaker opened ($market_circuit event(s))"
+fi
+if [ "$market_recovered_session" -ge 1 ]; then
+    notify "authenticated-market reused session recovered after 401 ($market_recovered_session event(s))"
 fi
 
 # --- counter-based alerts: independent of the journal, so they still fire when the

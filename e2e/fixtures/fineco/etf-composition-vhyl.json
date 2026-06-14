@@ -1,0 +1,26 @@
+{
+  "etfetcs": [
+    {
+      "id": "IE00B8GKDB10.AFF",
+      "ticker": "VHYL",
+      "venueSystem": "AFF",
+      "description": "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis",
+      "assetAllocations": [
+        { "value": 99.9, "type": "Azioni" },
+        { "value": 0.1, "type": "Altro" }
+      ],
+      "regionalExposures": [
+        { "value": 39.5, "type": "Stati Uniti" },
+        { "value": 13.3, "type": "Europa Occidentale - Euro" }
+      ],
+      "globalStockSectors": [
+        { "value": 20.0, "type": "Finanza" },
+        { "value": 15.0, "type": "Tecnologia" }
+      ],
+      "portfolioHoldings": [
+        { "isin": "US5949181045", "securityName": "Microsoft Corp", "weighting": 4.1 },
+        { "isin": "US0378331005", "securityName": "Apple Inc", "weighting": 3.7 }
+      ]
+    }
+  ]
+}

@@ -10,7 +10,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
-use fineco_live::{LiveClient, serve_live_blocking};
+use fineco_ipc::{
+    MarketAssetDetailsLiveFetcher, MarketAssetDetailsLiveResult, MarketAssetDetailsResult,
+    MarketAssetIdentity, MarketAssetSections, MarketAssetType, MarketDetailsParams,
+    MarketDetailsSection, MarketField, MarketSearchCandidate, MarketSearchGroup,
+    MarketSearchLiveResult, MarketSearchParams, MarketSearchResult, MarketSessionStatus,
+};
+use fineco_live::{LiveClient, MarketSearchLiveFetcher, serve_live_blocking};
 use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{
     NewAsset, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder, Store,
@@ -25,6 +31,8 @@ struct FakeWorker {
     orders: Result<Vec<RawOrder>, SafeError>,
     carry_forward: Result<NewTaxCarryForward, SafeError>,
     minus_by_year: Result<Vec<NewTaxMinusByYear>, SafeError>,
+    market_search: Result<MarketSearchLiveResult, SafeError>,
+    market_details: Result<MarketAssetDetailsLiveResult, SafeError>,
 }
 
 impl FakeWorker {
@@ -39,6 +47,42 @@ impl FakeWorker {
                 total: None,
             }),
             minus_by_year: Ok(vec![]),
+            market_search: Ok(MarketSearchLiveResult {
+                result: MarketSearchResult {
+                    query: String::new(),
+                    data_class: "authenticated_market".to_string(),
+                    source: "fineco.search.global".to_string(),
+                    captured_at: String::new(),
+                    groups: vec![MarketSearchGroup {
+                        asset_type: MarketAssetType::Etf,
+                        result_count: 1,
+                        candidates: vec![MarketSearchCandidate {
+                            fineco_key: "IE00B8GKDB10.AFF".to_string(),
+                            identifier: "AFF/VHYL".to_string(),
+                            name: "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis"
+                                .to_string(),
+                            venue: "AFF".to_string(),
+                            symbol: "VHYL".to_string(),
+                            display_symbol: "VHYL.MI".to_string(),
+                            isin: Some("IE00B8GKDB10".to_string()),
+                            currency: Some("EUR".to_string()),
+                            asset_type: MarketAssetType::Etf,
+                            preferred: true,
+                        }],
+                    }],
+                },
+                session: MarketSessionStatus {
+                    login_performed: true,
+                    session_reused: false,
+                    session_evicted: false,
+                    reused_session_401_recovered: false,
+                    session_expires_in_secs: None,
+                },
+            }),
+            market_details: Ok(MarketAssetDetailsLiveResult {
+                result: sample_details(""),
+                session: MarketSessionStatus::fresh_login(),
+            }),
         }
     }
 }
@@ -79,6 +123,100 @@ impl TaxFetcher for FakeWorker {
 
     fn fetch_tax_minus_by_year(&self) -> Result<Vec<NewTaxMinusByYear>, SafeError> {
         self.minus_by_year.clone()
+    }
+}
+
+impl MarketSearchLiveFetcher for FakeWorker {
+    fn fetch_market_search(
+        &self,
+        params: &MarketSearchParams,
+        now_iso: &str,
+    ) -> Result<MarketSearchLiveResult, SafeError> {
+        self.market_search.clone().map(|mut result| {
+            result.result.query = params.query.clone();
+            result.result.captured_at = now_iso.to_string();
+            result
+        })
+    }
+}
+
+impl MarketAssetDetailsLiveFetcher for FakeWorker {
+    fn fetch_market_asset_details(
+        &self,
+        params: &MarketDetailsParams,
+        now_iso: &str,
+    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
+        self.market_details.clone().map(|mut result| {
+            result.result.asset.identifier = params.identifier.clone();
+            result.result.captured_at = now_iso.to_string();
+            result
+        })
+    }
+}
+
+fn sample_details(captured_at: &str) -> MarketAssetDetailsResult {
+    MarketAssetDetailsResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        captured_at: captured_at.to_string(),
+        asset: MarketAssetIdentity {
+            identifier: "AFF/VHYL".to_string(),
+            fineco_key: MarketField::high_string(
+                "IE00B8GKDB10.AFF",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            ),
+            asset_type: MarketField::high(
+                MarketAssetType::Etf,
+                None,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                None,
+                captured_at,
+            ),
+            name: None,
+            isin: Some(MarketField::high_string(
+                "IE00B8GKDB10",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            )),
+            venue: MarketField::high_string(
+                "AFF",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            ),
+            symbol: MarketField::medium_string(
+                "VHYL",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            ),
+            display_symbol: Some(MarketField::medium_string(
+                "VHYL.MI",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            )),
+            currency: Some(MarketField::high_string(
+                "EUR",
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            )),
+        },
+        sections: MarketAssetSections::default(),
+        sources: vec![],
+        warnings: vec![],
     }
 }
 
@@ -196,6 +334,86 @@ fn tax_carry_forward_and_minus_round_trip() {
     assert_eq!(minus.len(), 1);
     assert_eq!(minus[0].year, 2026);
     assert_eq!(minus[0].minus_residue, Some(500.0));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn market_search_round_trips_and_is_stamped_with_the_controller_clock() {
+    let (client, path) = serve(FakeWorker::ok());
+    let result = client
+        .fetch_market_search(
+            &MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(5),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("market search")
+        .result;
+
+    assert_eq!(result.query, "VHYL");
+    assert_eq!(result.captured_at, "2026-06-14T09:30:00Z");
+    assert_eq!(result.groups[0].asset_type, MarketAssetType::Etf);
+    assert_eq!(
+        result.groups[0].candidates[0].fineco_key,
+        "IE00B8GKDB10.AFF"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn market_search_round_trip_carries_status_facts_without_cookie_values() {
+    let (client, path) = serve(FakeWorker::ok());
+    let live = client
+        .fetch_market_search_live(
+            &MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(5),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("market search");
+
+    assert_eq!(live.result.query, "VHYL");
+    assert!(live.session.login_performed);
+    assert!(!live.session.session_reused);
+    assert!(!live.session.session_evicted);
+    assert!(!live.session.reused_session_401_recovered);
+    assert_eq!(live.session.session_expires_in_secs, None);
+    let encoded = serde_json::to_string(&live.session).expect("session status JSON");
+    assert!(!encoded.contains("cookie"));
+    assert!(!encoded.contains("session_id"));
+    assert!(!encoded.contains("auth"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn market_details_round_trips_and_is_stamped_with_the_controller_clock() {
+    let (client, path) = serve(FakeWorker::ok());
+    let live = client
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10".to_string()),
+                sections: Some(vec![
+                    MarketDetailsSection::Identity,
+                    MarketDetailsSection::Etf,
+                ]),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("market details");
+
+    assert_eq!(live.result.asset.identifier, "AFF/VHYL");
+    assert_eq!(live.result.captured_at, "2026-06-14T09:30:00Z");
+    assert_eq!(live.result.asset.fineco_key.value, "IE00B8GKDB10.AFF");
+    assert!(live.session.login_performed);
+    let encoded = serde_json::to_string(&live.session).expect("session status JSON");
+    assert!(!encoded.contains("cookie"));
+    assert!(!encoded.contains("session_id"));
+    assert!(!encoded.contains("auth"));
     let _ = std::fs::remove_file(&path);
 }
 

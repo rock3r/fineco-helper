@@ -235,6 +235,19 @@ fn list_tools_body(base: &str, token: &str) -> String {
     list.body
 }
 
+fn mcp_json(body: &str) -> serde_json::Value {
+    if let Ok(value) = serde_json::from_str(body) {
+        return value;
+    }
+    let data = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(data.trim()).expect("MCP response JSON")
+}
+
 /// Drive the handshake then `tools/call` `tool` (empty args) with `token`, and
 /// return the raw response body.
 fn call_tool_body(base: &str, token: &str, tool: &str) -> String {
@@ -261,10 +274,66 @@ fn call_tool_body(base: &str, token: &str, tool: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_market_mcp_schemas_are_closed() {
+    let gateway = Gateway::new("/tmp/fineco-helper-schema-unused.sock")
+        .with_policy(owner_policy())
+        .with_connector_allowlist(
+            fineco_gateway::DEFAULT_CONNECTOR_TOOLS
+                .iter()
+                .map(|name| name.to_string()),
+        );
+    let keys: JwkSet = serde_json::from_str(TEST_JWKS).expect("jwks");
+    let verifier = Arc::new(AccessVerifier::new(
+        AccessConfig {
+            issuer: ISSUER.to_string(),
+            audience: AUDIENCE.to_string(),
+            owner_email: Some(OWNER_EMAIL.to_string()),
+            owner_common_name: Some(SERVICE_CN.to_string()),
+        },
+        keys,
+    ));
+    let app = gateway_router(gateway, Some(verifier));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service()).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("http://{addr}/");
+    let cli = service_token();
+    let body = tokio::task::spawn_blocking(move || list_tools_body(&base, &cli))
+        .await
+        .expect("join");
+    let json = mcp_json(&body);
+    let tools = json["result"]["tools"].as_array().expect("tools array");
+    let market_search = tools
+        .iter()
+        .find(|tool| tool["name"] == "market_search_asset")
+        .expect("market_search_asset listed on CLI channel");
+    assert_eq!(
+        market_search["inputSchema"]["additionalProperties"],
+        serde_json::Value::Bool(false),
+        "market_search_asset params schema must be closed: {market_search}"
+    );
+    let market_details = tools
+        .iter()
+        .find(|tool| tool["name"] == "market_get_asset_details")
+        .expect("market_get_asset_details listed on CLI channel");
+    assert_eq!(
+        market_details["inputSchema"]["additionalProperties"],
+        serde_json::Value::Bool(false),
+        "market_get_asset_details params schema must be closed: {market_details}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connector_channel_is_tool_scoped_while_cli_is_full() {
     // Dual-pin deployment with the DEFAULT connector allowlist: the connector
-    // (email/OAuth) channel must NOT see the four detailed-portfolio tools, while
-    // the CLI (service-token) channel keeps the full set.
+    // (email/OAuth) channel must NOT see the default-blocked tools, while the CLI
+    // (service-token) channel keeps the full set.
     let gateway = Gateway::new("/tmp/fineco-helper-scope-unused.sock")
         .with_policy(owner_policy())
         .with_connector_allowlist(
