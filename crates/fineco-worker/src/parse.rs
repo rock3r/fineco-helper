@@ -157,6 +157,10 @@ fn infer_index_region(symbol: &str, url: Option<&str>, label: &str) -> MarketInd
         || haystack.contains("nasdaq")
         || haystack.contains("usadj")
         || haystack.contains("dow")
+        || haystack.contains("sp500")
+        || haystack.contains("spx")
+        || haystack.contains("gspc")
+        || haystack.contains("s&p")
     {
         MarketIndexRegion::Americas
     } else if haystack.contains("affidx")
@@ -2371,6 +2375,7 @@ mod tests {
             "indices":[
                 {"symbol":"^FTMIB.affIdx","url":"/pvt/trading/stocklist/ftsemib","label":"Ftse mib","var":1.97},
                 {"symbol":"^DJI.NYSE","url":"/pvt/trading/stocklist/usadj","label":"Dow Jones","var":0.7},
+                {"symbol":"^GSPC","url":"/pvt/trading/stocklist/sp500","label":"S&P 500","var":0.5},
                 {"symbol":"MBTM6CFD.CFDC","url":"/pvt/trading/crypto/home/showcase","label":"BITCOIN","value":63535,"var":-0.4162},
                 {"symbol":"^N225.Tokyo","url":"/pvt/trading/indices?listname=indiciAsia&titolo=^N225.Tokyo","label":"Nikkei","var":2.81}
             ]
@@ -2418,6 +2423,19 @@ mod tests {
         );
         assert_eq!(asia.indices.len(), 1);
         assert_eq!(asia.indices[0].symbol.value, "^N225.Tokyo");
+
+        let resp: MarketIndicesResponse = serde_json::from_str(json).expect("parse");
+        let americas = to_market_indices(
+            resp,
+            &fineco_ipc::MarketIndicesParams {
+                region: Some(fineco_ipc::MarketIndexRegion::Americas),
+                limit: Some(2),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+        assert_eq!(americas.indices.len(), 2);
+        assert_eq!(americas.indices[0].symbol.value, "^DJI.NYSE");
+        assert_eq!(americas.indices[1].symbol.value, "^GSPC");
 
         let resp: MarketIndicesResponse = serde_json::from_str(json).expect("parse");
         let other = to_market_indices(
