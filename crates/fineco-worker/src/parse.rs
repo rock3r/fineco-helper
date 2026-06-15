@@ -1211,7 +1211,7 @@ fn verify_stock_snapshot_identity(
     if stock
         .ticker
         .as_ref()
-        .is_some_and(|ticker| !stock_symbols_equivalent(ticker, &candidate.symbol))
+        .is_some_and(|ticker| !stock_ticker_matches_candidate(ticker, candidate))
     {
         return Err(SafeError::market_unexpected_response());
     }
@@ -1225,9 +1225,15 @@ fn verify_stock_snapshot_identity(
     Ok(())
 }
 
-fn stock_symbols_equivalent(left: &str, right: &str) -> bool {
-    normalized_stock_symbol(&display_symbol_base(left))
-        == normalized_stock_symbol(&display_symbol_base(right))
+fn stock_ticker_matches_candidate(ticker: &str, candidate: &MarketSearchCandidate) -> bool {
+    let ticker_full = normalized_stock_symbol(ticker);
+    let ticker_base = normalized_stock_symbol(&display_symbol_base(ticker));
+    let candidate_symbol = normalized_stock_symbol(&candidate.symbol);
+    let candidate_display_symbol = normalized_stock_symbol(&candidate.display_symbol);
+    ticker_full == candidate_symbol
+        || ticker_full == candidate_display_symbol
+        || ticker_base == candidate_symbol
+        || ticker_base == candidate_display_symbol
 }
 
 fn normalized_stock_symbol(value: &str) -> String {
@@ -2725,6 +2731,70 @@ mod tests {
         .expect("display-symbol stock snapshot should match");
 
         assert_eq!(result.asset.symbol.value, "AAPL.O");
+    }
+
+    #[test]
+    fn stock_details_preserve_share_class_suffixes_in_snapshot_identity() {
+        let mut candidate = stock_candidate();
+        candidate.fineco_key = "US0846707026.NYSE".to_string();
+        candidate.identifier = "NYSE/BRK.B".to_string();
+        candidate.name = "BERKSHIRE HATHAWAY CL B".to_string();
+        candidate.venue = "NYSE".to_string();
+        candidate.symbol = "BRK.B".to_string();
+        candidate.display_symbol = "BRK.B.N".to_string();
+        candidate.isin = Some("US0846707026".to_string());
+
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "NYSE/BRK.B".to_string(),
+                expected_isin: Some("US0846707026".to_string()),
+                sections: Some(vec![MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: StaticSearchResponse::new(),
+                snapshot_response: None,
+                stock_snapshot: serde_json::from_str(r#"{"ticker":"BRK.B.N","exchange":"NYSE"}"#)
+                    .expect("stock snapshot"),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("class B snapshot should match");
+
+        assert_eq!(result.asset.symbol.value, "BRK.B.N");
+    }
+
+    #[test]
+    fn stock_details_reject_mismatched_share_class_snapshot() {
+        let mut candidate = stock_candidate();
+        candidate.fineco_key = "US0846707026.NYSE".to_string();
+        candidate.identifier = "NYSE/BRK.B".to_string();
+        candidate.name = "BERKSHIRE HATHAWAY CL B".to_string();
+        candidate.venue = "NYSE".to_string();
+        candidate.symbol = "BRK.B".to_string();
+        candidate.display_symbol = "BRK.B.N".to_string();
+        candidate.isin = Some("US0846707026".to_string());
+
+        let err = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "NYSE/BRK.B".to_string(),
+                expected_isin: Some("US0846707026".to_string()),
+                sections: Some(vec![MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: StaticSearchResponse::new(),
+                snapshot_response: None,
+                stock_snapshot: serde_json::from_str(r#"{"ticker":"BRK.A.N","exchange":"NYSE"}"#)
+                    .expect("stock snapshot"),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect_err("class A snapshot must not match class B");
+
+        assert_eq!(err.code(), "market_unexpected_response");
     }
 
     #[test]
