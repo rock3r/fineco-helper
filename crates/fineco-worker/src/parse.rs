@@ -379,7 +379,7 @@ struct RawHolding {
 
 pub(crate) struct MarketDetailsInputs {
     pub(crate) static_response: StaticSearchResponse,
-    pub(crate) snapshot_response: SnapshotResponse,
+    pub(crate) snapshot_response: Option<SnapshotResponse>,
     pub(crate) etf_snapshot: EtfQueryResponse,
     pub(crate) etf_composition: Option<EtfQueryResponse>,
     pub(crate) etf_returns: Option<EtfQueryResponse>,
@@ -387,7 +387,7 @@ pub(crate) struct MarketDetailsInputs {
 
 pub(crate) struct StockDetailsInputs {
     pub(crate) static_response: StaticSearchResponse,
-    pub(crate) snapshot_response: SnapshotResponse,
+    pub(crate) snapshot_response: Option<SnapshotResponse>,
     pub(crate) stock_snapshot: StockSnapshotResponse,
     pub(crate) stock_reports: Option<StockReportsResponse>,
 }
@@ -516,7 +516,10 @@ pub(crate) fn to_market_asset_details(
     captured_at: &str,
 ) -> Result<MarketAssetDetailsResult, SafeError> {
     let static_item = inputs.static_response.get(&candidate.fineco_key);
-    let snapshot_item = inputs.snapshot_response.get(&candidate.fineco_key);
+    let snapshot_item = inputs
+        .snapshot_response
+        .as_ref()
+        .and_then(|response| response.get(&candidate.fineco_key));
     let etf = matching_etf(&inputs.etf_snapshot, candidate)
         .ok_or_else(SafeError::market_unexpected_response)?;
     let composition = inputs
@@ -899,7 +902,10 @@ pub(crate) fn to_stock_asset_details(
     captured_at: &str,
 ) -> Result<MarketAssetDetailsResult, SafeError> {
     let static_item = inputs.static_response.get(&candidate.fineco_key);
-    let snapshot_item = inputs.snapshot_response.get(&candidate.fineco_key);
+    let snapshot_item = inputs
+        .snapshot_response
+        .as_ref()
+        .and_then(|response| response.get(&candidate.fineco_key));
     if let Some(reports) = &inputs.stock_reports
         && reports
             .instrument
@@ -2186,7 +2192,7 @@ mod tests {
             &candidate,
             MarketDetailsInputs {
                 static_response: static_response(),
-                snapshot_response: snapshot_response(Some("2026-06-12T15:35:29Z")),
+                snapshot_response: Some(snapshot_response(Some("2026-06-12T15:35:29Z"))),
                 etf_snapshot: serde_json::from_str(
                     r#"{"etfetcs":[
                         {"id":"OTHER.AFF","ticker":"OTHER","isinCusip":"IE0000000000","venueSystem":"AFF","costiGestioneOngoingCharge":9.99},
@@ -2281,7 +2287,7 @@ mod tests {
             &candidate,
             MarketDetailsInputs {
                 static_response: static_response(),
-                snapshot_response: snapshot_response(Some("2026-06-12T15:35:29Z")),
+                snapshot_response: Some(snapshot_response(Some("2026-06-12T15:35:29Z"))),
                 etf_snapshot: etf_snapshot_with_dates(),
                 etf_composition: None,
                 etf_returns: None,
@@ -2311,7 +2317,7 @@ mod tests {
             &candidate,
             MarketDetailsInputs {
                 static_response: static_response(),
-                snapshot_response: snapshot_response(None),
+                snapshot_response: Some(snapshot_response(None)),
                 etf_snapshot: serde_json::from_str(
                     r#"{"etfetcs":[{"id":"IE00B8GKDB10.AFF","ticker":"VHYL","venueSystem":"AFF","assetNetAssetValues":{"currencyId":"EUR","dayEndValue":100.0},"lastNAV":{"value":78.5}}]}"#,
                 )
@@ -2355,7 +2361,7 @@ mod tests {
             &candidate,
             MarketDetailsInputs {
                 static_response: static_response(),
-                snapshot_response: snapshot_response(Some("2026-06-12T15:35:29Z")),
+                snapshot_response: Some(snapshot_response(Some("2026-06-12T15:35:29Z"))),
                 etf_snapshot: etf_snapshot_with_dates(),
                 etf_composition: None,
                 etf_returns: None,
@@ -2505,7 +2511,7 @@ mod tests {
             &candidate,
             StockDetailsInputs {
                 static_response: stock_static_response(),
-                snapshot_response: stock_quote_response(),
+                snapshot_response: Some(stock_quote_response()),
                 stock_snapshot: serde_json::from_str(
                     r#"{
                         "descrizione":"Apple Inc. designs devices and services.",
@@ -2629,7 +2635,7 @@ mod tests {
             &candidate,
             StockDetailsInputs {
                 static_response: stock_static_response(),
-                snapshot_response: stock_quote_response(),
+                snapshot_response: Some(stock_quote_response()),
                 stock_snapshot: serde_json::from_str(r#"{"ticker":"MSFT","exchange":"NASDAQ"}"#)
                     .expect("stock snapshot"),
                 stock_reports: None,
@@ -2653,7 +2659,7 @@ mod tests {
             &candidate,
             StockDetailsInputs {
                 static_response: stock_static_response(),
-                snapshot_response: stock_quote_response(),
+                snapshot_response: Some(stock_quote_response()),
                 stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL.O","exchange":"NASDAQ"}"#)
                     .expect("stock snapshot"),
                 stock_reports: None,
@@ -2677,10 +2683,10 @@ mod tests {
             &candidate,
             StockDetailsInputs {
                 static_response: stock_static_response(),
-                snapshot_response: serde_json::from_str(
+                snapshot_response: Some(serde_json::from_str(
                     r#"{"US0378331005.NASDAQ":{"last":291.13,"bid":0.0,"ask":0.0,"prevClosePrice":295.63,"percVar":-1.52,"volume":38784789}}"#,
                 )
-                .expect("snapshot"),
+                .expect("snapshot")),
                 stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
                     .expect("stock snapshot"),
                 stock_reports: None,
@@ -2723,7 +2729,7 @@ mod tests {
             &candidate,
             StockDetailsInputs {
                 static_response: stock_static_response(),
-                snapshot_response: stock_quote_response(),
+                snapshot_response: Some(stock_quote_response()),
                 stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
                     .expect("stock snapshot"),
                 stock_reports: None,

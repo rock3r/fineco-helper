@@ -508,13 +508,16 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
             &candidate,
             params.expected_isin.as_deref(),
         )?;
-        let snapshot_url = format!(
-            "{}?instruments={}",
-            self.endpoints.instruments_snapshot,
-            percent_encode_query_component(&candidate.fineco_key)
-        );
-        let snapshot_response: parse::SnapshotResponse =
-            self.get_market_json(&snapshot_url, &cookie, MARKET_DETAILS_REFERER)?;
+        let snapshot_response = if wants_default_or_section(params, MarketDetailsSection::Quote) {
+            let snapshot_url = format!(
+                "{}?instruments={}",
+                self.endpoints.instruments_snapshot,
+                percent_encode_query_component(&candidate.fineco_key)
+            );
+            Some(self.get_market_json(&snapshot_url, &cookie, MARKET_DETAILS_REFERER)?)
+        } else {
+            None
+        };
 
         let result = match candidate.asset_type {
             MarketAssetType::Etf => {
@@ -770,6 +773,13 @@ fn wants_section(params: &MarketDetailsParams, section: MarketDetailsSection) ->
         .sections
         .as_ref()
         .is_some_and(|sections| sections.contains(&section))
+}
+
+fn wants_default_or_section(params: &MarketDetailsParams, section: MarketDetailsSection) -> bool {
+    params
+        .sections
+        .as_ref()
+        .is_none_or(|sections| sections.contains(&section))
 }
 
 fn wants_any_section(params: &MarketDetailsParams, sections: &[MarketDetailsSection]) -> bool {
