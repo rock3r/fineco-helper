@@ -185,6 +185,20 @@ fn market_details_request_is_strict_and_authenticated() {
         MarketControlRequest::MarketSearchAsset(_) => panic!("wrong command"),
     }
 
+    let external = MarketControlRequest::from_json(
+        r#"{"command":"market_get_asset_details","params":{"identifier":"BIT/TIP","sections":["external_enrichment"]}}"#,
+    )
+    .expect("external enrichment is a valid details section");
+    match external {
+        MarketControlRequest::MarketGetAssetDetails(params) => {
+            assert_eq!(
+                params.sections,
+                Some(vec![MarketDetailsSection::ExternalEnrichment])
+            );
+        }
+        MarketControlRequest::MarketSearchAsset(_) => panic!("wrong command"),
+    }
+
     for bad in [
         r#"{"command":"market_get_asset_details","params":{"identifier":"VHYL"}}"#,
         r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/"}}"#,
@@ -192,7 +206,6 @@ fn market_details_request_is_strict_and_authenticated() {
         r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["identity","listing","quote","profile","etf","stock","holdings","exposures","returns","risk","ratios","chart","news"]}}"#,
         r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["chart"]}}"#,
         r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["news"]}}"#,
-        r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["external_enrichment"]}}"#,
         r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","url":"http://example.test"}}"#,
         r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL"},"headers":{}}"#,
     ] {

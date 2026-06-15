@@ -29,8 +29,10 @@ use fineco_core::{
 };
 use fineco_ipc::{
     MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher, MarketAssetDetailsLiveResult,
-    MarketAssetType, MarketDetailsParams, MarketDetailsSection, MarketSearchCandidate,
+    MarketAssetDetailsResult, MarketAssetIdentity, MarketAssetSections, MarketAssetType,
+    MarketDetailsParams, MarketDetailsSection, MarketField, MarketSearchCandidate,
     MarketSearchLiveFetcher, MarketSearchLiveResult, MarketSearchParams, MarketSessionStatus,
+    MarketSource,
 };
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder};
@@ -460,6 +462,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
         params.validate()?;
         let parsed = ParsedMarketIdentifier::parse(&params.identifier)?;
         let cookie = self.login().map_err(market_login_error)?;
+        let session_status = MarketSessionStatus::fresh_login();
         let mut candidate = None;
         for query in details_search_terms(&parsed.symbol) {
             let search_params = MarketSearchParams {
@@ -494,6 +497,14 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                 candidate.asset_type.as_str(),
                 &candidate.identifier,
             ));
+        }
+        if wants_only_identity(params) {
+            let result = identity_only_details(params, &candidate, now_iso);
+            result.validate_response_size()?;
+            return Ok(MarketAssetDetailsLiveResult {
+                result,
+                session: session_status,
+            });
         }
 
         let static_body = StaticSearchRequest::for_instrument(&candidate.fineco_key);
@@ -622,7 +633,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
         result.validate_response_size()?;
         Ok(MarketAssetDetailsLiveResult {
             result,
-            session: MarketSessionStatus::fresh_login(),
+            session: session_status,
         })
     }
 }
@@ -818,11 +829,105 @@ fn wants_default_or_any_section(
     })
 }
 
+fn wants_only_identity(params: &MarketDetailsParams) -> bool {
+    params.sections.as_ref().is_some_and(|sections| {
+        !sections.is_empty()
+            && sections
+                .iter()
+                .all(|section| *section == MarketDetailsSection::Identity)
+    })
+}
+
 fn wants_any_section(params: &MarketDetailsParams, sections: &[MarketDetailsSection]) -> bool {
     sections
         .iter()
         .copied()
         .any(|section| wants_section(params, section))
+}
+
+fn identity_only_details(
+    params: &MarketDetailsParams,
+    candidate: &MarketSearchCandidate,
+    captured_at: &str,
+) -> MarketAssetDetailsResult {
+    MarketAssetDetailsResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        captured_at: captured_at.to_string(),
+        asset: MarketAssetIdentity {
+            identifier: params.identifier.clone(),
+            fineco_key: MarketField::high_string(
+                &candidate.fineco_key,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            ),
+            asset_type: MarketField::high(
+                candidate.asset_type,
+                None,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                None,
+                captured_at,
+            ),
+            name: Some(MarketField::high_string(
+                &candidate.name,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            )),
+            isin: candidate.isin.as_ref().map(|isin| {
+                MarketField::high_string(
+                    isin,
+                    "fineco",
+                    "authenticated_market",
+                    "search.global",
+                    captured_at,
+                )
+            }),
+            venue: MarketField::high_string(
+                &candidate.venue,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            ),
+            symbol: MarketField::medium_string(
+                &candidate.symbol,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            ),
+            display_symbol: Some(MarketField::medium_string(
+                &candidate.display_symbol,
+                "fineco",
+                "authenticated_market",
+                "search.global",
+                captured_at,
+            )),
+            currency: candidate.currency.as_ref().map(|currency| {
+                MarketField::high_string(
+                    currency,
+                    "fineco",
+                    "authenticated_market",
+                    "search.global",
+                    captured_at,
+                )
+            }),
+        },
+        sections: MarketAssetSections::default(),
+        sources: vec![MarketSource {
+            source: "fineco".to_string(),
+            data_class: "authenticated_market".to_string(),
+            source_ref: "search.global".to_string(),
+            captured_at: captured_at.to_string(),
+        }],
+        warnings: vec![],
+    }
 }
 
 fn etf_query_url(base: &str, fineco_key: &str, view: &str) -> String {

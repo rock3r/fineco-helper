@@ -57,7 +57,10 @@ Authenticated Fineco market reads (controller-mediated live Fineco login):
 - `market_get_asset_details` (Fineco stock/ETF details for a venue-qualified
   identifier, with source-wrapped identity/listing/quote/profile/core
   stock-or-ETF data and explicit heavy holdings/exposures/returns/risk/ratios
-  sections;
+  sections; stocks can also request an explicit `external_enrichment` section,
+  which is fetched by the credential-free market client after Fineco resolution;
+  enrichment-only requests resolve Fineco identity only before that external
+  fetch, and the section is source/audit-attributed as `external_enrichment`;
   implemented as a typed controller path, but intentionally not granted by the
   checked-in deployment policy until the market live-session gate has been
   reviewed clean and the owner intentionally enables it)

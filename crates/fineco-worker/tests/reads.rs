@@ -86,6 +86,25 @@ fn spawn_mock_fineco_with_broken_stock_detail_snapshot() -> String {
     format!("http://{addr}")
 }
 
+fn spawn_mock_fineco_search_only() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if path == "/"
+                || path == "/v1/public/authentications/web/login"
+                || path == "/v1/private/tol/stocklists/search/global"
+            {
+                mock_fineco::route(req)
+            } else {
+                httptiny::Response::json(500, r#"{"error":"details endpoint should not be hit"}"#)
+            }
+        });
+    });
+    format!("http://{addr}")
+}
+
 fn worker_for(base: &str) -> FinecoWorker {
     FinecoWorker::new(
         FinecoEndpoints::for_base(base),
@@ -463,6 +482,29 @@ fn etf_details_skip_detail_snapshot_for_identity_and_listing_only() {
         .collect();
     assert!(sources.contains(&"static.search"));
     assert!(!sources.contains(&"etf.query.snapshot"));
+}
+
+#[test]
+fn identity_only_stock_details_stop_after_search_resolution() {
+    let base = spawn_mock_fineco_search_only();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "NASDAQ/AAPL".to_string(),
+                expected_isin: Some("US0378331005".to_string()),
+                sections: Some(vec![MarketDetailsSection::Identity]),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("identity-only details should not fetch static/snapshot endpoints");
+
+    let result = live.result;
+    assert_eq!(result.asset.identifier, "NASDAQ/AAPL");
+    assert_eq!(result.asset.fineco_key.value, "US0378331005.NASDAQ");
+    assert_eq!(result.asset.asset_type.value, MarketAssetType::Stock);
+    assert!(result.sections.stock.is_none());
+    assert!(result.sections.quote.is_none());
+    assert_eq!(result.sources[0].source_ref, "search.global");
 }
 
 #[test]
