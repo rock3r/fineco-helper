@@ -134,13 +134,18 @@ Product (`crates/`):
   **mints synthetic public cookies** (`finecostat`/`XID`/`LBM`/`PORTALSESSIONID`/
   `gdate`/`store-sessionid`/`finecoLogin`) the WAF expects present — random/
   timestamped, non-secret, entropy from `/dev/urandom` (no added dependency) —
-  and the reads replay that jar plus the session. Today the worker remains
-  **stateless across calls** (login → use on the stack → discard), but market
-  live responses already report status-only session facts (`login_performed`,
-  `session_reused`, eviction/recovery flags, and optional cookie-lifetime
-  expiry TTL derived from `Max-Age`/`Expires`) across `fineco-live` so
-  controller-side budget/audit can govern future reuse without ever seeing
-  cookies or handles. The Fineco **password and
+  and the reads replay that jar plus the session. Refresh and search/details
+  fetches are **stateless per call** (login → use on the stack → discard), but
+  authenticated **market** reads additionally **hold one session for cross-call
+  reuse** within `MARKET_SESSION_REUSE_TTL_SECS` (a fixed 120 s; plan D-22), so a
+  basket of back-to-back instrument reads rides one login. Market live responses
+  report status-only session facts (`login_performed`, `session_reused`,
+  eviction/recovery flags, optional session-cookie expiry TTL from
+  `Max-Age`/`Expires`) across `fineco-live`; the controller models the same
+  TTL + last-activity to admit a reuse without the fresh-login cooldown/budget,
+  never seeing cookies or handles. The held cookie is zeroized on TTL expiry, a
+  reused-session 401, replacement, **any refresh login** (G-2), and shutdown (the
+  AC-22 accepted residual). The Fineco **password and
   session cookies are zeroized on drop** (`zeroize::Zeroizing`, owner-approved
   credentialed dep), and the agent **ignores proxy env vars** (`.proxy(None)`)
   so an env-injected proxy can't reroute the credentialed login. Uses

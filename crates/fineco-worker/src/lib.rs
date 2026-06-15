@@ -8,8 +8,15 @@
 //! credential-free refresh orchestration can drive it.
 //!
 //! Security posture:
-//! - The session cookie lives only on the stack for the duration of one fetch;
-//!   each fetch logs in fresh and discards the session — nothing is retained.
+//! - Refresh and search/details fetches log in fresh and discard the session
+//!   within the call. Authenticated **market** reads additionally hold one
+//!   `Zeroizing` session for cross-call reuse within
+//!   [`fineco_ipc::MARKET_SESSION_REUSE_TTL_SECS`] (plan D-22), so a basket of
+//!   back-to-back instrument reads rides a single login instead of a login storm.
+//!   The held cookie is zeroized on TTL expiry, a reused-session 401, replacement,
+//!   any refresh login (which may rotate the server session), and shutdown. This
+//!   longer in-memory credential window is the AC-22 accepted residual; the
+//!   gateway still never sees a cookie or session handle.
 //! - Nothing here logs request/response bodies, cookies, or credentials; every
 //!   failure is mapped to a [`SafeError`] envelope with a developer-authored,
 //!   payload-free message.
@@ -1325,20 +1332,38 @@ fn cookie_header_from(headers: &ureq::http::HeaderMap) -> Zeroizing<String> {
     )
 }
 
-/// Extract a conservative status-only session TTL from `Set-Cookie` attributes.
+/// Extract a conservative, status-only session TTL from the **session** cookies'
+/// `Set-Cookie` lifetime attributes (`Max-Age`/`Expires`) — never their values.
 ///
-/// This intentionally reads only cookie lifetime metadata and never exposes
-/// names or values. If several cookies declare a lifetime, report the shortest
-/// one so the controller never assumes a session lives longer than a component
-/// cookie says it does.
+/// Only cookies whose NAME marks them as session cookies are considered, so a
+/// long-lived tracking/analytics cookie (a stats or logging id that outlives the
+/// login by days) can never masquerade as the session lifetime. Fineco's real
+/// session cookies are typically `Session`-scoped (no declared lifetime), so this
+/// is usually `None`: the authoritative idle timeout is server-enforced, not
+/// client-derivable. This metadata is informational only — the cross-call reuse
+/// window is the fixed [`fineco_ipc::MARKET_SESSION_REUSE_TTL_SECS`], not derived
+/// from it. If several session cookies declare a lifetime, the shortest is used.
 fn session_expires_in_secs_from(headers: &ureq::http::HeaderMap) -> Option<u64> {
     let now = now_unix_secs();
     headers
         .get_all(ureq::http::header::SET_COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
+        .filter(|set_cookie| is_session_cookie(set_cookie))
         .filter_map(|set_cookie| ttl_secs_from_set_cookie_at(set_cookie, now))
         .min()
+}
+
+/// Whether a `Set-Cookie` is a session cookie by name (case-insensitive
+/// `session`) — used to keep tracking-cookie lifetimes out of the session TTL.
+fn is_session_cookie(set_cookie: &str) -> bool {
+    set_cookie
+        .split(['=', ';'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .contains("session")
 }
 
 fn max_age_secs_from_set_cookie(set_cookie: &str) -> Option<u64> {
@@ -1716,14 +1741,23 @@ mod tests {
     }
 
     #[test]
-    fn session_expiry_metadata_uses_the_shortest_cookie_lifetime() {
+    fn session_expiry_metadata_uses_only_session_cookie_lifetimes() {
         let mut headers = ureq::http::HeaderMap::new();
+        // A short-lived TRACKING cookie: must NOT be read as the session TTL.
+        headers.append(
+            ureq::http::header::SET_COOKIE,
+            "loggerUid=secret; Path=/; Max-Age=60"
+                .parse()
+                .expect("header"),
+        );
+        // A non-session preflight cookie with a longer lifetime: also excluded.
         headers.append(
             ureq::http::header::SET_COOKIE,
             "PREFLIGHT=secret; Path=/; Max-Age=3600"
                 .parse()
                 .expect("header"),
         );
+        // The actual session cookie: this is the lifetime we report.
         headers.append(
             ureq::http::header::SET_COOKIE,
             "FINECOSESSION=secret; Path=/; HttpOnly; Max-Age=600"
@@ -1731,7 +1765,30 @@ mod tests {
                 .expect("header"),
         );
 
+        // The 60s tracker is ignored; only the session cookie's lifetime counts.
         assert_eq!(session_expires_in_secs_from(&headers), Some(600));
+    }
+
+    #[test]
+    fn session_expiry_metadata_is_none_when_session_cookies_are_session_scoped() {
+        // Real Fineco session cookies carry no Max-Age/Expires (they are
+        // `Session`-scoped); only trackers declare a lifetime. The session TTL is
+        // then unknown from cookies (server-enforced), so this is `None`.
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.append(
+            ureq::http::header::SET_COOKIE,
+            "gsessionid=secret; Path=/; HttpOnly"
+                .parse()
+                .expect("header"),
+        );
+        headers.append(
+            ureq::http::header::SET_COOKIE,
+            "finecostat=secret; Path=/; Max-Age=31536000"
+                .parse()
+                .expect("header"),
+        );
+
+        assert_eq!(session_expires_in_secs_from(&headers), None);
     }
 
     #[test]

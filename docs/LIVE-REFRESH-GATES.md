@@ -36,27 +36,39 @@ in place for `market_search_asset`, `market_get_asset_details`, and
 `MarketAssetDetailsLiveResult` / `MarketIndicesLiveResult` carrying
 `MarketSessionStatus` (`login_performed`, `session_reused`, `session_evicted`,
 `reused_session_401_recovered`, optional expiry TTL) and no cookie values, auth
-headers, raw `Set-Cookie`, or session handles. The worker is still stateless
-across calls and reports `login_performed: true` for authenticated market reads;
-when Fineco sends safe cookie lifetime metadata such as `Max-Age` or `Expires`,
-the worker reports only the bounded TTL seconds in `session_expires_in_secs`.
+headers, raw `Set-Cookie`, or session handles.
+
+**Cross-call session reuse (D-22).** The worker holds one `Zeroizing` market
+session and reuses it for a follow-up market read within
+`MARKET_SESSION_REUSE_TTL_SECS` (a fixed **120 s**, well under the few-minute
+server-side idle timeout; that timeout is server-enforced and not exposed in
+Fineco's frontend, so the window is a fixed policy value, not a cookie-derived
+one). The window resets on each successful read, so a basket of back-to-back
+instrument reads rides **one** login instead of a login per read (which would also
+look like a login storm). The held cookie is zeroized on TTL expiry, a
+reused-session 401, replacement, **any refresh login** (which evicts the market
+session — G-2, since a refresh login may rotate the account's single server
+session), and shutdown. This longer in-memory credential window is the **AC-22
+accepted residual**; the gateway still never sees a cookie or session handle.
+`session_expires_in_secs` reports the **session** cookie's declared lifetime when
+present (tracking-cookie lifetimes are excluded so they cannot masquerade as the
+session); it is informational only and does not drive the fixed reuse window.
 
 Refresh and authenticated market reads share only the controller-local
 one-in-flight live-session operation lock. Authenticated market reads enforce
 their own market fresh-login policy: at most 12 fresh logins per rolling hour and
-a 60s minimum fresh-login cooldown, finalized from the worker's
-`MarketSessionStatus`, so a future `session_reused` response will not burn a
-fresh-login slot, while `reused_session_401_recovered` does burn a fresh-login
-slot. Scheduled refreshes keep their refresh-preflight gates and do not burn or
-obey the market budget/cooldown. Authenticated-market reads also have a
-controller-local circuit breaker that opens after three consecutive market
-upstream/timeout failures and half-opens after 600 seconds. The gateway audit
-line may include these session booleans as status-only metadata, never cookies or
-handles; the alert scanner keys on those audit metadata fields for market
-auth/upstream/circuit/recovered session events. Cross-call reuse TTL remains
-disabled until cookie-lifetime evidence is reviewed and an explicit reuse window
-is approved, so the worker still performs a fresh login for each market read
-today.
+a 60s minimum fresh-login cooldown. The controller models the worker's
+held-session validity (same TTL + last-activity) and admits an in-window read as a
+**reuse** — skipping the cooldown/budget — while a fresh login or a
+`reused_session_401_recovered` debits a slot and a plain `session_reused` does
+not. An error or a refresh admission clears the window, so the cooldown re-applies.
+Scheduled refreshes keep their refresh-preflight gates and do not burn or obey the
+market budget/cooldown. Authenticated-market reads also have a controller-local
+circuit breaker that opens after three consecutive market upstream/timeout
+failures and half-opens after 600 seconds. The gateway audit line may include
+these session booleans as status-only metadata, never cookies or handles; the
+alert scanner keys on those audit metadata fields for market
+auth/upstream/circuit/recovered session events.
 
 `market.authenticated.read` is still deliberately absent from the checked-in
 deployment policy and connector defaults. Granting it is an owner decision after
