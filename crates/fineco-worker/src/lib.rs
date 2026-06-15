@@ -674,7 +674,7 @@ fn verify_static_identity(
     candidate: &MarketSearchCandidate,
     expected_isin: Option<&str>,
 ) -> Result<(), SafeError> {
-    let Some(expected_isin) = expected_isin else {
+    let Some(expected_isin) = expected_isin.or(candidate.isin.as_deref()) else {
         return Ok(());
     };
     let expected_isin = normalize_expected_isin(expected_isin)?;
@@ -1257,6 +1257,20 @@ mod tests {
         let err =
             super::verify_static_identity(&static_response, &candidate, Some("IE00B8GKDB10.AFF"))
                 .expect_err("static identity mismatch must fail closed");
+
+        assert_eq!(err.code(), "market_unexpected_response");
+    }
+
+    #[test]
+    fn static_identity_uses_candidate_isin_without_expected_isin() {
+        let static_response = serde_json::from_str(
+            r#"{"IE00B8GKDB10.AFF":{"instrId":"IE00B8GKDB11","venueSystem":"AFF"}}"#,
+        )
+        .expect("static response");
+        let candidate = candidate("AFF/VHYL", "VHYL", "IE00B8GKDB10", MarketAssetType::Etf);
+
+        let err = super::verify_static_identity(&static_response, &candidate, None)
+            .expect_err("candidate ISIN mismatch must fail closed");
 
         assert_eq!(err.code(), "market_unexpected_response");
     }
