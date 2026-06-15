@@ -1594,6 +1594,19 @@ impl MarketControlWireReply {
     }
 }
 
+/// Read timeout for market details replies. Details can fan out across several
+/// authenticated Fineco endpoints; this must stay aligned with the live client
+/// details timeout so the gateway does not fail locally while the controller
+/// keeps spending the login.
+const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn market_reply_timeout_for(request: &MarketControlRequest) -> Duration {
+    match request {
+        MarketControlRequest::MarketSearchAsset(_) => REFRESH_REPLY_TIMEOUT,
+        MarketControlRequest::MarketGetAssetDetails(_) => MARKET_DETAILS_REPLY_TIMEOUT,
+    }
+}
+
 /// Serve validated market-control commands on `listener`.
 ///
 /// # Errors
@@ -1663,7 +1676,7 @@ impl MarketControlClient {
     ) -> Result<MarketControlOutcome, SafeErrorDto> {
         let internal = || SafeErrorDto::from(&SafeError::internal());
         let mut stream = UnixStream::connect(&self.path).map_err(|_| internal())?;
-        let _ = stream.set_read_timeout(Some(REFRESH_REPLY_TIMEOUT));
+        let _ = stream.set_read_timeout(Some(market_reply_timeout_for(request)));
         let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
         write_message(&mut stream, request).map_err(|_| internal())?;
         let reply: MarketControlWireReply = read_message(&mut stream).map_err(|_| internal())?;
@@ -1932,5 +1945,31 @@ impl RefreshClient {
         write_message(&mut stream, request).map_err(|_| internal())?;
         let reply: RefreshWireReply = read_message(&mut stream).map_err(|_| internal())?;
         reply.into_result()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_details_uses_a_fanout_sized_reply_timeout() {
+        let search = MarketControlRequest::MarketSearchAsset(MarketSearchParams {
+            query: "AAPL".to_string(),
+            asset_type: None,
+            limit: None,
+        });
+        let details = MarketControlRequest::MarketGetAssetDetails(MarketDetailsParams {
+            identifier: "NASDAQ/AAPL".to_string(),
+            expected_isin: None,
+            sections: None,
+        });
+
+        assert_eq!(market_reply_timeout_for(&search), REFRESH_REPLY_TIMEOUT);
+        assert_eq!(
+            market_reply_timeout_for(&details),
+            MARKET_DETAILS_REPLY_TIMEOUT
+        );
+        assert!(MARKET_DETAILS_REPLY_TIMEOUT > REFRESH_REPLY_TIMEOUT);
     }
 }

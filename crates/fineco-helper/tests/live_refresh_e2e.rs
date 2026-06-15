@@ -107,18 +107,16 @@ fn real_worker_live_refresh_through_the_controller_captures_a_snapshot() {
         "two positions captured (a count, never values)"
     );
 
-    // 3b. A second immediate live login is now blocked by the shared live-session
-    //     gate (refresh and authenticated-market reads use the same footprint
-    //     policy). Tests that need orders data drive it with an injected clock at
-    //     the controller/protocol layer; this socket E2E has no test-time clock
-    //     override and must not sleep for the production cooldown.
-    let err = client
+    // 3b. A second immediate refresh uses refresh-owned gates rather than the
+    //     authenticated-market fresh-login cooldown/budget.
+    let orders = client
         .call(&RefreshRequest::OrdersRefreshLive(OrdersRefreshParams {
             instrument_kind: "equity".to_string(),
             days: 7,
         }))
-        .expect_err("a second immediate live login is rate-limited");
-    assert_eq!(err.code, "market_rate_limited");
+        .expect("orders refresh is not blocked by the market login policy");
+    assert_eq!(orders.data_area, "orders");
+    assert_eq!(orders.count, 2);
 
     for path in [
         &db_path,

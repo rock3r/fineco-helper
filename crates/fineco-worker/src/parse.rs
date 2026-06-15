@@ -1197,20 +1197,47 @@ fn etf_row_matches(row: &RawEtfEtc, candidate: &MarketSearchCandidate) -> bool {
     {
         return true;
     }
-    if let (Some(row_isin), Some(candidate_isin), Some(row_venue)) =
-        (&row.isin_cusip, &candidate.isin, &row.venue_system)
-        && row_isin.eq_ignore_ascii_case(candidate_isin)
-        && row_venue.eq_ignore_ascii_case(&candidate.venue)
-    {
-        return true;
+    let venue_matches = row
+        .venue_system
+        .as_ref()
+        .is_some_and(|venue| venue.eq_ignore_ascii_case(&candidate.venue));
+    if let Some(candidate_isin) = &candidate.isin {
+        if let Some(row_isin) = &row.isin_cusip {
+            return row_isin.eq_ignore_ascii_case(candidate_isin)
+                && etf_venue_matches_or_missing(row.venue_system.as_deref(), &candidate.venue);
+        }
+        if let Some(row_id) = &row.id {
+            return etf_id_matches_isin_and_venue(
+                row_id,
+                candidate_isin,
+                &candidate.venue,
+                row.venue_system.as_deref(),
+            );
+        }
     }
-    row.ticker.as_ref().is_some_and(|ticker| {
-        ticker.eq_ignore_ascii_case(&candidate.symbol)
-            && row
-                .venue_system
-                .as_ref()
-                .is_some_and(|venue| venue.eq_ignore_ascii_case(&candidate.venue))
-    })
+    row.ticker
+        .as_ref()
+        .is_some_and(|ticker| ticker.eq_ignore_ascii_case(&candidate.symbol) && venue_matches)
+}
+
+fn etf_id_matches_isin_and_venue(
+    row_id: &str,
+    candidate_isin: &str,
+    candidate_venue: &str,
+    row_venue: Option<&str>,
+) -> bool {
+    let id_matches = row_id.eq_ignore_ascii_case(candidate_isin)
+        || row_id.split_once('.').is_some_and(|(id_isin, id_venue)| {
+            id_isin.eq_ignore_ascii_case(candidate_isin)
+                && id_venue.eq_ignore_ascii_case(candidate_venue)
+        });
+    id_matches && etf_venue_matches_or_missing(row_venue, candidate_venue)
+}
+
+fn etf_venue_matches_or_missing(row_venue: Option<&str>, candidate_venue: &str) -> bool {
+    row_venue
+        .map(|venue| venue.eq_ignore_ascii_case(candidate_venue))
+        .unwrap_or(true)
 }
 
 fn default_or_requested(params: &MarketDetailsParams, section: MarketDetailsSection) -> bool {
@@ -2134,6 +2161,7 @@ mod tests {
                 etf_snapshot: serde_json::from_str(
                     r#"{"etfetcs":[
                         {"id":"OTHER.AFF","ticker":"OTHER","isinCusip":"IE0000000000","venueSystem":"AFF","costiGestioneOngoingCharge":9.99},
+                        {"id":"DIFFERENT.AFF","ticker":"VHYL","isinCusip":"IE00DIFFERENT","venueSystem":"AFF","costiGestioneOngoingCharge":7.77},
                         {"id":"IE00B8GKDB10.AFF","ticker":"VHYL","isinCusip":"IE00B8GKDB10","venueSystem":"AFF","costiGestioneOngoingCharge":0.32}
                     ]}"#,
                 )
@@ -2143,6 +2171,7 @@ mod tests {
                     serde_json::from_str(
                         r#"{"etfetcs":[
                             {"id":"OTHER.AFF","ticker":"OTHER","venueSystem":"AFF","returnsCumulativeDayEnd":{"currencyId":"EUR","date":"2026-06-12T00:00:00","returnM12":999.0}},
+                            {"id":"DIFFERENT.AFF","ticker":"VHYL","isinCusip":"IE00DIFFERENT","venueSystem":"AFF","returnsCumulativeDayEnd":{"currencyId":"EUR","date":"2026-06-12T00:00:00","returnM12":777.0}},
                             {"id":"IE00B8GKDB10.AFF","ticker":"VHYL","venueSystem":"AFF","returnsCumulativeDayEnd":{"currencyId":"EUR","date":"2026-06-12T00:00:00","returnM12":26.85}}
                         ]}"#,
                     )
@@ -2172,6 +2201,48 @@ mod tests {
                 .iter()
                 .any(|row| row.period == "12M" && (row.value.value - 26.85).abs() < f64::EPSILON)
         );
+    }
+
+    #[test]
+    fn etf_row_matcher_allows_ticker_only_candidates_without_an_isin() {
+        let mut candidate = etf_candidate();
+        candidate.isin = None;
+        let row: RawEtfEtc = serde_json::from_str(
+            r#"{"id":"IE00B8GKDB10.AFF","ticker":"VHYL","isinCusip":"IE00B8GKDB10","venueSystem":"AFF"}"#,
+        )
+        .expect("row");
+
+        assert!(etf_row_matches(&row, &candidate));
+    }
+
+    #[test]
+    fn etf_row_matcher_rejects_conflicting_id_only_rows_when_candidate_has_isin() {
+        let candidate = etf_candidate();
+        let row: RawEtfEtc =
+            serde_json::from_str(r#"{"id":"DIFFERENT.AFF","ticker":"VHYL","venueSystem":"AFF"}"#)
+                .expect("row");
+
+        assert!(!etf_row_matches(&row, &candidate));
+    }
+
+    #[test]
+    fn etf_row_matcher_accepts_id_only_rows_that_encode_candidate_isin() {
+        let candidate = etf_candidate();
+        let row: RawEtfEtc = serde_json::from_str(
+            r#"{"id":"IE00B8GKDB10.AFF","ticker":"VHYL","venueSystem":"AFF"}"#,
+        )
+        .expect("row");
+
+        assert!(etf_row_matches(&row, &candidate));
+    }
+
+    #[test]
+    fn etf_row_matcher_accepts_matching_isin_rows_with_missing_venue() {
+        let candidate = etf_candidate();
+        let row: RawEtfEtc =
+            serde_json::from_str(r#"{"ticker":"VHYL","isinCusip":"IE00B8GKDB10"}"#).expect("row");
+
+        assert!(etf_row_matches(&row, &candidate));
     }
 
     #[test]

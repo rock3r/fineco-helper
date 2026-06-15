@@ -75,16 +75,17 @@ Product (`crates/`):
   (op/snapshot **status only**, a row count never a value).
   `RefreshLimitsByArea::defaults` encodes the plan's per-area rate limits. The
   controller does not retry refresh by re-entering the live worker, because each
-  worker call can perform a fresh Fineco login and must be accounted by the shared
-  live-login budget. This glue lives in the binary (not `fineco-refresh`) because
+  worker call can perform a fresh Fineco login and must remain one admitted
+  controller operation. This glue lives in the binary (not `fineco-refresh`) because
   it needs the `fineco-live` client, and `fineco-live` already depends on
   `fineco-refresh`.
   `handle_market_control()` separately re-checks `market.authenticated.read`,
   validates bounds, and forwards authenticated Fineco market reads to the
-  same live client. Refresh and authenticated-market reads share controller-local
-  login footprint state (12 fresh logins/hour, 60s fresh-login cooldown, one
-  in-flight operation) so both paths coordinate Fineco logins; market reads
-  finalizes the gate from the worker's status-only session facts and returns
+  same live client. Refresh and authenticated-market reads share the
+  controller-local one-in-flight live operation lock so both paths coordinate
+  Fineco logins; authenticated-market reads additionally enforce their own
+  market-only 12 fresh logins/hour budget and 60s fresh-login cooldown, then
+  finalize that gate from the worker's status-only session facts and return
   normalized market data only.
 - **`crates/fineco-core`** (M2) — the **leaf** shared-types crate (no
   credential/DB/network deps). Holds the **safe error envelope** (`SafeError` /
