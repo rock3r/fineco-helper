@@ -1198,7 +1198,8 @@ fn verify_stock_snapshot_identity(
 }
 
 fn stock_symbols_equivalent(left: &str, right: &str) -> bool {
-    normalized_stock_symbol(left) == normalized_stock_symbol(right)
+    normalized_stock_symbol(&display_symbol_base(left))
+        == normalized_stock_symbol(&display_symbol_base(right))
 }
 
 fn normalized_stock_symbol(value: &str) -> String {
@@ -2638,6 +2639,30 @@ mod tests {
         .expect_err("mismatched stock snapshot must fail closed");
 
         assert_eq!(err.code(), "market_unexpected_response");
+    }
+
+    #[test]
+    fn stock_details_accept_display_symbol_stock_snapshot() {
+        let candidate = stock_candidate();
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "NASDAQ/AAPL".to_string(),
+                expected_isin: Some("US0378331005".to_string()),
+                sections: Some(vec![MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: stock_static_response(),
+                snapshot_response: stock_quote_response(),
+                stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL.O","exchange":"NASDAQ"}"#)
+                    .expect("stock snapshot"),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("display-symbol stock snapshot should match");
+
+        assert_eq!(result.asset.symbol.value, "AAPL.O");
     }
 
     #[test]
