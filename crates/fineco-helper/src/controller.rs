@@ -227,13 +227,8 @@ struct LiveLoginPermit<'a> {
 }
 
 impl LiveLoginPermit<'_> {
-    fn finish_assumed_fresh_login(mut self) -> Result<(), SafeError> {
-        self.state
-            .lock()
-            .map_err(|_| SafeError::internal())?
-            .finish(true);
-        self.finished = true;
-        Ok(())
+    fn finish_after_error(self, error: &SafeError) -> Result<(), SafeError> {
+        self.finish_recording(should_record_assumed_fresh_login(error))
     }
 
     fn finish_with_session_status(self, session: MarketSessionStatus) -> Result<(), SafeError> {
@@ -248,6 +243,10 @@ impl LiveLoginPermit<'_> {
         self.finished = true;
         Ok(())
     }
+}
+
+fn should_record_assumed_fresh_login(error: &SafeError) -> bool {
+    error.code() != "internal"
 }
 
 impl Drop for LiveLoginPermit<'_> {
@@ -381,7 +380,10 @@ where
                 count,
             }),
         };
-        permit.finish_assumed_fresh_login()?;
+        let should_record_login = result
+            .as_ref()
+            .map_or_else(should_record_assumed_fresh_login, |_| true);
+        permit.finish_recording(should_record_login)?;
         result
     }
 }
@@ -433,7 +435,7 @@ where
                         })
                     }
                     Err(error) => {
-                        permit.finish_assumed_fresh_login()?;
+                        permit.finish_after_error(&error)?;
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
@@ -460,7 +462,7 @@ where
                         })
                     }
                     Err(error) => {
-                        permit.finish_assumed_fresh_login()?;
+                        permit.finish_after_error(&error)?;
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
@@ -996,6 +998,43 @@ mod tests {
 
         assert_eq!(err.code(), "market_upstream_failure");
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn market_transport_internal_failure_does_not_burn_fresh_login_cooldown() {
+        let mut worker = FakeWorker::ok();
+        worker.market_result = Box::new(|| Err(SafeError::internal()));
+        let ctrl = controller(worker, market_policy());
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect_err("local transport failure");
+        assert_eq!(err.code(), "internal");
+
+        let second_err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect_err("worker is still failing, but the login cooldown was not burned");
+        assert_eq!(second_err.code(), "internal");
+    }
+
+    #[test]
+    fn refresh_transport_internal_failure_does_not_burn_market_login_cooldown() {
+        let policy = Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
+                "market.authenticated.read","portfolio.live.refresh"]}}}"#,
+        )
+        .expect("policy");
+        let mut worker = FakeWorker::ok();
+        worker.portfolio = Box::new(|| Err(SafeError::internal()));
+        let ctrl = controller(worker, policy);
+
+        let refresh_err = ctrl
+            .handle(RefreshRequest::PortfolioRefreshLive, "2026-06-14T10:00:00Z")
+            .expect_err("local transport failure");
+        assert_eq!(refresh_err.code(), "internal");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect("transport failure did not burn shared login cooldown");
     }
 
     #[test]

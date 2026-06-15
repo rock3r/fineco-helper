@@ -71,7 +71,33 @@ pub(crate) fn to_market_search(
     params: &MarketSearchParams,
     captured_at: &str,
 ) -> MarketSearchResult {
-    let mut remaining = params.limit.unwrap_or(fineco_ipc::MAX_TOTAL_CANDIDATES) as usize;
+    to_market_search_with_caps(
+        resp,
+        params,
+        captured_at,
+        Some(params.limit.unwrap_or(fineco_ipc::MAX_TOTAL_CANDIDATES) as usize),
+        Some(MAX_CANDIDATES_PER_GROUP),
+    )
+}
+
+/// Convert Fineco search for internal details resolution. This preserves all
+/// returned candidates so display caps cannot hide an exact venue/symbol match.
+pub(crate) fn to_market_search_for_resolution(
+    resp: MarketSearchResponse,
+    params: &MarketSearchParams,
+    captured_at: &str,
+) -> MarketSearchResult {
+    to_market_search_with_caps(resp, params, captured_at, None, None)
+}
+
+fn to_market_search_with_caps(
+    resp: MarketSearchResponse,
+    params: &MarketSearchParams,
+    captured_at: &str,
+    total_cap: Option<usize>,
+    per_group_cap: Option<usize>,
+) -> MarketSearchResult {
+    let mut remaining = total_cap;
     let mut groups = Vec::new();
     for (asset_type, raws) in [
         (MarketAssetType::Stock, resp.stocks),
@@ -83,22 +109,27 @@ pub(crate) fn to_market_search(
         (MarketAssetType::Knockout, resp.knockout),
         (MarketAssetType::FxCfd, resp.fx_cfd),
     ] {
-        if remaining == 0 {
+        if remaining.is_some_and(|remaining| remaining == 0) {
             break;
         }
         if params.asset_type.is_some_and(|wanted| wanted != asset_type) {
             continue;
         }
         let mut candidates = Vec::new();
-        for raw in raws.into_iter().take(MAX_CANDIDATES_PER_GROUP) {
-            if remaining == 0 {
+        for (idx, raw) in raws.into_iter().enumerate() {
+            if per_group_cap.is_some_and(|cap| idx >= cap) {
+                break;
+            }
+            if remaining.is_some_and(|remaining| remaining == 0) {
                 break;
             }
             let Some(candidate) = to_market_search_candidate(raw, asset_type) else {
                 continue;
             };
             candidates.push(candidate);
-            remaining -= 1;
+            if let Some(remaining) = &mut remaining {
+                *remaining = remaining.saturating_sub(1);
+            }
         }
         if !candidates.is_empty() {
             groups.push(MarketSearchGroup {

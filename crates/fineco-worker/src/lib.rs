@@ -474,7 +474,8 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
             );
             let search_response: parse::MarketSearchResponse =
                 self.get_market_json(&search_url, &cookie, MARKET_SEARCH_REFERER)?;
-            let search = parse::to_market_search(search_response, &search_params, now_iso);
+            let search =
+                parse::to_market_search_for_resolution(search_response, &search_params, now_iso);
             match resolve_market_candidate(&search, &parsed, params) {
                 Ok(resolved) => {
                     candidate = Some(resolved);
@@ -1057,7 +1058,7 @@ mod tests {
     use fineco_core::SafeError;
     use fineco_ipc::{
         MarketAssetType, MarketDetailsParams, MarketSearchCandidate, MarketSearchGroup,
-        MarketSearchResult,
+        MarketSearchParams, MarketSearchResult,
     };
     use std::collections::HashMap;
 
@@ -1199,6 +1200,50 @@ mod tests {
             details_search_terms("BRK/B"),
             vec!["BRK/B", "BRK B", "BRK", "BRKB"]
         );
+    }
+
+    #[test]
+    fn details_resolution_uses_uncapped_search_candidates() {
+        let mut etfs = Vec::new();
+        for idx in 0..fineco_ipc::MAX_CANDIDATES_PER_GROUP {
+            etfs.push(format!(
+                r#"{{"d":"Distractor {idx}","m":"AFF","s":"D{idx}.MI","i":"IE00DIST{idx:04}","c":"EUR"}}"#
+            ));
+        }
+        etfs.push(
+            r#"{"d":"Target ETF","m":"AFF","s":"VHYL.MI","i":"IE00B8GKDB10","c":"EUR"}"#
+                .to_string(),
+        );
+        let raw = format!(r#"{{"ETF":[{}]}}"#, etfs.join(","));
+        let response: super::parse::MarketSearchResponse =
+            serde_json::from_str(&raw).expect("search fixture");
+        let params = MarketSearchParams {
+            query: "VHYL".to_string(),
+            asset_type: None,
+            limit: Some(fineco_ipc::MAX_TOTAL_CANDIDATES),
+        };
+        let search = super::parse::to_market_search_for_resolution(
+            response,
+            &params,
+            "2026-06-14T09:30:00Z",
+        );
+        let parsed = ParsedMarketIdentifier {
+            venue: "AFF".to_string(),
+            symbol: "VHYL".to_string(),
+        };
+
+        let resolved = resolve_market_candidate(
+            &search,
+            &parsed,
+            &MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10".to_string()),
+                sections: None,
+            },
+        )
+        .expect("details resolution must see candidates beyond display caps");
+
+        assert_eq!(resolved.identifier, "AFF/VHYL");
     }
 
     #[test]

@@ -55,6 +55,13 @@ const LIVE_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// whole call, so this is a generous hang-stop, not a latency budget.
 const LIVE_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Market details may fan out across authenticated search, static identity,
+/// snapshot, and stock/ETF report endpoints under one worker-held session. Its
+/// live-socket read timeout must cover that allowed fan-out so the controller
+/// does not report a local transport failure while the worker is still making
+/// bounded Fineco reads.
+const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// A command from the refresh controller to the private worker. Adjacently tagged
 /// as `{"command": "...", "params": {...}}` (commands without params omit it).
 /// Command-enum only — there is no generic proxy, URL, or raw field.
@@ -270,7 +277,7 @@ impl LiveClient {
     /// `retryable`. A transport failure surfaces as `internal` (not retryable).
     fn call(&self, request: &LiveRequest) -> Result<LiveResponse, SafeError> {
         let mut stream = UnixStream::connect(&self.path).map_err(|_| SafeError::internal())?;
-        let _ = stream.set_read_timeout(Some(LIVE_CLIENT_TIMEOUT));
+        let _ = stream.set_read_timeout(Some(client_timeout_for(request)));
         let _ = stream.set_write_timeout(Some(LIVE_SERVER_TIMEOUT));
         fineco_ipc::write_message(&mut stream, request).map_err(|_| SafeError::internal())?;
         let reply: LiveReply =
@@ -279,6 +286,17 @@ impl LiveClient {
             LiveReply::Ok(body) => Ok(body),
             LiveReply::Err(dto) => Err(safe_error_from_dto(&dto)),
         }
+    }
+}
+
+fn client_timeout_for(request: &LiveRequest) -> Duration {
+    match request {
+        LiveRequest::MarketAssetDetails(_) => LIVE_MARKET_DETAILS_CLIENT_TIMEOUT,
+        LiveRequest::Portfolio(_)
+        | LiveRequest::Orders(_)
+        | LiveRequest::TaxCarryForward(_)
+        | LiveRequest::TaxMinusByYear
+        | LiveRequest::MarketSearch(_) => LIVE_CLIENT_TIMEOUT,
     }
 }
 
@@ -432,5 +450,32 @@ fn safe_error_from_dto(dto: &SafeErrorDto) -> SafeError {
         // validated, so the specific message is not needed across the socket.
         "invalid_request" => SafeError::invalid_request("the live worker rejected the request"),
         _ => SafeError::internal(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LiveMarketDetailsParams,
+        LiveRequest, client_timeout_for,
+    };
+    use fineco_ipc::MarketDetailsParams;
+
+    #[test]
+    fn market_details_uses_a_fanout_sized_client_timeout() {
+        let request = LiveRequest::MarketAssetDetails(LiveMarketDetailsParams {
+            details: MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10".to_string()),
+                sections: None,
+            },
+            now_iso: "2026-06-14T09:30:00Z".to_string(),
+        });
+
+        assert_eq!(
+            client_timeout_for(&request),
+            LIVE_MARKET_DETAILS_CLIENT_TIMEOUT
+        );
+        assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
     }
 }
