@@ -20,11 +20,12 @@ use fineco_ipc::{
     AllocationHistoryDto, Capability, Client, FreshnessReportDto, FullSnapshotDto, HistoryParams,
     MarketAssetDetailsResult, MarketControlClient, MarketControlOutcome, MarketControlRequest,
     MarketDetailsParams, MarketDetailsSection, MarketEnrichmentParams, MarketEtfsParams,
-    MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketSearchParams,
-    MarketSearchResult, MarketSource, MarketWarning, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams,
-    Policy, PortfolioHistoryDto, PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams,
-    RefreshClient, RefreshOutcome, RefreshRequest, Request, ResponseBody, SafeErrorDto,
-    ShareableReportDto, TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
+    MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketIndicesParams,
+    MarketIndicesResult, MarketSearchParams, MarketSearchResult, MarketSource, MarketWarning,
+    OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams, Policy, PortfolioHistoryDto,
+    PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams, RefreshClient, RefreshOutcome,
+    RefreshRequest, Request, ResponseBody, SafeErrorDto, ShareableReportDto,
+    TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
 };
 use fineco_market::{EnrichmentReport, MarketClient, ZeroCommissionEtfs};
 use rmcp::handler::server::wrapper::Parameters;
@@ -47,11 +48,11 @@ pub type GatewayService = StreamableHttpService<ScopedGateway, LocalSessionManag
 /// (`portfolio_get_latest_snapshot_summary`, `portfolio_get_latest_full_snapshot`,
 /// `portfolio_get_history`, `portfolio_get_position_history`) plus
 /// the authenticated market tools (`market_search_asset`,
-/// `market_get_asset_details`). This is an EXPLICIT allowlist, not "all minus
-/// blocked": a newly-added tool is NOT visible to connectors until it is added
-/// here (fail-safe). Per-deployment override via `FINECO_CONNECTOR_TOOLS`. A
-/// test asserts every name here is a real tool and that the default-blocked tools
-/// are absent.
+/// `market_get_asset_details`, `market_get_indices`). This is an EXPLICIT
+/// allowlist, not "all minus blocked": a newly-added tool is NOT visible to
+/// connectors until it is added here (fail-safe). Per-deployment override via
+/// `FINECO_CONNECTOR_TOOLS`. A test asserts every name here is a real tool and
+/// that the default-blocked tools are absent.
 pub const DEFAULT_CONNECTOR_TOOLS: &[&str] = &[
     "portfolio_get_freshness",
     "portfolio_get_latest_shareable_report",
@@ -433,7 +434,9 @@ impl Gateway {
             .await
             .and_then(|outcome| match outcome {
                 MarketControlOutcome::Search { result, .. } => Ok(Json(result)),
-                MarketControlOutcome::Details { .. } => Err(unexpected()),
+                MarketControlOutcome::Details { .. } | MarketControlOutcome::Indices { .. } => {
+                    Err(unexpected())
+                }
             })
     }
 
@@ -446,6 +449,24 @@ impl Gateway {
         Parameters(params): Parameters<MarketDetailsParams>,
     ) -> Result<Json<MarketAssetDetailsResult>, ErrorData> {
         self.market_asset_details_call(params).await.map(Json)
+    }
+
+    #[tool(
+        name = "market_get_indices",
+        description = "Authenticated Fineco headline index-bar cards from the market widget. Optional `region` filters locally; this is not a venue registry or full market universe."
+    )]
+    pub async fn market_get_indices(
+        &self,
+        Parameters(params): Parameters<MarketIndicesParams>,
+    ) -> Result<Json<MarketIndicesResult>, ErrorData> {
+        self.market_control_call(MarketControlRequest::MarketGetIndices(params))
+            .await
+            .and_then(|outcome| match outcome {
+                MarketControlOutcome::Indices { result, .. } => Ok(Json(result)),
+                MarketControlOutcome::Search { .. } | MarketControlOutcome::Details { .. } => {
+                    Err(unexpected())
+                }
+            })
     }
 
     #[tool(
@@ -797,6 +818,16 @@ impl Gateway {
                 Some(session),
                 Ok(MarketControlOutcome::Details { result, session }),
             ),
+            Ok(MarketControlOutcome::Indices { result, session }) => {
+                let count = Some(result.indices.len());
+                (
+                    "ok",
+                    None,
+                    count,
+                    Some(session),
+                    Ok(MarketControlOutcome::Indices { result, session }),
+                )
+            }
             Err((code, err)) => ("error", Some(code), None, None, Err(err)),
         };
         audit::emit(&audit::AuditRecord {
@@ -860,13 +891,15 @@ impl Gateway {
                     Err(err) => Err((err, Some(session))),
                 }
             }
-            Ok(MarketControlOutcome::Search { .. }) => Err((
-                (
-                    "controller_protocol_error".to_string(),
-                    ErrorData::internal_error("market request failed", None),
-                ),
-                None,
-            )),
+            Ok(MarketControlOutcome::Search { .. } | MarketControlOutcome::Indices { .. }) => {
+                Err((
+                    (
+                        "controller_protocol_error".to_string(),
+                        ErrorData::internal_error("market request failed", None),
+                    ),
+                    None,
+                ))
+            }
             Err(err) => Err((err, None)),
         };
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -1223,6 +1256,9 @@ fn validate_market_control_outcome(
         ) | (
             MarketControlRequest::MarketGetAssetDetails(_),
             MarketControlOutcome::Details { .. }
+        ) | (
+            MarketControlRequest::MarketGetIndices(_),
+            MarketControlOutcome::Indices { .. }
         )
     );
     if !matches_request {

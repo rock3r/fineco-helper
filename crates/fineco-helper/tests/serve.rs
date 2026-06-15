@@ -1292,6 +1292,52 @@ impl fineco_live::MarketAssetDetailsLiveFetcher for FakeLiveWorker {
     }
 }
 
+impl fineco_live::MarketIndicesLiveFetcher for FakeLiveWorker {
+    fn fetch_market_indices(
+        &self,
+        _params: &fineco_ipc::MarketIndicesParams,
+        now_iso: &str,
+    ) -> Result<fineco_ipc::MarketIndicesLiveResult, fineco_core::SafeError> {
+        Ok(fineco_ipc::MarketIndicesLiveResult {
+            result: fineco_ipc::MarketIndicesResult {
+                schema_version: 1,
+                data_class: "authenticated_market".to_string(),
+                source: "fineco.indicesbar".to_string(),
+                captured_at: now_iso.to_string(),
+                indices: vec![fineco_ipc::MarketIndexCard {
+                    symbol: fineco_ipc::MarketField::high_string(
+                        "^FTMIB.affIdx",
+                        "fineco.indicesbar",
+                        "authenticated_market",
+                        "indicesbar",
+                        now_iso,
+                    ),
+                    label: fineco_ipc::MarketField::high_string(
+                        "Ftse mib",
+                        "fineco.indicesbar",
+                        "authenticated_market",
+                        "indicesbar",
+                        now_iso,
+                    ),
+                    region: fineco_ipc::MarketIndexRegion::Europe,
+                    value: None,
+                    change_percent: Some(fineco_ipc::MarketField::medium(
+                        1.97,
+                        Some("percent"),
+                        "fineco.indicesbar",
+                        "authenticated_market",
+                        "indicesbar",
+                        None,
+                        now_iso,
+                    )),
+                }],
+                warnings: vec![],
+            },
+            session: fineco_ipc::MarketSessionStatus::fresh_login(),
+        })
+    }
+}
+
 #[test]
 fn private_worker_serves_a_live_fetch_and_keeps_the_socket_owner_only() {
     use fineco_refresh::PortfolioFetcher;
@@ -1540,7 +1586,9 @@ fn store_server_market_control_routes_authenticated_search_to_live_worker() {
                 "IE00B8GKDB10.AFF"
             );
         }
-        MarketControlOutcome::Details { .. } => panic!("wrong market-control outcome"),
+        MarketControlOutcome::Details { .. } | MarketControlOutcome::Indices { .. } => {
+            panic!("wrong market-control outcome")
+        }
     }
 
     for path in [

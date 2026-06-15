@@ -21,8 +21,8 @@ use std::sync::Mutex;
 use fineco_core::{SafeError, parse_iso8601_utc};
 use fineco_ipc::{
     MarketAssetDetailsLiveFetcher, MarketControlOutcome, MarketControlRequest,
-    MarketSearchLiveFetcher, MarketSessionStatus, OWNER_AUTH_ID, Policy, RefreshOutcome,
-    RefreshRequest,
+    MarketIndicesLiveFetcher, MarketSearchLiveFetcher, MarketSessionStatus, OWNER_AUTH_ID, Policy,
+    RefreshOutcome, RefreshRequest,
 };
 use fineco_refresh::{
     OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher, refresh_orders, refresh_portfolio,
@@ -409,7 +409,7 @@ where
 
 impl<F> RefreshController<F>
 where
-    F: MarketSearchLiveFetcher + MarketAssetDetailsLiveFetcher,
+    F: MarketSearchLiveFetcher + MarketAssetDetailsLiveFetcher + MarketIndicesLiveFetcher,
 {
     /// Handle one authenticated market-control request, stamping the resulting
     /// payload with `now_iso`. Capability and bounds are re-checked here even
@@ -490,6 +490,31 @@ where
                     }
                 }
             }
+            MarketControlRequest::MarketGetIndices(params) => {
+                let live = self.fetcher.fetch_market_indices(&params, now_iso);
+                match live {
+                    Ok(live) => {
+                        let session = live.session;
+                        permit.finish_with_session_status(session)?;
+                        self.market_circuit_state
+                            .lock()
+                            .map_err(|_| SafeError::internal())?
+                            .record_outcome(now_iso, None)?;
+                        Ok(MarketControlOutcome::Indices {
+                            result: live.result,
+                            session,
+                        })
+                    }
+                    Err(error) => {
+                        permit.finish_after_error(&error)?;
+                        self.market_circuit_state
+                            .lock()
+                            .map_err(|_| SafeError::internal())?
+                            .record_outcome(now_iso, Some(&error))?;
+                        Err(error)
+                    }
+                }
+            }
         }
     }
 }
@@ -507,9 +532,10 @@ mod tests {
     use fineco_ipc::{
         MarketAssetDetailsLiveResult, MarketAssetDetailsResult, MarketAssetIdentity,
         MarketAssetSections, MarketAssetType, MarketControlRequest, MarketDetailsParams,
-        MarketField, MarketSearchCandidate, MarketSearchGroup, MarketSearchLiveResult,
-        MarketSearchParams, MarketSearchResult, MarketSessionStatus, OrdersRefreshParams, Policy,
-        RefreshRequest, TaxRefreshParams,
+        MarketField, MarketIndexCard, MarketIndexRegion, MarketIndicesLiveResult,
+        MarketIndicesParams, MarketIndicesResult, MarketSearchCandidate, MarketSearchGroup,
+        MarketSearchLiveResult, MarketSearchParams, MarketSearchResult, MarketSessionStatus,
+        OrdersRefreshParams, Policy, RefreshRequest, TaxRefreshParams,
     };
     use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher};
     use fineco_store::{
@@ -696,6 +722,53 @@ mod tests {
                     },
                     sections: MarketAssetSections::default(),
                     sources: vec![],
+                    warnings: vec![],
+                },
+                session: self.market_session,
+            })
+        }
+    }
+
+    impl fineco_ipc::MarketIndicesLiveFetcher for FakeWorker {
+        fn fetch_market_indices(
+            &self,
+            _params: &MarketIndicesParams,
+            now_iso: &str,
+        ) -> Result<MarketIndicesLiveResult, SafeError> {
+            (self.market_result)()?;
+            Ok(MarketIndicesLiveResult {
+                result: MarketIndicesResult {
+                    schema_version: 1,
+                    data_class: "authenticated_market".to_string(),
+                    source: "fineco.indicesbar".to_string(),
+                    captured_at: now_iso.to_string(),
+                    indices: vec![MarketIndexCard {
+                        symbol: MarketField::high_string(
+                            "^FTMIB.affIdx",
+                            "fineco.indicesbar",
+                            "authenticated_market",
+                            "indicesbar",
+                            now_iso,
+                        ),
+                        label: MarketField::high_string(
+                            "Ftse mib",
+                            "fineco.indicesbar",
+                            "authenticated_market",
+                            "indicesbar",
+                            now_iso,
+                        ),
+                        region: MarketIndexRegion::Europe,
+                        value: None,
+                        change_percent: Some(MarketField::medium(
+                            1.97,
+                            Some("percent"),
+                            "fineco.indicesbar",
+                            "authenticated_market",
+                            "indicesbar",
+                            None,
+                            now_iso,
+                        )),
+                    }],
                     warnings: vec![],
                 },
                 session: self.market_session,

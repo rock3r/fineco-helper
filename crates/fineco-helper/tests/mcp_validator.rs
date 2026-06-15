@@ -50,7 +50,7 @@ fn mcp_validator_expected_tools_match_the_gateway() {
         registered.difference(&expected).collect::<Vec<_>>(),
         expected.difference(&registered).collect::<Vec<_>>(),
     );
-    assert_eq!(registered.len(), 17, "expected 17 registered tools");
+    assert_eq!(registered.len(), 18, "expected 18 registered tools");
 }
 
 #[test]

@@ -12,6 +12,7 @@ use fineco_ipc::{
     MAX_SOURCES, MAX_STOCK_RATIOS, MarketAssetDetailsResult, MarketAssetIdentity,
     MarketAssetSections, MarketAssetType, MarketDetailsParams, MarketDetailsSection,
     MarketEtfSection, MarketExposure, MarketExposuresSection, MarketField, MarketHolding,
+    MarketIndexCard, MarketIndexRegion, MarketIndicesParams, MarketIndicesResult,
     MarketListingSection, MarketProfileSection, MarketQuoteSection, MarketRatio,
     MarketRatiosSection, MarketReturn, MarketReturnsSection, MarketRiskSection,
     MarketSearchCandidate, MarketSearchGroup, MarketSearchParams, MarketSearchResult, MarketSource,
@@ -25,6 +26,158 @@ use std::collections::BTreeMap;
 
 /// Provenance label stamped on snapshots fetched by this worker.
 const SOURCE: &str = "fineco";
+
+// ---- Market indices-bar ----------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct MarketIndicesResponse {
+    #[serde(default)]
+    indices: Vec<RawMarketIndexCard>,
+}
+
+#[derive(Deserialize)]
+struct RawMarketIndexCard {
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, rename = "value")]
+    last_value: Option<f64>,
+    #[serde(default, rename = "var")]
+    change_percent: Option<f64>,
+}
+
+pub(crate) fn to_market_indices(
+    resp: MarketIndicesResponse,
+    params: &MarketIndicesParams,
+    captured_at: &str,
+) -> MarketIndicesResult {
+    let source = "fineco.indicesbar";
+    let source_ref = "indicesbar";
+    let limit = params.limit.unwrap_or(fineco_ipc::MAX_INDEX_CARDS) as usize;
+    let mut indices = Vec::new();
+    let mut quote_like_without_provider_time = false;
+    for raw in resp.indices {
+        let Some(symbol) = sanitized_non_empty(raw.symbol) else {
+            continue;
+        };
+        let Some(label) = sanitized_non_empty(raw.label) else {
+            continue;
+        };
+        let url = sanitized_non_empty(raw.url);
+        let region = infer_index_region(&symbol, url.as_deref(), &label);
+        if let Some(filter) = params.region
+            && region != filter
+        {
+            continue;
+        }
+        if raw.last_value.is_some() || raw.change_percent.is_some() {
+            quote_like_without_provider_time = true;
+        }
+        indices.push(MarketIndexCard {
+            symbol: MarketField::high_string(
+                &symbol,
+                source,
+                "authenticated_market",
+                source_ref,
+                captured_at,
+            ),
+            label: MarketField::high_string(
+                &label,
+                source,
+                "authenticated_market",
+                source_ref,
+                captured_at,
+            ),
+            region,
+            value: raw.last_value.map(|value| {
+                MarketField::medium(
+                    value,
+                    None,
+                    source,
+                    "authenticated_market",
+                    source_ref,
+                    None,
+                    captured_at,
+                )
+            }),
+            change_percent: raw.change_percent.map(|value| {
+                MarketField::medium(
+                    value,
+                    Some("percent"),
+                    source,
+                    "authenticated_market",
+                    source_ref,
+                    None,
+                    captured_at,
+                )
+            }),
+        });
+        if indices.len() >= limit {
+            break;
+        }
+    }
+    MarketIndicesResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        source: source.to_string(),
+        captured_at: captured_at.to_string(),
+        indices,
+        warnings: if quote_like_without_provider_time {
+            vec![warning(
+                "missing_provider_timestamp",
+                "Fineco indicesbar fields did not include a provider timestamp.",
+            )]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn infer_index_region(symbol: &str, url: Option<&str>, label: &str) -> MarketIndexRegion {
+    let haystack = format!(
+        "{} {} {}",
+        symbol.to_ascii_lowercase(),
+        url.unwrap_or_default().to_ascii_lowercase(),
+        label.to_ascii_lowercase()
+    );
+    if haystack.contains("tokyo")
+        || haystack.contains("hongkong")
+        || haystack.contains("beijing")
+        || haystack.contains("singapore")
+        || haystack.contains("indiciasia")
+        || haystack.contains("nikkei")
+        || haystack.contains("seng")
+        || haystack.contains("china")
+    {
+        MarketIndexRegion::AsiaPacific
+    } else if haystack.contains("nyse")
+        || haystack.contains("nasdaq")
+        || haystack.contains("usadj")
+        || haystack.contains("dow")
+        || haystack.contains("sp500")
+        || haystack.contains("spx")
+        || haystack.contains("gspc")
+        || haystack.contains("s&p")
+    {
+        MarketIndexRegion::Americas
+    } else if haystack.contains("affidx")
+        || haystack.contains("xetra")
+        || haystack.contains("londra")
+        || haystack.contains("sbf")
+        || haystack.contains("ftse")
+        || haystack.contains("dax")
+        || haystack.contains("cac")
+        || haystack.contains("mib")
+        || haystack.contains("all share")
+    {
+        MarketIndexRegion::Europe
+    } else {
+        MarketIndexRegion::Other
+    }
+}
 
 // ---- Market search ---------------------------------------------------------
 
@@ -2213,6 +2366,99 @@ mod tests {
         assert_eq!(result.groups[0].candidates[0].identifier, "EURONEXTNL/VHYL");
         assert_eq!(result.groups[0].candidates[0].symbol, "VHYL");
         assert_eq!(result.groups[0].candidates[0].display_symbol, "VHYL.AS");
+    }
+
+    #[test]
+    fn market_indices_normalizes_fineco_indicesbar_cards() {
+        let json = r#"{
+            "nextToken":"redacted",
+            "indices":[
+                {"symbol":"^FTMIB.affIdx","url":"/pvt/trading/stocklist/ftsemib","label":"Ftse mib","var":1.97},
+                {"symbol":"^DJI.NYSE","url":"/pvt/trading/stocklist/usadj","label":"Dow Jones","var":0.7},
+                {"symbol":"^GSPC","url":"/pvt/trading/stocklist/sp500","label":"S&P 500","var":0.5},
+                {"symbol":"MBTM6CFD.CFDC","url":"/pvt/trading/crypto/home/showcase","label":"BITCOIN","value":63535,"var":-0.4162},
+                {"symbol":"^N225.Tokyo","url":"/pvt/trading/indices?listname=indiciAsia&titolo=^N225.Tokyo","label":"Nikkei","var":2.81}
+            ]
+        }"#;
+        let resp: MarketIndicesResponse = serde_json::from_str(json).expect("parse");
+        let result = to_market_indices(
+            resp,
+            &fineco_ipc::MarketIndicesParams {
+                region: Some(fineco_ipc::MarketIndexRegion::Europe),
+                limit: Some(2),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+
+        assert_eq!(result.schema_version, 1);
+        assert_eq!(result.data_class, "authenticated_market");
+        assert_eq!(result.source, "fineco.indicesbar");
+        assert_eq!(result.indices.len(), 1);
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].code, "missing_provider_timestamp");
+        let card = &result.indices[0];
+        assert_eq!(card.symbol.value, "^FTMIB.affIdx");
+        assert_eq!(card.label.value, "Ftse mib");
+        assert_eq!(card.region, fineco_ipc::MarketIndexRegion::Europe);
+        assert_eq!(
+            card.change_percent.as_ref().map(|field| field.value),
+            Some(1.97)
+        );
+        assert_eq!(
+            card.change_percent
+                .as_ref()
+                .and_then(|field| field.unit.as_deref()),
+            Some("percent")
+        );
+        assert_eq!(card.value, None);
+
+        let resp: MarketIndicesResponse = serde_json::from_str(json).expect("parse");
+        let asia = to_market_indices(
+            resp,
+            &fineco_ipc::MarketIndicesParams {
+                region: Some(fineco_ipc::MarketIndexRegion::AsiaPacific),
+                limit: Some(1),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+        assert_eq!(asia.indices.len(), 1);
+        assert_eq!(asia.indices[0].symbol.value, "^N225.Tokyo");
+
+        let resp: MarketIndicesResponse = serde_json::from_str(json).expect("parse");
+        let americas = to_market_indices(
+            resp,
+            &fineco_ipc::MarketIndicesParams {
+                region: Some(fineco_ipc::MarketIndexRegion::Americas),
+                limit: Some(2),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+        assert_eq!(americas.indices.len(), 2);
+        assert_eq!(americas.indices[0].symbol.value, "^DJI.NYSE");
+        assert_eq!(americas.indices[1].symbol.value, "^GSPC");
+
+        let resp: MarketIndicesResponse = serde_json::from_str(json).expect("parse");
+        let other = to_market_indices(
+            resp,
+            &fineco_ipc::MarketIndicesParams {
+                region: Some(fineco_ipc::MarketIndexRegion::Other),
+                limit: Some(1),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+        let bitcoin = &other.indices[0];
+        assert_eq!(bitcoin.label.value, "BITCOIN");
+        assert_eq!(
+            bitcoin.value.as_ref().map(|field| field.value),
+            Some(63535.0)
+        );
+        assert_eq!(
+            bitcoin
+                .value
+                .as_ref()
+                .and_then(|field| field.unit.as_deref()),
+            None
+        );
     }
 
     #[test]

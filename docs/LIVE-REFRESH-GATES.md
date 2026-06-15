@@ -30,9 +30,10 @@ static checks done; the live verification runs on the target host) · **open**
 Authenticated market reads share the live Fineco session risk but return
 `authenticated_market` data rather than refresh snapshots. The current
 implementation has the controller-mediated path and status-only worker boundary
-in place for `market_search_asset` and `market_get_asset_details`: gateway ->
-`market-control.sock` -> controller -> `fineco-live.sock` -> private worker,
-with `MarketSearchLiveResult` / `MarketAssetDetailsLiveResult` carrying
+in place for `market_search_asset`, `market_get_asset_details`, and
+`market_get_indices`: gateway -> `market-control.sock` -> controller ->
+`fineco-live.sock` -> private worker, with `MarketSearchLiveResult` /
+`MarketAssetDetailsLiveResult` / `MarketIndicesLiveResult` carrying
 `MarketSessionStatus` (`login_performed`, `session_reused`, `session_evicted`,
 `reused_session_401_recovered`, optional expiry TTL) and no cookie values, auth
 headers, raw `Set-Cookie`, or session handles. The worker is still stateless
@@ -79,7 +80,7 @@ notifier command from `/etc/fineco/alert.env` (default `logger -t fineco-alert`)
 | **Repeated Fineco auth failures** | live refresh keeps returning `auth_required` | `job_runs` rows `status=failed safe_error_code=auth_required` for the area, and the audit `error_code:auth_required`. Alert on a count over a window. |
 | **Circuit breaker opened** | N consecutive upstream/timeout failures | the audit `error_code:refresh_circuit_open` (the controller returns it once the breaker is open) + the `job_runs` failure streak that tripped it. |
 | **Refresh spike / off-window** | more refreshes than expected, or outside the owner's window | the gateway audit lines `tool:private_*_refresh_live_sensitive` (count over time). |
-| **Repeated Fineco authenticated-market auth failures** | authenticated market tools keep returning `market_auth_required` | gateway audit lines for `tool:market_search_asset` / `market_get_asset_details` with `error_code:market_auth_required`. Alert on a count over a window; cached/private tool auth errors do not match. |
+| **Repeated Fineco authenticated-market auth failures** | authenticated market tools keep returning `market_auth_required` | gateway audit lines for `tool:market_search_asset` / `market_get_asset_details` / `market_get_indices` with `error_code:market_auth_required`. Alert on a count over a window; cached/private tool auth errors do not match. |
 | **Authenticated-market upstream failures** | authenticated market tools keep returning retryable upstream/timeout errors | gateway audit lines for authenticated-market tools with `error_code:market_upstream_failure`, `fineco_timeout`, or `fineco_upstream_error`. Alert on a count over a window. |
 | **Authenticated-market circuit breaker opened** | the market controller circuit opens after repeated market upstream/timeout failures | gateway audit lines for authenticated-market tools with `error_code:market_circuit_open`; controller tests cover open and half-open behavior. |
 | **Authenticated-market reused session recovered after 401** | a stale reused session was evicted and repaired by the one allowed fresh-login retry | successful authenticated-market audit lines with `reused_session_401_recovered:true`; the controller debits this as a fresh-login slot. |

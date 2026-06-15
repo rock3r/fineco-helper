@@ -13,8 +13,10 @@ use std::thread;
 use fineco_ipc::{
     MarketAssetDetailsLiveFetcher, MarketAssetDetailsLiveResult, MarketAssetDetailsResult,
     MarketAssetIdentity, MarketAssetSections, MarketAssetType, MarketDetailsParams,
-    MarketDetailsSection, MarketField, MarketSearchCandidate, MarketSearchGroup,
-    MarketSearchLiveResult, MarketSearchParams, MarketSearchResult, MarketSessionStatus,
+    MarketDetailsSection, MarketField, MarketIndexCard, MarketIndexRegion,
+    MarketIndicesLiveFetcher, MarketIndicesLiveResult, MarketIndicesParams, MarketIndicesResult,
+    MarketSearchCandidate, MarketSearchGroup, MarketSearchLiveResult, MarketSearchParams,
+    MarketSearchResult, MarketSessionStatus,
 };
 use fineco_live::{LiveClient, MarketSearchLiveFetcher, serve_live_blocking};
 use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
@@ -33,6 +35,7 @@ struct FakeWorker {
     minus_by_year: Result<Vec<NewTaxMinusByYear>, SafeError>,
     market_search: Result<MarketSearchLiveResult, SafeError>,
     market_details: Result<MarketAssetDetailsLiveResult, SafeError>,
+    market_indices: Result<MarketIndicesLiveResult, SafeError>,
 }
 
 impl FakeWorker {
@@ -81,6 +84,10 @@ impl FakeWorker {
             }),
             market_details: Ok(MarketAssetDetailsLiveResult {
                 result: sample_details(""),
+                session: MarketSessionStatus::fresh_login(),
+            }),
+            market_indices: Ok(MarketIndicesLiveResult {
+                result: sample_indices(""),
                 session: MarketSessionStatus::fresh_login(),
             }),
         }
@@ -154,6 +161,19 @@ impl MarketAssetDetailsLiveFetcher for FakeWorker {
     }
 }
 
+impl MarketIndicesLiveFetcher for FakeWorker {
+    fn fetch_market_indices(
+        &self,
+        _params: &MarketIndicesParams,
+        now_iso: &str,
+    ) -> Result<MarketIndicesLiveResult, SafeError> {
+        self.market_indices.clone().map(|mut result| {
+            result.result.captured_at = now_iso.to_string();
+            result
+        })
+    }
+}
+
 fn sample_details(captured_at: &str) -> MarketAssetDetailsResult {
     MarketAssetDetailsResult {
         schema_version: 1,
@@ -216,6 +236,43 @@ fn sample_details(captured_at: &str) -> MarketAssetDetailsResult {
         },
         sections: MarketAssetSections::default(),
         sources: vec![],
+        warnings: vec![],
+    }
+}
+
+fn sample_indices(captured_at: &str) -> MarketIndicesResult {
+    MarketIndicesResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        source: "fineco.indicesbar".to_string(),
+        captured_at: captured_at.to_string(),
+        indices: vec![MarketIndexCard {
+            symbol: MarketField::high_string(
+                "^FTMIB.affIdx",
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                captured_at,
+            ),
+            label: MarketField::high_string(
+                "Ftse mib",
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                captured_at,
+            ),
+            region: MarketIndexRegion::Europe,
+            value: None,
+            change_percent: Some(MarketField::medium(
+                1.97,
+                Some("percent"),
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                None,
+                captured_at,
+            )),
+        }],
         warnings: vec![],
     }
 }
@@ -414,6 +471,29 @@ fn market_search_round_trip_carries_status_only_expiry_ttl() {
     assert!(encoded.contains("session_expires_in_secs"));
     assert!(!encoded.contains("cookie"));
     assert!(!encoded.contains("set-cookie"));
+    assert!(!encoded.contains("session_id"));
+    assert!(!encoded.contains("auth"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn market_indices_round_trip_carries_status_facts_without_cookie_values() {
+    let (client, path) = serve(FakeWorker::ok());
+    let live = client
+        .fetch_market_indices_live(
+            &MarketIndicesParams {
+                region: Some(MarketIndexRegion::Europe),
+                limit: Some(10),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("market indices");
+
+    assert_eq!(live.result.captured_at, "2026-06-14T09:30:00Z");
+    assert_eq!(live.result.indices[0].symbol.value, "^FTMIB.affIdx");
+    assert!(live.session.login_performed);
+    let encoded = serde_json::to_string(&live.session).expect("session status JSON");
+    assert!(!encoded.contains("cookie"));
     assert!(!encoded.contains("session_id"));
     assert!(!encoded.contains("auth"));
     let _ = std::fs::remove_file(&path);

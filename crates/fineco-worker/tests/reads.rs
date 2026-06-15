@@ -8,7 +8,8 @@ use std::thread;
 
 use fineco_ipc::{
     MarketAssetDetailsLiveFetcher, MarketAssetType, MarketDetailsParams, MarketDetailsSection,
-    MarketSearchLiveFetcher, MarketSearchParams,
+    MarketIndexRegion, MarketIndicesLiveFetcher, MarketIndicesParams, MarketSearchLiveFetcher,
+    MarketSearchParams,
 };
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_worker::{FinecoEndpoints, FinecoWorker, StaticCredentialSource};
@@ -357,6 +358,38 @@ fn logs_in_and_fetches_authenticated_market_search() {
     assert_eq!(
         result.groups[0].candidates[1].fineco_key,
         "IE00B8GKDB10.AFF"
+    );
+    assert!(live.session.login_performed);
+    assert!(!live.session.session_reused);
+    assert_eq!(live.session.session_expires_in_secs, Some(3600));
+}
+
+#[test]
+fn logs_in_and_fetches_authenticated_market_indices() {
+    let base = spawn_mock_fineco();
+    let live = worker_for(&base)
+        .fetch_market_indices(
+            &MarketIndicesParams {
+                region: Some(MarketIndexRegion::Europe),
+                limit: Some(10),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("market indices fetch should succeed");
+    let result = live.result;
+
+    assert_eq!(result.schema_version, 1);
+    assert_eq!(result.data_class, "authenticated_market");
+    assert_eq!(result.source, "fineco.indicesbar");
+    assert_eq!(result.indices.len(), 2);
+    assert_eq!(result.indices[0].symbol.value, "^FTMIB.affIdx");
+    assert_eq!(result.indices[0].region, MarketIndexRegion::Europe);
+    assert_eq!(
+        result.indices[0]
+            .change_percent
+            .as_ref()
+            .map(|field| field.value),
+        Some(1.97)
     );
     assert!(live.session.login_performed);
     assert!(!live.session.session_reused);

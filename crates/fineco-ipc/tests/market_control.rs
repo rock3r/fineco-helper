@@ -9,8 +9,9 @@ use std::thread;
 
 use fineco_ipc::{
     Capability, MarketAssetType, MarketControlClient, MarketControlOutcome, MarketControlRequest,
-    MarketDetailsParams, MarketDetailsSection, MarketField, MarketSearchCandidate,
-    MarketSearchGroup, MarketSearchParams, MarketSearchResult, serve_market_control_blocking,
+    MarketDetailsParams, MarketDetailsSection, MarketField, MarketIndexCard, MarketIndexRegion,
+    MarketIndicesResult, MarketSearchCandidate, MarketSearchGroup, MarketSearchParams,
+    MarketSearchResult, serve_market_control_blocking,
 };
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -112,6 +113,43 @@ fn sample_details() -> fineco_ipc::MarketAssetDetailsResult {
     }
 }
 
+fn sample_indices() -> MarketIndicesResult {
+    MarketIndicesResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        source: "fineco.indicesbar".to_string(),
+        captured_at: "2026-06-14T09:30:00Z".to_string(),
+        indices: vec![MarketIndexCard {
+            symbol: MarketField::high_string(
+                "^FTMIB.affIdx",
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                "2026-06-14T09:30:00Z",
+            ),
+            label: MarketField::high_string(
+                "Ftse mib",
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                "2026-06-14T09:30:00Z",
+            ),
+            region: MarketIndexRegion::Europe,
+            value: None,
+            change_percent: Some(MarketField::medium(
+                1.97,
+                Some("percent"),
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                None,
+                "2026-06-14T09:30:00Z",
+            )),
+        }],
+        warnings: vec![],
+    }
+}
+
 fn socket_path() -> PathBuf {
     let mut path = PathBuf::from("/tmp");
     let tag = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -137,7 +175,10 @@ fn market_search_request_is_strict_and_authenticated() {
             assert_eq!(params.asset_type, Some(MarketAssetType::Etf));
             assert_eq!(params.limit, Some(5));
         }
-        MarketControlRequest::MarketGetAssetDetails(_) => panic!("wrong command"),
+        MarketControlRequest::MarketGetAssetDetails(_)
+        | MarketControlRequest::MarketGetIndices(_) => {
+            panic!("wrong command")
+        }
     }
 
     for bad in [
@@ -154,6 +195,50 @@ fn market_search_request_is_strict_and_authenticated() {
             "bad request must be rejected: {bad}"
         );
     }
+}
+
+#[test]
+fn market_indices_request_is_strict_and_authenticated() {
+    let request = MarketControlRequest::from_json(
+        r#"{"command":"market_get_indices","params":{"region":"europe","limit":10}}"#,
+    )
+    .expect("parse request");
+    assert_eq!(
+        request.required_capability(),
+        Capability::MarketAuthenticatedRead
+    );
+    assert_eq!(request.audit_tool(), "market_get_indices");
+
+    let MarketControlRequest::MarketGetIndices(params) = request else {
+        panic!("wrong request");
+    };
+    assert_eq!(params.region, Some(MarketIndexRegion::Europe));
+    assert_eq!(params.limit, Some(10));
+
+    MarketControlRequest::from_json(
+        r#"{"command":"market_get_indices","params":{"region":"americas","limit":50}}"#,
+    )
+    .expect("at-limit request is accepted");
+
+    for limit in [0, 51] {
+        let err = MarketControlRequest::from_json(&format!(
+            r#"{{"command":"market_get_indices","params":{{"limit":{limit}}}}}"#
+        ))
+        .expect_err("out-of-range limit rejected");
+        assert_eq!(err.code(), "invalid_request");
+    }
+
+    let err = MarketControlRequest::from_json(
+        r#"{"command":"market_get_indices","params":{"region":"moon"}}"#,
+    )
+    .expect_err("unknown region rejected");
+    assert_eq!(err.code(), "invalid_request");
+
+    let err = MarketControlRequest::from_json(
+        r#"{"command":"market_get_indices","params":{"url":"https://example.com"}}"#,
+    )
+    .expect_err("generic proxy-shaped params rejected");
+    assert_eq!(err.code(), "invalid_request");
 }
 
 #[test]
@@ -182,7 +267,9 @@ fn market_details_request_is_strict_and_authenticated() {
                 ])
             );
         }
-        MarketControlRequest::MarketSearchAsset(_) => panic!("wrong command"),
+        MarketControlRequest::MarketSearchAsset(_) | MarketControlRequest::MarketGetIndices(_) => {
+            panic!("wrong command")
+        }
     }
 
     let external = MarketControlRequest::from_json(
@@ -196,7 +283,9 @@ fn market_details_request_is_strict_and_authenticated() {
                 Some(vec![MarketDetailsSection::ExternalEnrichment])
             );
         }
-        MarketControlRequest::MarketSearchAsset(_) => panic!("wrong command"),
+        MarketControlRequest::MarketSearchAsset(_) | MarketControlRequest::MarketGetIndices(_) => {
+            panic!("wrong command")
+        }
     }
 
     for bad in [
@@ -270,7 +359,9 @@ fn market_control_socket_round_trips_search_results() {
                 "IE00B8GKDB10.AFF"
             );
         }
-        MarketControlOutcome::Details { .. } => panic!("wrong outcome"),
+        MarketControlOutcome::Details { .. } | MarketControlOutcome::Indices { .. } => {
+            panic!("wrong outcome")
+        }
     }
     let _ = std::fs::remove_file(&path);
 }
@@ -293,7 +384,8 @@ fn market_control_socket_round_trips_details_results() {
                         session: fineco_ipc::MarketSessionStatus::fresh_login(),
                     })
                 }
-                MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+                MarketControlRequest::MarketSearchAsset(_)
+                | MarketControlRequest::MarketGetIndices(_) => panic!("wrong request"),
             }
         });
     });
@@ -318,7 +410,56 @@ fn market_control_socket_round_trips_details_results() {
             assert_eq!(result.schema_version, 1);
             assert_eq!(result.asset.fineco_key.value, "IE00B8GKDB10.AFF");
         }
-        MarketControlOutcome::Search { .. } => panic!("wrong outcome"),
+        MarketControlOutcome::Search { .. } | MarketControlOutcome::Indices { .. } => {
+            panic!("wrong outcome")
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn market_control_socket_round_trips_indices_results() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| {
+            assert_eq!(
+                request.required_capability(),
+                Capability::MarketAuthenticatedRead
+            );
+            match request {
+                MarketControlRequest::MarketGetIndices(params) => {
+                    assert_eq!(params.region, Some(MarketIndexRegion::Europe));
+                    Ok(MarketControlOutcome::Indices {
+                        result: sample_indices(),
+                        session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                    })
+                }
+                MarketControlRequest::MarketSearchAsset(_)
+                | MarketControlRequest::MarketGetAssetDetails(_) => panic!("wrong request"),
+            }
+        });
+    });
+
+    let client = MarketControlClient::new(&path);
+    let outcome = client
+        .call(&MarketControlRequest::MarketGetIndices(
+            fineco_ipc::MarketIndicesParams {
+                region: Some(MarketIndexRegion::Europe),
+                limit: Some(10),
+            },
+        ))
+        .expect("market-control call");
+
+    match outcome {
+        MarketControlOutcome::Indices { result, session } => {
+            assert!(session.login_performed);
+            assert_eq!(result.schema_version, 1);
+            assert_eq!(result.indices[0].symbol.value, "^FTMIB.affIdx");
+        }
+        MarketControlOutcome::Search { .. } | MarketControlOutcome::Details { .. } => {
+            panic!("wrong outcome")
+        }
     }
     let _ = std::fs::remove_file(&path);
 }

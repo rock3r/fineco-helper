@@ -273,6 +273,7 @@ fn default_connector_allowlist_is_valid_and_excludes_default_blocked_tools() {
         "portfolio_get_position_history",
         "market_search_asset",
         "market_get_asset_details",
+        "market_get_indices",
     ] {
         assert!(
             all.contains(blocked),
@@ -290,7 +291,7 @@ fn default_connector_allowlist_is_valid_and_excludes_default_blocked_tools() {
     // absent from the resolved allowlist is hidden), so the posture is fail-safe.
     assert_eq!(
         DEFAULT_CONNECTOR_TOOLS.len(),
-        all.len() - 6,
+        all.len() - 7,
         "the default allowlist should be every tool except the default-blocked tools"
     );
 }
