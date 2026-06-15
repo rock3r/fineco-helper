@@ -116,8 +116,8 @@ fn to_market_search_with_caps(
             continue;
         }
         let mut candidates = Vec::new();
-        for (idx, raw) in raws.into_iter().enumerate() {
-            if per_group_cap.is_some_and(|cap| idx >= cap) {
+        for raw in raws {
+            if per_group_cap.is_some_and(|cap| candidates.len() >= cap) {
                 break;
             }
             if remaining.is_some_and(|remaining| remaining == 0) {
@@ -2157,6 +2157,39 @@ mod tests {
         assert_eq!(result.groups[0].candidates[0].identifier, "EURONEXTNL/VHYL");
         assert_eq!(result.groups[0].candidates[0].symbol, "VHYL");
         assert_eq!(result.groups[0].candidates[0].display_symbol, "VHYL.AS");
+    }
+
+    #[test]
+    fn market_search_group_cap_counts_accepted_candidates() {
+        let json = r#"{
+            "ETF": [
+                {"m":"AFF","s":"BROKEN0.MI","i":"IE0000000000","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN1.MI","i":"IE0000000001","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN2.MI","i":"IE0000000002","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN3.MI","i":"IE0000000003","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN4.MI","i":"IE0000000004","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN5.MI","i":"IE0000000005","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN6.MI","i":"IE0000000006","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN7.MI","i":"IE0000000007","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN8.MI","i":"IE0000000008","c":"EUR","t":"ETF"},
+                {"m":"AFF","s":"BROKEN9.MI","i":"IE0000000009","c":"EUR","t":"ETF"},
+                {"d":"Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis","m":"AFF","s":"VHYL.MI","i":"IE00B8GKDB10","c":"EUR","t":"ETF"}
+            ]
+        }"#;
+        let resp: MarketSearchResponse = serde_json::from_str(json).expect("parse");
+        let result = to_market_search(
+            resp,
+            &MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(10),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].result_count, 1);
+        assert_eq!(result.groups[0].candidates[0].identifier, "AFF/VHYL");
     }
 
     #[test]
