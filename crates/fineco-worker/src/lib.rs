@@ -321,9 +321,14 @@ impl FinecoWorker {
         let acquired = self.acquire_market_session(now_epoch)?;
         match read(acquired.cookie.as_str()) {
             Ok(value) => {
-                // A successful read resets the server idle timer, so extend the
-                // reuse window from now.
-                self.touch_market_session_validity(now_epoch);
+                // The read proved the session good and reset the server idle timer:
+                // re-store it (re-establishing it even if the reaper evicted it
+                // mid-read) so the held session matches what we report.
+                self.store_market_session_parts(
+                    acquired.cookie.clone(),
+                    acquired.expires_in_secs,
+                    now_epoch,
+                );
                 let session = if acquired.reused {
                     MarketSessionStatus {
                         login_performed: false,
@@ -354,7 +359,7 @@ impl FinecoWorker {
                 self.store_market_session(fresh, now_epoch);
                 match read(cookie.as_str()) {
                     Ok(value) => {
-                        self.touch_market_session_validity(now_epoch);
+                        self.store_market_session_parts(cookie.clone(), expires, now_epoch);
                         Ok((
                             value,
                             MarketSessionStatus {
@@ -366,10 +371,14 @@ impl FinecoWorker {
                             },
                         ))
                     }
-                    // The fresh login's own session also 401'd: drop it too and
-                    // surface `market_auth_required` (a fresh-login 401, no retry).
+                    // The fresh login's own session ALSO 401'd: drop it too and
+                    // surface `market_auth_required` (a fresh-login 401, no retry). A
+                    // non-auth retry error (e.g. 429) leaves the valid fresh session
+                    // held — 429 never evicts/re-logs.
                     Err(error) => {
-                        self.evict_market_session();
+                        if error.code() == "market_auth_required" {
+                            self.evict_market_session();
+                        }
                         Err(error)
                     }
                 }
@@ -419,35 +428,34 @@ impl FinecoWorker {
         }
     }
 
-    /// Hold `session` as the reusable market session, valid for `reuse_ttl_secs`
-    /// from `now_epoch`. A no-op when reuse is disabled.
-    fn store_market_session(&self, session: FinecoSession, now_epoch: i64) {
+    /// Hold a market session (cookie + lifetime metadata) for reuse, valid for
+    /// `reuse_ttl_secs` from `now_epoch`. A no-op when reuse is disabled. A
+    /// successful read re-stores its own cookie through this, so the held session
+    /// always reflects the last good read and the window resets on activity — even
+    /// if the reaper happened to evict it mid-read.
+    fn store_market_session_parts(
+        &self,
+        cookie: Zeroizing<String>,
+        expires_in_secs: Option<u64>,
+        now_epoch: i64,
+    ) {
         let Some(ttl) = self.reuse_ttl_secs else {
             return;
         };
         let valid_until_epoch = now_epoch.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
         if let Ok(mut guard) = self.market_session.lock() {
             *guard = Some(HeldMarketSession {
-                cookie: session.cookie,
-                expires_in_secs: session.expires_in_secs,
+                cookie,
+                expires_in_secs,
                 valid_until_epoch,
             });
         }
     }
 
-    /// Extend the held session's reuse window to `now_epoch + reuse_ttl_secs`
-    /// (the server idle timer resets on each successful read). A no-op when reuse
-    /// is disabled or nothing is held.
-    fn touch_market_session_validity(&self, now_epoch: i64) {
-        let Some(ttl) = self.reuse_ttl_secs else {
-            return;
-        };
-        let valid_until_epoch = now_epoch.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
-        if let Ok(mut guard) = self.market_session.lock()
-            && let Some(held) = guard.as_mut()
-        {
-            held.valid_until_epoch = valid_until_epoch;
-        }
+    /// Hold `session` as the reusable market session, valid for `reuse_ttl_secs`
+    /// from `now_epoch`. A no-op when reuse is disabled.
+    fn store_market_session(&self, session: FinecoSession, now_epoch: i64) {
+        self.store_market_session_parts(session.cookie, session.expires_in_secs, now_epoch);
     }
 
     /// Drop and zeroize any held market session. Called on TTL expiry, a
