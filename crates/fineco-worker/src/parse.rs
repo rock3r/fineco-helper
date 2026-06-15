@@ -321,8 +321,6 @@ struct RawDatedValue {
 
 #[derive(Deserialize, Clone)]
 struct RawCumulativeReturns {
-    #[serde(rename = "currencyId", default)]
-    currency_id: Option<String>,
     #[serde(default)]
     date: Option<String>,
     #[serde(rename = "returnD1", default)]
@@ -345,8 +343,6 @@ struct RawCumulativeReturns {
 
 #[derive(Deserialize, Clone)]
 struct RawPeriodReturns {
-    #[serde(rename = "currencyId", default)]
-    currency_id: Option<String>,
     #[serde(rename = "returnHPS", default)]
     return_hps: Vec<RawDatedValue>,
 }
@@ -1443,7 +1439,6 @@ fn returns_section(item: &RawEtfEtc, captured_at: &str) -> MarketReturnsSection 
     let mut section = MarketReturnsSection::default();
     let mut remaining = MAX_RETURNS_ROWS;
     if let Some(cumulative) = &item.returns_cumulative_day_end {
-        let unit = cumulative.currency_id.as_deref().unwrap_or("percent");
         for (period, value) in [
             ("1D", cumulative.return_d1),
             ("1W", cumulative.return_w1),
@@ -1461,7 +1456,7 @@ fn returns_section(item: &RawEtfEtc, captured_at: &str) -> MarketReturnsSection 
                     period: period.to_string(),
                     value: MarketField::medium(
                         value,
-                        Some(unit),
+                        Some("percent"),
                         SOURCE,
                         "authenticated_market",
                         "etf.query.returns",
@@ -1501,7 +1496,6 @@ fn append_period_returns(
     captured_at: &str,
     remaining: &mut usize,
 ) {
-    let unit = raw.currency_id.as_deref().unwrap_or("percent");
     for row in &raw.return_hps {
         if *remaining == 0 {
             break;
@@ -1511,7 +1505,7 @@ fn append_period_returns(
                 period: sanitize_text(date),
                 value: MarketField::medium(
                     value,
-                    Some(unit),
+                    Some("percent"),
                     SOURCE,
                     "authenticated_market",
                     source_ref,
@@ -2192,15 +2186,14 @@ mod tests {
                 .value,
             0.32
         );
-        assert!(
-            result
-                .sections
-                .returns
-                .expect("returns")
-                .cumulative
-                .iter()
-                .any(|row| row.period == "12M" && (row.value.value - 26.85).abs() < f64::EPSILON)
-        );
+        let returns = result.sections.returns.expect("returns");
+        let m12 = returns
+            .cumulative
+            .iter()
+            .find(|row| row.period == "12M")
+            .expect("12M return");
+        assert!((m12.value.value - 26.85).abs() < f64::EPSILON);
+        assert_eq!(m12.value.unit.as_deref(), Some("percent"));
     }
 
     #[test]
@@ -2420,6 +2413,18 @@ mod tests {
         assert_eq!(section.cumulative.len(), 8);
         assert_eq!(section.annual.len(), MAX_RETURNS_ROWS - 8);
         assert!(section.quarterly.is_empty());
+        assert!(
+            section
+                .cumulative
+                .iter()
+                .all(|row| row.value.unit.as_deref() == Some("percent"))
+        );
+        assert!(
+            section
+                .annual
+                .iter()
+                .all(|row| row.value.unit.as_deref() == Some("percent"))
+        );
     }
 
     #[test]
