@@ -360,6 +360,7 @@ fn logs_in_and_fetches_authenticated_market_search() {
     );
     assert!(live.session.login_performed);
     assert!(!live.session.session_reused);
+    assert_eq!(live.session.session_expires_in_secs, Some(3600));
 }
 
 #[test]
@@ -415,6 +416,7 @@ fn logs_in_and_fetches_authenticated_etf_details() {
     let risk = result.sections.risk.expect("risk");
     assert_eq!(risk.beta_m36.expect("beta").value, 1.01);
     assert!(live.session.login_performed);
+    assert_eq!(live.session.session_expires_in_secs, Some(3600));
 }
 
 #[test]

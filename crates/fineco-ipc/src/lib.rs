@@ -787,12 +787,21 @@ impl MarketSessionStatus {
     /// without changing the controller boundary again.
     #[must_use]
     pub fn fresh_login() -> Self {
+        Self::fresh_login_with_expiry(None)
+    }
+
+    /// Fresh-login status with optional status-only session lifetime metadata.
+    ///
+    /// The value is derived from cookie metadata such as `Max-Age`, never from
+    /// cookie values or a reusable session handle.
+    #[must_use]
+    pub fn fresh_login_with_expiry(session_expires_in_secs: Option<u64>) -> Self {
         Self {
             login_performed: true,
             session_reused: false,
             session_evicted: false,
             reused_session_401_recovered: false,
-            session_expires_in_secs: None,
+            session_expires_in_secs,
         }
     }
 }
