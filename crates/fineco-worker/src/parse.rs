@@ -918,6 +918,43 @@ pub(crate) fn to_stock_asset_details(
     let stock = &inputs.stock_snapshot;
     verify_stock_snapshot_identity(stock, candidate)?;
     let mut warnings = Vec::new();
+    let (name, name_source_ref) = static_item
+        .and_then(|item| item.description.clone())
+        .map_or_else(
+            || (candidate.name.clone(), "search.global"),
+            |description| (description, "static.search"),
+        );
+    let (venue, venue_source_ref) =
+        if let Some(venue) = static_item.and_then(|item| item.venue_system.clone()) {
+            (venue, "static.search")
+        } else if let Some(exchange) = stock.exchange.clone() {
+            (exchange, "stock.snapshot")
+        } else {
+            (candidate.venue.clone(), "search.global")
+        };
+    let (symbol, symbol_source_ref) = if let Some(ticker) = stock.ticker.clone() {
+        (ticker, "stock.snapshot")
+    } else if let Some(symbol) = static_item.and_then(|item| item.symbol.clone()) {
+        (display_symbol_base(&symbol), "static.search")
+    } else {
+        (candidate.symbol.clone(), "search.global")
+    };
+    let (display_symbol, display_symbol_source_ref) = static_item
+        .and_then(|item| item.symbol.clone())
+        .map_or_else(
+            || (candidate.display_symbol.clone(), "search.global"),
+            |symbol| (symbol, "static.search"),
+        );
+    let currency = if let Some(currency) = candidate.currency.clone() {
+        Some((currency, "search.global"))
+    } else if let Some(currency) = static_item.and_then(|item| item.currency_cd.clone()) {
+        Some((currency, "static.search"))
+    } else {
+        stock
+            .price_currency
+            .clone()
+            .map(|currency| (currency, "stock.snapshot"))
+    };
 
     let asset = MarketAssetIdentity {
         identifier: params.identifier.clone(),
@@ -937,10 +974,8 @@ pub(crate) fn to_stock_asset_details(
             captured_at,
         ),
         name: Some(text_field(
-            static_item
-                .and_then(|item| item.description.clone())
-                .unwrap_or_else(|| candidate.name.clone()),
-            "static.search",
+            name,
+            name_source_ref,
             captured_at,
             fineco_ipc::MarketConfidence::High,
         )),
@@ -953,49 +988,31 @@ pub(crate) fn to_stock_asset_details(
             )
         }),
         venue: text_field(
-            static_item
-                .and_then(|item| item.venue_system.clone())
-                .or_else(|| stock.exchange.clone())
-                .unwrap_or_else(|| candidate.venue.clone()),
-            "search.global",
+            venue,
+            venue_source_ref,
             captured_at,
             fineco_ipc::MarketConfidence::High,
         ),
         symbol: text_field(
-            stock
-                .ticker
-                .clone()
-                .or_else(|| {
-                    static_item
-                        .and_then(|item| item.symbol.clone())
-                        .map(|symbol| display_symbol_base(&symbol))
-                })
-                .unwrap_or_else(|| candidate.symbol.clone()),
-            "stock.snapshot",
+            symbol,
+            symbol_source_ref,
             captured_at,
             fineco_ipc::MarketConfidence::High,
         ),
         display_symbol: Some(text_field(
-            static_item
-                .and_then(|item| item.symbol.clone())
-                .unwrap_or_else(|| candidate.display_symbol.clone()),
-            "static.search",
+            display_symbol,
+            display_symbol_source_ref,
             captured_at,
             fineco_ipc::MarketConfidence::Medium,
         )),
-        currency: candidate
-            .currency
-            .clone()
-            .or_else(|| static_item.and_then(|item| item.currency_cd.clone()))
-            .or_else(|| stock.price_currency.clone())
-            .map(|currency| {
-                text_field(
-                    currency,
-                    "stock.snapshot",
-                    captured_at,
-                    fineco_ipc::MarketConfidence::High,
-                )
-            }),
+        currency: currency.map(|(currency, source_ref)| {
+            text_field(
+                currency,
+                source_ref,
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            )
+        }),
     };
 
     let mut sections = MarketAssetSections::default();
@@ -2708,6 +2725,32 @@ mod tests {
         .expect("display-symbol stock snapshot should match");
 
         assert_eq!(result.asset.symbol.value, "AAPL.O");
+    }
+
+    #[test]
+    fn stock_details_currency_fallback_uses_search_source_ref() {
+        let candidate = stock_candidate();
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "NASDAQ/AAPL".to_string(),
+                expected_isin: Some("US0378331005".to_string()),
+                sections: None,
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: StaticSearchResponse::new(),
+                snapshot_response: None,
+                stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
+                    .expect("stock snapshot"),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("stock details");
+
+        let currency = result.asset.currency.expect("currency");
+        assert_eq!(currency.value, "USD");
+        assert_eq!(currency.source_ref, "search.global");
     }
 
     #[test]
