@@ -44,14 +44,16 @@ ssh root@<proxmox> 'pct exec <ctid> -- systemctl restart fineco-store-server fin
 
 ## Process topology
 
-The cached-read deployment is **two processes / two users / one socket**; **M8
-live refresh** adds a third process + two more sockets, splitting into the plan's
+The cached-read deployment is **two processes / two users / one socket**; **M8+
+live refresh + authenticated market reads** add a third process, two
+live-refresh sockets, and an optional authenticated market-control socket,
+splitting into the plan's
 **three users / three IPC groups** (the controller runs inside the store-server,
 so the plan's `fineco-store` + `fineco-refresh` collapse to one process/user):
 
 | Process | Unit | User | Network | Reaches |
 | --- | --- | --- | --- | --- |
-| store-server (DB + query + **controller**) | `fineco-store-server.service` | `fineco-store` | none (`AF_UNIX`) | owns the SQLite store; serves `snapshot-query.sock` + (M8) `refresh-control.sock`; clients `fineco-live.sock` |
+| store-server (DB + query + **controller**) | `fineco-store-server.service` | `fineco-store` | none (`AF_UNIX`) | owns the SQLite store; serves `snapshot-query.sock` + `refresh-control.sock` + optional `market-control.sock`; clients `fineco-live.sock` |
 | owner MCP gateway | `fineco-gateway.service` | `fineco-gateway` | yes | the sockets only (no DB, no credentials, **no live socket**); binds `127.0.0.1` only |
 | private Fineco worker (M8) | `fineco-private-worker.service` | `fineco-worker` | yes (Fineco) | holds the Fineco credentials; serves `fineco-live.sock`; **no DB** |
 
@@ -65,6 +67,7 @@ is **live** (M6, below).
 | --- | --- | --- | --- |
 | `snapshot-query.sock` | `/run/fineco-helper` | `fineco-store:fineco-ipc-store` | gateway |
 | `refresh-control.sock` | `/run/fineco-helper-refresh` | `fineco-store:fineco-ipc-refresh` | gateway (live refresh) |
+| `market-control.sock` | `/run/fineco-helper-refresh` | `fineco-store:fineco-ipc-refresh` | gateway (authenticated market reads) |
 | `fineco-live.sock` | `/run/fineco-worker` | `fineco-worker:fineco-ipc-live` | store-server (controller) |
 
 The internet-facing gateway joins `fineco-ipc-store` + `fineco-ipc-refresh` but
@@ -135,7 +138,7 @@ install -Dm0644 deploy/systemd/fineco-private-worker.service /etc/systemd/system
 # fails closed and will not start.
 install -Dm0644 deploy/systemd/fineco-gateway.service.d/override.conf /etc/systemd/system/fineco-gateway.service.d/override.conf
 install -Dm0644 deploy/systemd/cloudflared.service          /etc/systemd/system/cloudflared.service
-# The per-socket setgid runtime dirs (snapshot-query / refresh-control / live):
+# The per-socket setgid runtime dirs (snapshot-query / refresh+market-control / live):
 install -Dm0644 deploy/tmpfiles.d/fineco-helper.conf /etc/tmpfiles.d/fineco-helper.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/fineco-helper.conf                    # needs the users/groups above to exist
 install -d -m0700 -o fineco-store -g fineco-store /var/lib/fineco-helper        # DB dir (owner fineco-store; the worker has NO access)
@@ -164,7 +167,10 @@ systemctl enable --now fineco-private-worker.service                            
 The capability policy (`/etc/fineco/policy.json`) is **required** — both roles
 fail closed without it. Grant `owner` only the capabilities for the tools you
 expose (`market.read`, `portfolio.cached.full_read`, `portfolio.shareable.read`,
-`orders.cached.read`, `tax.cached.read`); `*.live.refresh` arrives in M8.
+`orders.cached.read`, `tax.cached.read`). Keep `market.authenticated.read`
+ungranted until the market live-session gate has been reviewed clean and the
+owner intentionally wants on-demand authenticated Fineco market reads.
+`*.live.refresh` stays grant-only-if-needed.
 
 > Order matters: the gateway and cloudflared each need their `/etc/fineco/`
 > EnvironmentFiles present before `enable --now` — the gateway refuses to start
@@ -190,6 +196,16 @@ The gateway drop-in
 ([`deploy/systemd/fineco-gateway.service.d/override.conf`](../deploy/systemd/fineco-gateway.service.d/override.conf))
 sets the loopback bind (`127.0.0.1:8799`) and wires `access.env` (required) +
 `enrichment.env` (optional, `-` prefix).
+
+`FINECO_MARKET_CONTROL_SOCKET` is optional and explicit-only. Leave it unset in
+normal deployments until the market live-session gate has been reviewed clean
+and the owner intentionally enables authenticated market reads. When
+enabled, set it on both gateway and store-server to a
+controller-owned socket such as `/run/fineco-helper-refresh/market-control.sock`;
+it uses the same `fineco-ipc-refresh` group and socket mode. In the current
+controller topology it is valid only when `FINECO_REFRESH_SOCKET` and
+`FINECO_LIVE_SOCKET` are also configured; market-control is served by the same
+controller block as refresh-control.
 
 > **Do not set `FINECO_ETF_URL` in production.** The zero-commission ETF list
 > defaults to its fixed public Fineco endpoint, baked into the binary. The
@@ -355,7 +371,9 @@ loopback-only with no auth):
 - `FINECO_CONNECTOR_TOOLS` (optional, **requires an email/OAuth pin** —
   `FINECO_OWNER_EMAIL`) — the connector (email/OAuth) channel's tool allowlist; the
   CLI (service-token) channel is always full. Unset = the default (every tool except
-  the four detailed-portfolio absolute-€ tools); `*`/`all` = no restriction; a comma
+  the four detailed-portfolio absolute-€ tools plus `market_search_asset` and
+  `market_get_asset_details`);
+  `*`/`all` = no restriction; a comma
   list = exactly those tools. Unknown names fail closed; setting it without an email
   pin errors. Applies to any email-pinned deployment (incl. single-email-pin), not
   only dual-pin. See [CONNECTORS.md](CONNECTORS.md).
@@ -466,12 +484,12 @@ The plan's *Observability → Minimum alerts* (scoped to live refresh) are wired
 since the last run (a journald cursor + last-seen counters under
 `/var/lib/fineco-alert`) and pipes any fired alert — a payload-free one-liner
 (type + count + timestamp) — to the notifier command in `/etc/fineco/alert.env`
-(`FINECO_ALERT_COMMAND`, default `logger -t fineco-alert`). The eight alerts come
-from the gateway audit journal (budget exhausted / repeated `auth_required` /
-circuit opened / refresh spike), the nftables deny **counters** (worker egress deny
-+ gateway egress deny), the worker's `NRestarts` (restart loop), and the
-scheduled-refresh one-shot journal (a failed unattended portfolio refresh) — none
-reads the DB. See
+(`FINECO_ALERT_COMMAND`, default `logger -t fineco-alert`). The alerts come from
+the gateway audit journal (live-refresh budget/auth/circuit/spike plus
+authenticated-market auth/upstream/circuit/recovered-session events), the
+nftables deny **counters** (worker egress deny + gateway egress deny), the
+worker's `NRestarts` (restart loop), and the scheduled-refresh one-shot journal
+(a failed unattended portfolio refresh) — none reads the DB. See
 [`docs/LIVE-REFRESH-GATES.md`](LIVE-REFRESH-GATES.md) for the per-alert source map.
 
 ```

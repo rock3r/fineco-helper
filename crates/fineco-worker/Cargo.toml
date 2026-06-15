@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 fineco-core = { path = "../fineco-core" }
+fineco-ipc = { path = "../fineco-ipc" }
 fineco-store = { path = "../fineco-store" }
 fineco-refresh = { path = "../fineco-refresh" }
 # Credentialed HTTP/TLS client (owner-approved: ureq + rustls). serde/serde_json

@@ -1,0 +1,41 @@
+{
+  "Azione": [],
+  "Obbligazione": [],
+  "LevaFissa": [],
+  "Turbo": [],
+  "Knockout": [],
+  "CFD": [],
+  "FxCfd": [],
+  "ETF": [
+    {
+      "d": "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis",
+      "m": "EURONEXTNL",
+      "s": "VHYL.AS",
+      "i": "IE00B8GKDB10",
+      "c": "EUR",
+      "t": "ETF",
+      "lg": "Vanguard"
+    },
+    {
+      "d": "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis",
+      "m": "AFF",
+      "s": "VHYL.MI",
+      "i": "IE00B8GKDB10",
+      "c": "EUR",
+      "t": "ETF",
+      "lg": "Vanguard"
+    }
+  ],
+  "resultCounter": [
+    {
+      "Azione": 0,
+      "Obbligazione": 0,
+      "LevaFissa": 0,
+      "Turbo": 0,
+      "Knockout": 0,
+      "CFD": 0,
+      "FxCfd": 0,
+      "ETF": 2
+    }
+  ]
+}

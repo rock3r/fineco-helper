@@ -31,6 +31,65 @@ fn named_constructors_are_stable() {
     assert_eq!(r.code(), "already_refreshing");
     assert_eq!(r.class(), ErrorClass::Conflict);
     assert!(r.retryable());
+
+    let m = SafeError::market_circuit_open();
+    assert_eq!(m.code(), "market_circuit_open");
+    assert_eq!(m.class(), ErrorClass::Upstream);
+    assert!(m.retryable());
+
+    let not_found = SafeError::market_not_found();
+    assert_eq!(not_found.code(), "market_not_found");
+    assert_eq!(not_found.class(), ErrorClass::NotFound);
+    assert!(!not_found.retryable());
+
+    let ambiguous = SafeError::market_ambiguous_identifier();
+    assert_eq!(ambiguous.code(), "market_ambiguous_identifier");
+    assert_eq!(ambiguous.class(), ErrorClass::Validation);
+    assert!(!ambiguous.retryable());
+    let contextual_ambiguous = SafeError::market_ambiguous_identifier_with_suggestions(&[
+        "AFF/VHYL (IE00B8GKDB10)".to_string(),
+    ]);
+    assert_eq!(contextual_ambiguous.code(), "market_ambiguous_identifier");
+    assert!(
+        contextual_ambiguous
+            .safe_message()
+            .contains("AFF/VHYL (IE00B8GKDB10)")
+    );
+
+    let unsupported = SafeError::market_unsupported_asset_type();
+    assert_eq!(unsupported.code(), "market_unsupported_asset_type");
+    assert_eq!(unsupported.class(), ErrorClass::Validation);
+    assert!(!unsupported.retryable());
+    let contextual_unsupported =
+        SafeError::market_unsupported_asset_type_for("stock", "NASDAQ/AAPL");
+    assert_eq!(
+        contextual_unsupported.code(),
+        "market_unsupported_asset_type"
+    );
+    assert!(
+        contextual_unsupported
+            .safe_message()
+            .contains("NASDAQ/AAPL")
+    );
+}
+
+#[test]
+fn expected_isin_normalization_accepts_plain_and_dotted_suffixes() {
+    assert_eq!(
+        fineco_core::normalize_expected_isin("IE00B8GKDB10").expect("plain isin"),
+        "IE00B8GKDB10"
+    );
+    assert_eq!(
+        fineco_core::normalize_expected_isin("ie00b8gkdb10.aff").expect("dotted isin"),
+        "IE00B8GKDB10"
+    );
+    assert!(fineco_core::normalize_expected_isin("Vanguard").is_err());
+}
+
+#[test]
+fn expected_isin_normalization_rejects_non_numeric_check_digit() {
+    assert!(fineco_core::normalize_expected_isin("IE00B8GKDB1A").is_err());
+    assert!(fineco_core::normalize_expected_isin("IE00B8GKDB1A.AFF").is_err());
 }
 
 #[test]

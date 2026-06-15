@@ -12,8 +12,9 @@ topology:
 - **gateway** — internet-facing (behind Cloudflare Access); Streamable HTTP MCP;
   holds no Fineco credentials, no DB handle to the SQLite file, no live socket.
 - **store-server** — owns the SQLite snapshot-store; answers cached reads on the
-  snapshot-query socket; and (M8) **hosts the refresh controller** on a dedicated
-  `refresh-control.sock`.
+  snapshot-query socket; and (M8+) **hosts the controller** on dedicated
+  `refresh-control.sock` and, only when explicitly configured,
+  `market-control.sock` sockets.
 - **private-worker** (M8) — the credential holder; performs allowlisted Fineco
   reads and serves them on `fineco-live.sock`. Holds **no** DB.
 - Enrichment (third-party stock data) runs in the **gateway/market path**, never
@@ -22,9 +23,13 @@ topology:
 Cached-read deployment = gateway + store-server over the snapshot-query socket
 (no credentials reachable from the gateway). M8 **live refresh** adds the
 private-worker process and the controller (on the store-server) so the chain is
-**gateway → `refresh-control.sock` → controller → `fineco-live.sock` → worker**;
-the gateway never touches `fineco-live.sock`. See the plan's *Single-Owner
-Simplification*, *Local IPC*, and *Process Boundaries* sections.
+**gateway → `refresh-control.sock` → controller → `fineco-live.sock` → worker**.
+Authenticated Fineco market reads use the sibling chain **gateway →
+`market-control.sock` → controller → `fineco-live.sock` → worker**. The gateway
+never touches `fineco-live.sock`; the market-control socket is explicit-only and
+not enabled by the checked-in deployment policy. See the plan's
+*Single-Owner Simplification*,
+*Local IPC*, and *Process Boundaries* sections.
 
 ## Crate / module layout
 
@@ -43,8 +48,11 @@ Product (`crates/`):
   until the M6 authenticated-remote mode); **`store-server`** opens the store and
   answers cached reads on the snapshot-query socket, and — when
   `FINECO_REFRESH_SOCKET` + `FINECO_LIVE_SOCKET` are set (both-or-neither) — also
-  spawns the **refresh controller** (M8, `controller` module) on a second thread
-  serving `refresh-control.sock`; and **`private-worker`** (M8) builds the
+  spawns the **controller** (M8+, `controller` module) on a refresh-control
+  thread and, only when `FINECO_MARKET_CONTROL_SOCKET` is explicitly set, a
+  market-control thread; market-control is not a standalone mode and requires
+  the same refresh-control + fineco-live configuration; and
+  **`private-worker`** (M8) builds the
   credential worker and serves `fineco-live.sock` (`serve_live`), reading its
   Fineco creds from its own env (`FINECO_USER_ID`/`FINECO_PASSWORD`), never the
   config getter. Two auxiliary **one-shot** subcommands round out the binary:
@@ -58,23 +66,34 @@ Product (`crates/`):
   `fineco-gateway` + `fineco-query` + `fineco-ipc` (+ core/market/store) and —
   for the M8 worker/controller roles — `fineco-worker` + `fineco-refresh` +
   `fineco-live` (these enter only the binary, never the gateway crate's closure).
-- **`crates/fineco-helper` → `controller`** (M8) — the **refresh controller**:
+- **`crates/fineco-helper` → `controller`** (M8+) — the **controller**:
   `RefreshController<F>` (generic over the fetcher — the live client in prod, a
   fake in tests; holds the `Store` behind a `Mutex`). `handle()` enforces order
   per request: capability re-check (fail closed, independent of the gateway) →
   bounds re-validate → `refresh_preflight` (cooldown/budget/circuit; denials
-  create **no** `job_runs` row) → `refresh_*` wrapped in `Retrying` (a transient
-  blip is absorbed within one `job_runs` row) → `RefreshOutcome` (op/snapshot
-  **status only**, a row count never a value). `RefreshLimitsByArea::defaults`
-  encodes the plan's per-area rate limits; `default_retry_policy` = 3 tries, 500ms
-  backoff. This glue lives in the binary (not `fineco-refresh`) because it needs
-  the `fineco-live` client, and `fineco-live` already depends on `fineco-refresh`.
+  create **no** `job_runs` row) → one `refresh_*` call → `RefreshOutcome`
+  (op/snapshot **status only**, a row count never a value).
+  `RefreshLimitsByArea::defaults` encodes the plan's per-area rate limits. The
+  controller does not retry refresh by re-entering the live worker, because each
+  worker call can perform a fresh Fineco login and must remain one admitted
+  controller operation. This glue lives in the binary (not `fineco-refresh`) because
+  it needs the `fineco-live` client, and `fineco-live` already depends on
+  `fineco-refresh`.
+  `handle_market_control()` separately re-checks `market.authenticated.read`,
+  validates bounds, and forwards authenticated Fineco market reads to the
+  same live client. Refresh and authenticated-market reads share the
+  controller-local one-in-flight live operation lock so both paths coordinate
+  Fineco logins; authenticated-market reads additionally enforce their own
+  market-only 12 fresh logins/hour budget and 60s fresh-login cooldown, then
+  finalize that gate from the worker's status-only session facts and return
+  normalized market data only.
 - **`crates/fineco-core`** (M2) — the **leaf** shared-types crate (no
   credential/DB/network deps). Holds the **safe error envelope** (`SafeError` /
   `ErrorClass` — boundary errors carry only safe fields) and the **freshness
   model** (`FreshnessState`, `freshness_from_age`, a hand-rolled exact
-  ISO-8601-UTC→epoch parse). Everything depends *down* onto this; it depends on
-  nothing.
+  ISO-8601-UTC→epoch parse), plus the shared provider-text sanitizer used by
+  both external enrichment and authenticated Fineco market parsing. Everything
+  depends *down* onto this; it depends on nothing.
 - **`crates/fineco-store`** (M1) — the local SQLite history store
   (`rusqlite`, `bundled`). Owns the schema + migrations, typed snapshot capture,
   history queries, full/shareable report generation, `job_runs` recording + the
@@ -93,15 +112,15 @@ Product (`crates/`):
   *Data & storage*). Orchestrators `refresh_portfolio`/`refresh_orders`/
   `refresh_tax` (each = one `job_runs` row), the pre-flight gate
   `refresh_preflight` (cooldown / daily budget (UTC day) / circuit breaker — a
-  denial creates no row), and `RetryPolicy`/`with_retry`/`Retrying<F>` (retry a
-  transient upstream/timeout blip — the same `fineco_timeout`/`fineco_upstream_error`
-  codes the breaker keys on, **not** a 429/auth — **inside** one fetch → one row, so
-  a rate-limited bank is never hammered with re-logins).
+  denial creates no row), and retry helpers that remain available to callers that
+  can prove retries do not create extra Fineco logins.
 - **`crates/fineco-worker`** (M3) — the **sole credential holder** and the only
   component that mints/holds a Fineco session cookie and reaches the live Fineco
   endpoints. Logs in and performs allowlisted read-only requests against
   **server-built URLs** (`FinecoEndpoints::production`/`for_base`; no
   client-supplied URL/path): positions summary (impl `PortfolioFetcher`),
+  authenticated global instrument search (impl `MarketSearchLiveFetcher`, returns
+  normalized candidates plus status-only session facts for the controller),
   order-monitor transactions (impl **`RawOrdersFetcher`** → `Vec<RawOrder>`, the
   **raw** `trans_id`; the worker holds **no** DB key, so it never hashes —
   hashing is controller-side; `days ≤ 30` + alphanumeric guards re-validated
@@ -115,11 +134,16 @@ Product (`crates/`):
   **mints synthetic public cookies** (`finecostat`/`XID`/`LBM`/`PORTALSESSIONID`/
   `gdate`/`store-sessionid`/`finecoLogin`) the WAF expects present — random/
   timestamped, non-secret, entropy from `/dev/urandom` (no added dependency) —
-  and the reads replay that jar plus the session. Session is **stateless per
-  call** (login → use on the stack → discard). The Fineco **password and session
-  cookies are zeroized on drop** (`zeroize::Zeroizing`, owner-approved credentialed
+  and the reads replay that jar plus the session. Today the worker remains
+  **stateless across calls** (login → use on the stack → discard), but market
+  live responses already report status-only session facts (`login_performed`,
+  `session_reused`, eviction/recovery flags, optional expiry TTL) across
+  `fineco-live` so controller-side budget/audit can govern future reuse without
+  ever seeing cookies or handles. The Fineco **password and session cookies are
+  zeroized on drop** (`zeroize::Zeroizing`, owner-approved credentialed
   dep), and the agent **ignores proxy env vars** (`.proxy(None)`) so an env-injected
-  proxy can't reroute the credentialed login. Uses `ureq`+rustls. Depends on `fineco-core`, `fineco-store` (the
+  proxy can't reroute the credentialed login. Uses `ureq`+rustls. Depends on
+  `fineco-core`, `fineco-ipc` (market-search types/trait), `fineco-store` (the
   `New*`/`RawOrder` types), `fineco-refresh` (the fetcher traits). No
   payloads/secrets logged; failures map to `SafeError`. Behind the live socket it
   is the server half of `fineco-live` (the binary's `private-worker` role).
@@ -135,13 +159,21 @@ Product (`crates/`):
   **capability model** (`Capability`, versioned `Policy` with structural schema
   validation, `Request::required_capability`, `OWNER_AUTH_ID`). It also owns the
   **generic framing** (`write_message`/`read_message`, reused by `fineco-live`)
-  and (M8) the **refresh-control protocol** — a SECOND, separate protocol for the
-  gateway↔controller path: `RefreshRequest` (command-enum, `deny_unknown_fields`,
-  no forbidden field; bounds reuse `validate_order_request`/`validate_tax_range`),
-  `RefreshOutcome` (op/snapshot **status only** — a row count, never a value),
-  `serve_refresh_blocking`/`RefreshClient`, and the three `*.live.refresh`
-  capabilities (owner-only; audit data class `credentialed_live`). Depends on
-  `fineco-core` (+ `serde`/`serde_json`/`schemars`).
+  and (M8+) the controller protocols: **refresh-control** for live refresh and
+  **market-control** for authenticated Fineco market reads. `RefreshRequest`
+  (command-enum, `deny_unknown_fields`, no forbidden field; bounds reuse
+  `validate_order_request`/`validate_tax_range`), `RefreshOutcome` (op/snapshot
+  **status only** — a row count, never a value), `serve_refresh_blocking`/
+  `RefreshClient`, and the three `*.live.refresh` capabilities (owner-only; audit
+  data class `credentialed_live`) cover refresh.
+  `MarketControlRequest::{MarketSearchAsset,MarketGetAssetDetails}`,
+  `MarketControlClient`, normalized `MarketSearchResult` /
+  `MarketAssetDetailsResult`, status-only
+  `MarketSessionStatus` / `MarketSearchLiveResult` /
+  `MarketAssetDetailsLiveResult`,
+  and `market.authenticated.read` (audit data class `authenticated_market`) cover
+  Fineco search/details. Depends on `fineco-core`
+  (+ `serde`/`serde_json`/`schemars`).
 - **`crates/fineco-live`** (M8) — the **credentialed-boundary protocol** over
   `fineco-live.sock`, between the no-DB private worker (server) and the refresh
   controller (client), reusing `fineco-ipc`'s generic framing. `LiveRequest`/
@@ -149,8 +181,11 @@ Product (`crates/`):
   forbidden field); `handle_live_request` + `serve_live_blocking` (the worker
   server, re-validates structurally + via the fetchers' bounds); and `LiveClient`
   (the controller client) which impls `PortfolioFetcher`/`OrdersFetcher`/
-  `TaxFetcher` — for orders it hashes the worker's `RawOrder`s into store-ready
-  `NewOrder`s with the passed store's key. A worker `SafeErrorDto` is rebuilt to a
+  `TaxFetcher`/`MarketSearchLiveFetcher`/`MarketAssetDetailsLiveFetcher` — for orders it hashes the worker's
+  `RawOrder`s into store-ready `NewOrder`s with the passed store's key, and for
+  authenticated market reads it carries status-only session lifecycle facts
+  alongside the normalized result. A worker
+  `SafeErrorDto` is rebuilt to a
   `SafeError` via the canonical constructors (`safe_error_from_dto`), preserving
   `retryable`/`code` for the controller's retry+circuit logic without a public
   arbitrary-text `SafeError` constructor. Depends on `fineco-core` + `fineco-store`
@@ -175,11 +210,19 @@ Product (`crates/`):
   `private_*_refresh_live_sensitive` tools by forwarding a `RefreshRequest` over
   **`refresh-control.sock`** (cap authorize → gateway-side bounds → `spawn_blocking`
   → audit; reply is op/snapshot status only); `None` → a safe "not configured"
-  error. The gateway has **no** `fineco-live` client — it cannot reach the live
-  socket by any path. Depends on `fineco-core` + `fineco-ipc` + `fineco-market` +
+  error. It also holds an `Option<Arc<MarketControlClient>>` and serves
+  authenticated market tools by forwarding a `MarketControlRequest` over
+  **`market-control.sock`** for `market_search_asset` and
+  `market_get_asset_details`; these require `market.authenticated.read` and are
+  hidden from connector defaults. The checked-in deployment policy intentionally
+  leaves that capability ungranted until market live-session gates are complete.
+  Market-control audit logs include only status metadata (login/session booleans),
+  never cookies or session handles. The gateway has **no** `fineco-live` client —
+  it cannot reach the live socket by any path. Depends on `fineco-core` + `fineco-ipc` + `fineco-market` +
   `rmcp` — **never** `fineco-store`/`fineco-worker`/`fineco-live` (enforced
-  structurally; see below). Tool surface: the 12 cached + market tools plus (M8)
-  the 3 live-refresh tools; `portfolio_get_charts` stays **deferred** (no
+  structurally; see below). Tool surface: 17 read-only tools (cached reads,
+  credential-free market reads, authenticated Fineco market reads, and the 3
+  live-refresh tools); `portfolio_get_charts` stays **deferred** (no
   chart/time-series data is captured yet — the store holds
   snapshots/positions/orders/tax only).
 - **`crates/fineco-market`** (M3) — **credential-free** market path: stock
@@ -257,7 +300,7 @@ As-built edges (M4, extended at M8):
 - `fineco-store` → `fineco-core`. `fineco-refresh` → `fineco-core` +
   `fineco-store` (credential-free; the fetcher is injected).
 - `fineco-worker` (the **only** credential holder) → `fineco-core` +
-  `fineco-store` + `fineco-refresh`. It is the single crate pulling the
+  `fineco-ipc` + `fineco-store` + `fineco-refresh`. It is the single crate pulling the
   credentialed HTTP client; only `fineco-helper` (the `private-worker` role) and
   `fineco-live`'s server use it — the gateway reaches stored data over the socket,
   never via a dependency.
@@ -272,8 +315,9 @@ As-built edges (M4, extended at M8):
 - `fineco-gateway` → `fineco-core` + `fineco-ipc` + `fineco-market` + `rmcp`.
   It depends on **none** of `fineco-store`/`fineco-worker`/`fineco-live`, so it
   cannot hold a DB handle, credentials, or a live-socket client — it reaches
-  stored data over the snapshot-query socket and live refresh only over
-  `refresh-control.sock`.
+  stored data over `snapshot-query.sock`, live refresh over
+  `refresh-control.sock`, and authenticated market reads over
+  `market-control.sock`.
 - `fineco-helper` (binary) → `fineco-gateway` + `fineco-query` + `fineco-ipc`
   (+ core/market/store) and, for the M8 worker/controller roles, `fineco-worker` +
   `fineco-refresh` + `fineco-live`. It composes the roles into processes; these
@@ -299,16 +343,20 @@ The cached-read deployment runs two processes over one local socket:
   verified-identity→`auth_id` mapping land in M6); the gateway refuses any
   non-loopback bind outright.
 
-**M8 live refresh** adds a third process and two more sockets:
+**M8+ live refresh and authenticated market reads** add a third process, two
+live-refresh sockets, and an optional authenticated market-control socket:
 
 - **private-worker** (`fineco-helper private-worker`) holds the Fineco credentials
   and serves `fineco-live.sock` (the `fineco-live` protocol). No DB, no public
   listener.
-- The **store-server also hosts the refresh controller** (a second accept loop on
-  a second thread, with its own `Store` connection) on `refresh-control.sock`.
+- The **store-server also hosts the controller** (separate accept loops on
+  threads, with its own `Store` connection) on `refresh-control.sock` and,
+  when explicitly configured, `market-control.sock`.
 - The chain is **gateway → `refresh-control.sock` → controller → `fineco-live.sock`
-  → worker**. The gateway joins the refresh path only; it is **never** a client of
-  `fineco-live.sock` (build-time barrier + it holds no `LiveClient`). Each socket
+  → worker** for refresh, and **gateway → `market-control.sock` → controller →
+  `fineco-live.sock` → worker** for authenticated market reads. The gateway joins
+  the controller paths only; it is **never** a client of `fineco-live.sock`
+  (build-time barrier + it holds no `LiveClient`). Each socket
   is prepared/bound/`chmod`-restricted (default `0600`; the multi-user LXC sets
   `0660` + the per-socket IPC group — the gateway is never in `fineco-ipc-live`).
 

@@ -475,9 +475,11 @@ pub fn with_retry<T>(
 }
 
 /// A fetcher decorator that retries the inner fetch on retryable (5xx/timeout)
-/// errors per [`RetryPolicy`], so a transient Fineco blip is absorbed within a
-/// single refresh (one `job_runs` row). Wrap the real worker once in the
-/// controller; it implements whichever fetcher trait(s) the inner type does.
+/// errors per [`RetryPolicy`]. This is safe only for fetchers where retrying the
+/// call does not create an unaccounted fresh Fineco login. Do not wrap
+/// `fineco_live::LiveClient` in the controller unless each worker login attempt
+/// is separately debited/reported, or the retry happens worker-side under one
+/// authenticated session.
 pub struct Retrying<'a, F: ?Sized> {
     inner: &'a F,
     policy: RetryPolicy,
@@ -968,9 +970,9 @@ mod tests {
         assert_eq!(calls.get(), 2, "exactly max_attempts tries");
     }
 
-    /// A portfolio fetcher that fails with a transient timeout `fails` times, then
-    /// succeeds — to prove the Retrying decorator absorbs a transient blip within
-    /// a single refresh (one job_runs row).
+    /// A local fake fetcher that fails with a transient timeout `fails` times,
+    /// then succeeds. It proves the decorator behavior for non-live fetchers; the
+    /// live controller must not use this to hide extra worker logins.
     struct FlakyPortfolio {
         fails_remaining: Cell<u32>,
     }
@@ -985,16 +987,17 @@ mod tests {
     }
 
     #[test]
-    fn retrying_decorator_absorbs_a_transient_failure_in_one_refresh() {
+    fn retrying_decorator_can_wrap_a_local_fetcher() {
         let mut store = Store::open_in_memory().expect("open");
         let flaky = FlakyPortfolio {
             fails_remaining: Cell::new(1),
         };
         let retrying = Retrying::new(&flaky, RetryPolicy::immediate(3));
         let id = refresh_portfolio(&mut store, &retrying, "owner", "2026-01-01T00:00:00Z")
-            .expect("the transient timeout is absorbed");
+            .expect("the local transient timeout is absorbed");
         assert!(id > 0);
-        // Exactly one job_runs row, completed — the retries are inside the one fetch.
+        // Exactly one job_runs row, completed. This assertion is about the local
+        // decorator contract, not the live-controller login budget.
         let job = store
             .latest_job_run("portfolio")
             .expect("q")

@@ -25,15 +25,18 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Client TCP connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A parsed request: method, path, and headers (the body is read off the socket
-/// and discarded). Mocks route on method + path and may inspect headers (e.g.
-/// `Cookie`) to model authentication.
+/// A parsed request: method, path, headers, and a small bounded body. Mocks
+/// route on method + path and may inspect headers/body to model authenticated
+/// Fineco APIs.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
     pub path: String,
     /// Request headers as `(name, value)` pairs, in order, as sent.
     pub headers: Vec<(String, String)>,
+    /// Request body decoded as UTF-8 lossily. Test fixtures only; product code
+    /// never depends on this helper.
+    pub body: String,
 }
 
 impl Request {
@@ -183,6 +186,15 @@ fn handle_connection(
     let response = match parse_request_line(&request_line) {
         Some(mut req) if saw_blank => {
             req.headers = headers;
+            let content_length = req
+                .header("Content-Length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if content_length > 0 {
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body)?;
+                req.body = String::from_utf8_lossy(&body).into_owned();
+            }
             handler(&req)
         }
         _ => Response::text(400, "bad request"),
@@ -209,6 +221,7 @@ fn parse_request_line(line: &str) -> Option<Request> {
         method: method.to_string(),
         path: path.to_string(),
         headers: Vec::new(),
+        body: String::new(),
     })
 }
 

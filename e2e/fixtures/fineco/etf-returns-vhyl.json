@@ -1,0 +1,30 @@
+{
+  "etfetcs": [
+    {
+      "id": "IE00B8GKDB10.AFF",
+      "ticker": "VHYL",
+      "venueSystem": "AFF",
+      "returnsCumulativeDayEnd": {
+        "currencyId": "EUR",
+        "date": "2026-06-12T00:00:00",
+        "returnD1": 1.488324,
+        "returnW1": 1.228564,
+        "returnM1": 4.546656,
+        "returnM12": 26.858085
+      },
+      "returnsAnnual": {
+        "currencyId": "EUR",
+        "returnHPS": [
+          { "value": 12.76424, "date": "2025-12-31T00:00:00" },
+          { "value": 16.23437, "date": "2024-12-31T00:00:00" }
+        ]
+      },
+      "returnsQuarterly": {
+        "currencyId": "EUR",
+        "returnHPS": [
+          { "value": 5.40366, "date": "2026-03-31T00:00:00" }
+        ]
+      }
+    }
+  ]
+}

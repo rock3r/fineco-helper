@@ -5,12 +5,12 @@
 //! credentials and never reaches an authenticated Fineco endpoint. Nothing here
 //! logs URLs, bodies, or responses; failures map to a [`SafeError`] envelope.
 
-use fineco_core::SafeError;
+use fineco_core::{SafeError, sanitize_text};
 use serde::{Deserialize, Serialize};
 use ureq::Agent;
 
 use crate::build_enrichment_report;
-use crate::report::{EnrichmentReport, normalize_expected_isin, sanitize_text};
+use crate::report::{EnrichmentReport, normalize_expected_isin};
 use crate::source::{EnrichmentHostAllowlist, validate_fetch_target};
 
 /// Cap the enrichment page read at the network layer (matches the parser's page

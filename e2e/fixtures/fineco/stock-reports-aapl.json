@@ -1,0 +1,35 @@
+{
+  "instrument": "US0378331005.NASDAQ",
+  "fundamentalReports": {
+    "ratios": {
+      "latestAvailableDate": "2026-03-28",
+      "group": [
+        {
+          "id": "Price and Volume",
+          "ratio": [
+            {
+              "fieldName": "NPRICE",
+              "type": "N",
+              "value": 291.13
+            },
+            {
+              "fieldName": "PDATE",
+              "type": "D",
+              "date": "2026-06-12"
+            }
+          ]
+        },
+        {
+          "id": "Profitability",
+          "ratio": [
+            {
+              "fieldName": "ROE",
+              "type": "N",
+              "value": 140.9
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

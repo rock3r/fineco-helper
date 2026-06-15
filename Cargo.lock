@@ -481,6 +481,7 @@ name = "fineco-worker"
 version = "0.0.0"
 dependencies = [
  "fineco-core",
+ "fineco-ipc",
  "fineco-refresh",
  "fineco-store",
  "httptiny",

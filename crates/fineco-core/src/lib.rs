@@ -8,11 +8,13 @@
 //! And Audit".)
 
 mod freshness;
+mod text;
 mod transport;
 pub use freshness::{
     FreshnessState, epoch_to_iso8601_utc, freshness_from_age, now_epoch_seconds, now_iso8601_utc,
     parse_iso8601_utc,
 };
+pub use text::{MAX_TEXT_FIELD_CHARS, sanitize_text, truncate_text};
 pub use transport::is_secure_or_loopback;
 
 /// Coarse classification of an error, used for logging and client handling.
@@ -149,6 +151,157 @@ impl SafeError {
         )
     }
 
+    /// An authenticated market live read would exceed the controller-governed
+    /// Fineco login budget/cooldown/concurrency policy.
+    #[must_use]
+    pub fn market_rate_limited() -> Self {
+        Self::new(
+            "market_rate_limited",
+            ErrorClass::RateLimit,
+            true,
+            "Fineco live-session reads are temporarily rate limited. Try again later.",
+        )
+    }
+
+    /// Fineco authentication/session failed on an authenticated market read.
+    #[must_use]
+    pub fn market_auth_required() -> Self {
+        Self::new(
+            "market_auth_required",
+            ErrorClass::Auth,
+            false,
+            "Fineco authentication is required for this market read.",
+        )
+    }
+
+    /// The authenticated market resolver found no matching Fineco instrument.
+    #[must_use]
+    pub fn market_not_found() -> Self {
+        Self::new(
+            "market_not_found",
+            ErrorClass::NotFound,
+            false,
+            "No matching Fineco market instrument was found.",
+        )
+    }
+
+    /// The authenticated market resolver found multiple plausible instruments.
+    #[must_use]
+    pub fn market_ambiguous_identifier() -> Self {
+        Self::new(
+            "market_ambiguous_identifier",
+            ErrorClass::Validation,
+            false,
+            "The market identifier is ambiguous; use a more specific Fineco venue-qualified identifier.",
+        )
+    }
+
+    /// The authenticated market resolver found multiple plausible instruments,
+    /// with bounded, already-normalized suggestions safe to show to the client.
+    #[must_use]
+    pub fn market_ambiguous_identifier_with_suggestions(suggestions: &[String]) -> Self {
+        if suggestions.is_empty() {
+            return Self::market_ambiguous_identifier();
+        }
+        let context = suggestions
+            .iter()
+            .map(|suggestion| truncate_text(&sanitize_text(suggestion), 120))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::market_ambiguous_identifier_from_safe_message(format!(
+            "The market identifier is ambiguous; use a more specific Fineco venue-qualified identifier. Candidates: {context}."
+        ))
+    }
+
+    /// Rebuild a contextual ambiguity error from an already-safe boundary DTO.
+    /// The text is sanitized and bounded again before it re-enters the envelope.
+    #[must_use]
+    pub fn market_ambiguous_identifier_from_safe_message(safe_message: impl AsRef<str>) -> Self {
+        let message = truncate_text(&sanitize_text(safe_message.as_ref()), 2_000);
+        if message.is_empty() {
+            return Self::market_ambiguous_identifier();
+        }
+        Self::new(
+            "market_ambiguous_identifier",
+            ErrorClass::Validation,
+            false,
+            message,
+        )
+    }
+
+    /// The requested asset type is searchable but not supported by details v0.
+    #[must_use]
+    pub fn market_unsupported_asset_type() -> Self {
+        Self::new(
+            "market_unsupported_asset_type",
+            ErrorClass::Validation,
+            false,
+            "This asset type is not supported by market details yet.",
+        )
+    }
+
+    /// The requested asset type is searchable but not supported by details v0,
+    /// with the resolved identity echoed in a bounded, safe form.
+    #[must_use]
+    pub fn market_unsupported_asset_type_for(asset_type: &str, identifier: &str) -> Self {
+        let asset_type = truncate_text(&sanitize_text(asset_type), 80);
+        let identifier = truncate_text(&sanitize_text(identifier), 120);
+        Self::market_unsupported_asset_type_from_safe_message(format!(
+            "Market details v0 does not support asset type {asset_type} for {identifier}."
+        ))
+    }
+
+    /// Rebuild a contextual unsupported-type error from an already-safe boundary
+    /// DTO. The text is sanitized and bounded again before it re-enters the
+    /// envelope.
+    #[must_use]
+    pub fn market_unsupported_asset_type_from_safe_message(safe_message: impl AsRef<str>) -> Self {
+        let message = truncate_text(&sanitize_text(safe_message.as_ref()), 2_000);
+        if message.is_empty() {
+            return Self::market_unsupported_asset_type();
+        }
+        Self::new(
+            "market_unsupported_asset_type",
+            ErrorClass::Validation,
+            false,
+            message,
+        )
+    }
+
+    /// Fineco returned a retryable upstream failure on an authenticated market read.
+    #[must_use]
+    pub fn market_upstream_failure() -> Self {
+        Self::new(
+            "market_upstream_failure",
+            ErrorClass::Upstream,
+            true,
+            "Authenticated market read failed upstream.",
+        )
+    }
+
+    /// Authenticated market reads are temporarily disabled after repeated
+    /// upstream failures.
+    #[must_use]
+    pub fn market_circuit_open() -> Self {
+        Self::new(
+            "market_circuit_open",
+            ErrorClass::Upstream,
+            true,
+            "Authenticated market reads are temporarily unavailable after repeated upstream failures. Try again later.",
+        )
+    }
+
+    /// Fineco returned an unexpected non-retryable authenticated-market response.
+    #[must_use]
+    pub fn market_unexpected_response() -> Self {
+        Self::new(
+            "market_unexpected_response",
+            ErrorClass::Upstream,
+            false,
+            "Authenticated market read returned an unexpected response.",
+        )
+    }
+
     /// A live refresh was requested again before this data area's cooldown
     /// elapsed; retryable once the cooldown passes.
     #[must_use]
@@ -207,6 +360,18 @@ impl SafeError {
         )
     }
 
+    /// The local controller-to-worker socket failed before a live worker result
+    /// could be observed. This does not prove a Fineco login happened.
+    #[must_use]
+    pub fn live_transport_failure() -> Self {
+        Self::new(
+            "live_transport_failure",
+            ErrorClass::Internal,
+            false,
+            "The live worker transport failed.",
+        )
+    }
+
     /// A validation failure. `safe_message` must be developer-authored and free
     /// of payloads (e.g. `"days must be <= 30"`).
     #[must_use]
@@ -244,6 +409,34 @@ impl SafeError {
             ),
         }
     }
+}
+
+/// Normalize an expected ISIN verifier. Accepts a plain ISIN or a dotted
+/// Fineco/provider suffix (`IE00B8GKDB10.AFF`), returning the uppercase ISIN.
+///
+/// # Errors
+/// [`SafeError::invalid_request`] if the value is not ISIN-shaped after suffix
+/// removal.
+pub fn normalize_expected_isin(expected_isin: &str) -> Result<String, SafeError> {
+    let trimmed = expected_isin.trim();
+    let isin = trimmed.split_once('.').map_or(trimmed, |(isin, _)| isin);
+    let isin = isin.to_ascii_uppercase();
+    if is_isin(&isin) {
+        Ok(isin)
+    } else {
+        Err(SafeError::invalid_request(
+            "expected_isin must be an ISIN, optionally followed by a suffix.",
+        ))
+    }
+}
+
+fn is_isin(value: &str) -> bool {
+    value.len() == 12
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+        && value.chars().take(2).all(|ch| ch.is_ascii_uppercase())
+        && value.chars().last().is_some_and(|ch| ch.is_ascii_digit())
 }
 
 impl std::fmt::Display for SafeError {

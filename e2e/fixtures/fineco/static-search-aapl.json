@@ -1,0 +1,13 @@
+{
+  "US0378331005.NASDAQ": {
+    "instrId": "US0378331005",
+    "venueSystem": "NASDAQ",
+    "description": "APPLE",
+    "symbol": "AAPL.O",
+    "currencyCd": "USD",
+    "issueDate": "30/03/2005",
+    "preferredVenue": "NASDAQ",
+    "newType": "Azione",
+    "instrTyp": "E"
+  }
+}

@@ -19,6 +19,12 @@ pub struct FinecoEndpoints {
     pub(crate) login: String,
     pub(crate) positions_summary: String,
     pub(crate) transactions: String,
+    pub(crate) global_search: String,
+    pub(crate) static_search: String,
+    pub(crate) instruments_snapshot: String,
+    pub(crate) etf_query: String,
+    pub(crate) stock_snapshot: String,
+    pub(crate) stock_reports: String,
     pub(crate) tax_carry_forward: String,
     pub(crate) tax_minus: String,
 }
@@ -35,6 +41,18 @@ impl FinecoEndpoints {
                 "https://private-api.finecobank.com/v1/private/tol/positions/summary?type=sintesi"
                     .to_string(),
             transactions: "https://private-api.finecobank.com/v1/private/tol/transactions"
+                .to_string(),
+            global_search:
+                "https://private-api.finecobank.com/v1/private/tol/stocklists/search/global"
+                    .to_string(),
+            static_search:
+                "https://private-api.finecobank.com/v1/private/tol/instruments/static/search"
+                    .to_string(),
+            instruments_snapshot:
+                "https://private-api.finecobank.com/v1/private/tol/instruments/snapshot".to_string(),
+            etf_query: "https://private-api.finecobank.com/v1/private/tol/etf/query".to_string(),
+            stock_snapshot: "https://private-api.finecobank.com/v1/private/snapshot".to_string(),
+            stock_reports: "https://private-api.finecobank.com/v1/private/snapshot/reports"
                 .to_string(),
             tax_carry_forward:
                 "https://private-api.finecobank.com/v1/private/tax-carry-forward/search".to_string(),
@@ -53,6 +71,12 @@ impl FinecoEndpoints {
             login: format!("{base}/v1/public/authentications/web/login?sca=true"),
             positions_summary: format!("{base}/v1/private/tol/positions/summary?type=sintesi"),
             transactions: format!("{base}/v1/private/tol/transactions"),
+            global_search: format!("{base}/v1/private/tol/stocklists/search/global"),
+            static_search: format!("{base}/v1/private/tol/instruments/static/search"),
+            instruments_snapshot: format!("{base}/v1/private/tol/instruments/snapshot"),
+            etf_query: format!("{base}/v1/private/tol/etf/query"),
+            stock_snapshot: format!("{base}/v1/private/snapshot"),
+            stock_reports: format!("{base}/v1/private/snapshot/reports"),
             tax_carry_forward: format!("{base}/v1/private/tax-carry-forward/search"),
             tax_minus: format!("{base}/v1/private/tax-carry-forward/minus"),
         }

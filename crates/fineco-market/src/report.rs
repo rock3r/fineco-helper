@@ -5,13 +5,13 @@
 //! expected ISIN. All external free text and raw score/metric output is
 //! size-limited and reduced to primitives — never echoed unbounded.
 
-use fineco_core::SafeError;
+use fineco_core::{SafeError, sanitize_text, truncate_text};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 /// Max characters kept for any external free-text string. Shared with the ETF
 /// list path in `client.rs`, which sanitizes its untrusted string fields too.
-pub(crate) const MAX_STR: usize = 4096;
+pub(crate) const MAX_STR: usize = fineco_core::MAX_TEXT_FIELD_CHARS;
 /// Max entries kept from the scores object.
 const MAX_SCORE_ENTRIES: usize = 64;
 /// Max metric entries kept per analysis section (mirrors the TS `slice(0, 16)`).
@@ -301,34 +301,9 @@ fn pick_str(object: &Value, key: &str) -> Option<String> {
 fn clean_value(value: &Value) -> String {
     match value {
         Value::String(s) => sanitize_text(s),
-        Value::Number(n) => truncate(&n.to_string(), MAX_STR),
+        Value::Number(n) => truncate_text(&n.to_string(), MAX_STR),
         Value::Bool(b) => b.to_string(),
         _ => String::new(),
-    }
-}
-
-/// Sanitize an external free-text string before it reaches the model: replace
-/// every control character (newline, tab, NUL, ANSI/ESC, DEL, C1) with a space,
-/// collapse whitespace runs to single spaces, trim, and length-bound. Applied to
-/// every untrusted free-text field — company overview, metric/score keys and
-/// string values, and the public ETF list's string fields — so a hostile
-/// provider cannot smuggle line breaks or escape sequences (a prompt-injection
-/// channel) into a payload returned to the model.
-pub(crate) fn sanitize_text(raw: &str) -> String {
-    let stripped: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate(&collapsed, MAX_STR)
-}
-
-/// Truncate `s` to at most `max` characters (on a char boundary).
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
     }
 }
 
@@ -394,19 +369,10 @@ pub(crate) fn normalize_expected_isin(
     let Some(raw) = expected_isin else {
         return Ok(None);
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if raw.trim().is_empty() {
         return Ok(None);
     }
-    let isin = trimmed.split_once('.').map_or(trimmed, |(isin, _)| isin);
-    let isin = isin.to_ascii_uppercase();
-    if is_isin(&isin) {
-        Ok(Some(isin))
-    } else {
-        Err(SafeError::invalid_request(
-            "expected_isin must be an ISIN, optionally followed by a suffix.",
-        ))
-    }
+    fineco_core::normalize_expected_isin(raw).map(Some)
 }
 
 fn page_isin_for_compare(value: &str) -> Option<String> {

@@ -17,18 +17,59 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fineco_core::{SafeError, validate_order_request, validate_tax_range};
+use fineco_core::{
+    SafeError, normalize_expected_isin, sanitize_text, validate_order_request, validate_tax_range,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 mod capability;
 pub use capability::{AuthIdPolicy, Capability, OWNER_AUTH_ID, Policy};
 
-/// Max length of any client-supplied identifier/query string in a request.
+/// Max length of most client-supplied identifier strings in a request.
 const MAX_PARAM_LEN: usize = 256;
+
+/// Max characters in an authenticated market search query.
+pub const MAX_SEARCH_QUERY_CHARS: usize = 64;
 
 /// Max number of history points a single request may ask for.
 const MAX_HISTORY_LIMIT: u32 = 1000;
+
+/// Max number of Fineco search candidates returned to one market-search call.
+pub const MAX_TOTAL_CANDIDATES: u32 = 30;
+
+/// Max candidate summaries embedded in an ambiguity safe error.
+pub const MAX_AMBIGUITY_SUGGESTIONS: usize = 10;
+
+/// Max number of candidates returned in one search result group.
+pub const MAX_CANDIDATES_PER_GROUP: usize = 10;
+
+/// Max characters in a public market-details identifier (`<venue>/<symbol>`).
+pub const MAX_IDENTIFIER_CHARS: usize = 64;
+
+/// Max number of explicit sections a market-details request may ask for.
+pub const MAX_SECTIONS: usize = 12;
+
+/// Max ETF holdings returned in a details response.
+pub const MAX_HOLDINGS: usize = 25;
+
+/// Max exposure rows returned for any one exposure group.
+pub const MAX_EXPOSURE_ROWS_PER_GROUP: usize = 25;
+
+/// Max return rows returned for one details response.
+pub const MAX_RETURNS_ROWS: usize = 40;
+
+/// Max stock ratio rows returned for one details response.
+pub const MAX_STOCK_RATIOS: usize = 80;
+
+/// Max warnings returned in a details response.
+pub const MAX_WARNINGS: usize = 20;
+
+/// Max source records returned in a details response.
+pub const MAX_SOURCES: usize = 20;
+
+/// Max serialized JSON bytes returned by one market-details response.
+pub const MAX_DETAILS_RESPONSE_BYTES: usize = 98_304;
 
 /// Max framed message size on the socket (bounds memory against a hostile or
 /// buggy peer); applies to both requests and replies.
@@ -141,6 +182,697 @@ pub struct MarketEnrichmentParams {
     pub identifier: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_isin: Option<String>,
+}
+
+/// Fineco asset groups normalized from the authenticated instrument search.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketAssetType {
+    Stock,
+    Etf,
+    Bond,
+    Cfd,
+    FixedLeverage,
+    Turbo,
+    Knockout,
+    FxCfd,
+    Unknown,
+}
+
+impl MarketAssetType {
+    /// Stable lowercase label used in normalized JSON and safe error context.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketAssetType::Stock => "stock",
+            MarketAssetType::Etf => "etf",
+            MarketAssetType::Bond => "bond",
+            MarketAssetType::Cfd => "cfd",
+            MarketAssetType::FixedLeverage => "fixed_leverage",
+            MarketAssetType::Turbo => "turbo",
+            MarketAssetType::Knockout => "knockout",
+            MarketAssetType::FxCfd => "fx_cfd",
+            MarketAssetType::Unknown => "unknown",
+        }
+    }
+}
+
+/// Parameters for `market_search_asset`: a free-text ticker/name/ISIN query,
+/// optional asset-type filter, and bounded candidate limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MarketSearchParams {
+    pub query: String,
+    #[serde(rename = "type")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_type: Option<MarketAssetType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One normalized instrument candidate from Fineco search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketSearchCandidate {
+    /// Non-secret Fineco lookup key (`instr_id.venue`), useful for follow-up tools.
+    pub fineco_key: String,
+    /// Public follow-up identifier in the approved `<fineco_venue>/<symbol>` form.
+    pub identifier: String,
+    pub name: String,
+    pub venue: String,
+    /// Symbol base without Fineco's display suffix where one is present.
+    pub symbol: String,
+    /// Fineco display symbol, such as `VHYL.MI`, `VHYL.AS`, or `AAPL.O`.
+    pub display_symbol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(rename = "type")]
+    pub asset_type: MarketAssetType,
+    /// Fineco's own "best execution"/preferred marker when present.
+    pub preferred: bool,
+}
+
+/// Search candidates grouped by normalized asset type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketSearchGroup {
+    #[serde(rename = "type")]
+    pub asset_type: MarketAssetType,
+    pub result_count: usize,
+    pub candidates: Vec<MarketSearchCandidate>,
+}
+
+/// Authenticated Fineco search result. `captured_at` is fetch time, not a
+/// provider-reported quote/NAV timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketSearchResult {
+    pub query: String,
+    pub data_class: String,
+    pub source: String,
+    pub captured_at: String,
+    pub groups: Vec<MarketSearchGroup>,
+}
+
+/// Optional sections for `market_get_asset_details`. Defaults are selected by
+/// the controller/worker; heavy sections are returned only when explicitly
+/// requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketDetailsSection {
+    Identity,
+    Listing,
+    Quote,
+    Profile,
+    Etf,
+    Stock,
+    Holdings,
+    Exposures,
+    Returns,
+    Risk,
+    Ratios,
+    Chart,
+    Events,
+    News,
+    Similar,
+    ExternalEnrichment,
+}
+
+/// Parameters for `market_get_asset_details`: a venue-qualified public
+/// identifier, optional ISIN verifier, and an optional bounded section set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MarketDetailsParams {
+    pub identifier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_isin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<MarketDetailsSection>>,
+}
+
+/// Field-level confidence label for normalized market details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+/// A normalized provider field with source and freshness provenance. `as_of` is
+/// the provider-reported datum timestamp when present; `captured_at` is this
+/// service's fetch time and is never used as a silent substitute.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketField<T> {
+    pub value: T,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    pub source: String,
+    pub data_class: String,
+    pub source_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    pub captured_at: String,
+    pub confidence: MarketConfidence,
+}
+
+impl<T> MarketField<T> {
+    #[must_use]
+    pub fn high(
+        value: T,
+        unit: Option<&str>,
+        source: &str,
+        data_class: &str,
+        source_ref: &str,
+        as_of: Option<&str>,
+        captured_at: &str,
+    ) -> Self {
+        Self {
+            value,
+            unit: sanitize_optional_metadata(unit),
+            source: source.to_string(),
+            data_class: data_class.to_string(),
+            source_ref: source_ref.to_string(),
+            as_of: sanitize_optional_metadata(as_of),
+            captured_at: captured_at.to_string(),
+            confidence: MarketConfidence::High,
+        }
+    }
+
+    #[must_use]
+    pub fn medium(
+        value: T,
+        unit: Option<&str>,
+        source: &str,
+        data_class: &str,
+        source_ref: &str,
+        as_of: Option<&str>,
+        captured_at: &str,
+    ) -> Self {
+        Self {
+            value,
+            unit: sanitize_optional_metadata(unit),
+            source: source.to_string(),
+            data_class: data_class.to_string(),
+            source_ref: source_ref.to_string(),
+            as_of: sanitize_optional_metadata(as_of),
+            captured_at: captured_at.to_string(),
+            confidence: MarketConfidence::Medium,
+        }
+    }
+
+    #[must_use]
+    pub fn low(
+        value: T,
+        unit: Option<&str>,
+        source: &str,
+        data_class: &str,
+        source_ref: &str,
+        as_of: Option<&str>,
+        captured_at: &str,
+    ) -> Self {
+        Self {
+            value,
+            unit: sanitize_optional_metadata(unit),
+            source: source.to_string(),
+            data_class: data_class.to_string(),
+            source_ref: source_ref.to_string(),
+            as_of: sanitize_optional_metadata(as_of),
+            captured_at: captured_at.to_string(),
+            confidence: MarketConfidence::Low,
+        }
+    }
+}
+
+fn sanitize_optional_metadata(value: Option<&str>) -> Option<String> {
+    value
+        .map(sanitize_text)
+        .filter(|cleaned| !cleaned.is_empty())
+}
+
+impl MarketField<String> {
+    #[must_use]
+    pub fn high_string(
+        value: &str,
+        source: &str,
+        data_class: &str,
+        source_ref: &str,
+        captured_at: &str,
+    ) -> Self {
+        Self::high(
+            value.to_string(),
+            None,
+            source,
+            data_class,
+            source_ref,
+            None,
+            captured_at,
+        )
+    }
+
+    #[must_use]
+    pub fn medium_string(
+        value: &str,
+        source: &str,
+        data_class: &str,
+        source_ref: &str,
+        captured_at: &str,
+    ) -> Self {
+        Self::medium(
+            value.to_string(),
+            None,
+            source,
+            data_class,
+            source_ref,
+            None,
+            captured_at,
+        )
+    }
+}
+
+/// Normalized asset identity returned by `market_get_asset_details`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketAssetIdentity {
+    pub identifier: String,
+    pub fineco_key: MarketField<String>,
+    #[serde(rename = "type")]
+    pub asset_type: MarketField<MarketAssetType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isin: Option<MarketField<String>>,
+    pub venue: MarketField<String>,
+    pub symbol: MarketField<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_symbol: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<MarketField<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketListingSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_date: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_venue: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid_url: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esg_taxonomy: Option<MarketField<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketQuoteSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bid: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_close: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_percent: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<MarketField<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketProfileSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sector: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub industry: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investment_strategy: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inception_date: Option<MarketField<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketEtfSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ongoing_charge: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_fee: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aum: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nav: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ucits: Option<MarketField<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub morningstar_rating: Option<MarketField<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketStockSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_cap: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pe: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eps: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roe: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dividend: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dividend_yield: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_52w_high: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_52w_low: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_1w: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_3m: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_6m: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_1y: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_price: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation_count: Option<MarketField<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketRatio {
+    pub group: MarketField<String>,
+    pub name: MarketField<String>,
+    pub value: MarketField<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketRatiosSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_available_date: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ratios: Vec<MarketRatio>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketHolding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isin: Option<MarketField<String>>,
+    pub name: MarketField<String>,
+    pub weight: MarketField<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketExposure {
+    pub label: MarketField<String>,
+    pub value: MarketField<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketExposuresSection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asset_allocation: Vec<MarketExposure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<MarketExposure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sectors: Vec<MarketExposure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketReturn {
+    pub period: String,
+    pub value: MarketField<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketReturnsSection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cumulative: Vec<MarketReturn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annual: Vec<MarketReturn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarterly: Vec<MarketReturn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketRiskSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard_deviation_m36: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharpe_ratio_m36: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beta_m36: Option<MarketField<f64>>,
+}
+
+/// Normalized details sections. Missing sections mean not requested, not
+/// available, or not applicable; explicit warnings explain important absences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketAssetSections {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing: Option<MarketListingSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<MarketQuoteSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<MarketProfileSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etf: Option<MarketEtfSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stock: Option<MarketStockSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratios: Option<MarketRatiosSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdings: Option<Vec<MarketHolding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposures: Option<MarketExposuresSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<MarketReturnsSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<MarketRiskSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketSource {
+    pub source: String,
+    pub data_class: String,
+    pub source_ref: String,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketWarning {
+    pub code: String,
+    pub message: String,
+}
+
+/// Normalized result for `market_get_asset_details`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketAssetDetailsResult {
+    pub schema_version: u32,
+    pub data_class: String,
+    pub captured_at: String,
+    pub asset: MarketAssetIdentity,
+    pub sections: MarketAssetSections,
+    pub sources: Vec<MarketSource>,
+    pub warnings: Vec<MarketWarning>,
+}
+
+impl MarketAssetDetailsResult {
+    /// Enforce the model-visible details response byte cap after normalization.
+    ///
+    /// # Errors
+    /// [`SafeError::market_unexpected_response`] if the serialized JSON result
+    /// exceeds [`MAX_DETAILS_RESPONSE_BYTES`].
+    pub fn validate_response_size(&self) -> Result<(), SafeError> {
+        let bytes = serde_json::to_vec(self).map_err(|_| SafeError::internal())?;
+        if bytes.len() > MAX_DETAILS_RESPONSE_BYTES {
+            return Err(SafeError::market_unexpected_response());
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated Fineco details result plus status-only worker session facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketAssetDetailsLiveResult {
+    pub result: MarketAssetDetailsResult,
+    pub session: MarketSessionStatus,
+}
+
+/// Status-only Fineco session facts returned by the credentialed worker. This
+/// intentionally carries no cookie values, auth headers, raw `Set-Cookie`, or
+/// reusable session handles.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+pub struct MarketSessionStatus {
+    pub login_performed: bool,
+    pub session_reused: bool,
+    pub session_evicted: bool,
+    pub reused_session_401_recovered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_expires_in_secs: Option<u64>,
+}
+
+impl MarketDetailsParams {
+    /// Validate details request bounds at every boundary.
+    ///
+    /// # Errors
+    /// [`SafeError::invalid_request`] if the identifier/ISIN/sections are
+    /// malformed or out of bounds.
+    pub fn validate(&self) -> Result<(), SafeError> {
+        if self.identifier.chars().count() > MAX_IDENTIFIER_CHARS {
+            return Err(SafeError::invalid_request(
+                "identifier must be at most 64 characters.",
+            ));
+        }
+        validate_market_identifier(&self.identifier)?;
+        if let Some(expected_isin) = &self.expected_isin {
+            normalize_expected_isin(expected_isin)?;
+        }
+        if let Some(sections) = &self.sections
+            && sections.len() > MAX_SECTIONS
+        {
+            return Err(SafeError::invalid_request(
+                "sections must contain at most 12 entries.",
+            ));
+        }
+        if let Some(sections) = &self.sections
+            && sections
+                .iter()
+                .any(|section| !market_details_section_supported_in_v0(*section))
+        {
+            return Err(SafeError::invalid_request(
+                "section is not supported by market details v0.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl MarketSessionStatus {
+    /// Status for the current stateless worker behavior: one fresh login, no
+    /// retained/reused session. Later slices can tighten this to real reuse
+    /// without changing the controller boundary again.
+    #[must_use]
+    pub fn fresh_login() -> Self {
+        Self {
+            login_performed: true,
+            session_reused: false,
+            session_evicted: false,
+            reused_session_401_recovered: false,
+            session_expires_in_secs: None,
+        }
+    }
+}
+
+/// Authenticated market result plus the status-only session lifecycle facts the
+/// controller needs for budgeting/audit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketSearchLiveResult {
+    pub result: MarketSearchResult,
+    pub session: MarketSessionStatus,
+}
+
+/// Authenticated market-data fetches served by the private worker. The gateway
+/// never implements this trait; the controller-side live client does, so
+/// market-control can route through the credentialed boundary.
+pub trait MarketSearchLiveFetcher {
+    /// Search Fineco instruments using the allowlisted authenticated endpoint.
+    ///
+    /// # Errors
+    /// [`SafeError`] on validation/auth/upstream/internal failure.
+    fn fetch_market_search(
+        &self,
+        params: &MarketSearchParams,
+        now_iso: &str,
+    ) -> Result<MarketSearchLiveResult, SafeError>;
+}
+
+/// Authenticated market details fetcher served by the credentialed live worker.
+pub trait MarketAssetDetailsLiveFetcher {
+    /// Resolve and fetch normalized Fineco details for one supported asset.
+    ///
+    /// # Errors
+    /// [`SafeError`] on validation/auth/upstream/internal failure.
+    fn fetch_market_asset_details(
+        &self,
+        params: &MarketDetailsParams,
+        now_iso: &str,
+    ) -> Result<MarketAssetDetailsLiveResult, SafeError>;
+}
+
+impl MarketSearchParams {
+    /// Validate search bounds at every boundary (gateway, controller, worker).
+    ///
+    /// # Errors
+    /// [`SafeError::invalid_request`] if the query is empty/too long or the
+    /// limit is outside `1..=30`.
+    pub fn validate(&self) -> Result<(), SafeError> {
+        if self.query.trim().is_empty() {
+            return Err(SafeError::invalid_request("query must not be empty."));
+        }
+        if self.query.chars().count() > MAX_SEARCH_QUERY_CHARS {
+            return Err(SafeError::invalid_request(
+                "query must be at most 64 characters.",
+            ));
+        }
+        if let Some(limit) = self.limit
+            && (limit == 0 || limit > MAX_TOTAL_CANDIDATES)
+        {
+            return Err(SafeError::invalid_request("limit must be 1..=30."));
+        }
+        Ok(())
+    }
+}
+
+fn validate_market_identifier(identifier: &str) -> Result<(), SafeError> {
+    if identifier.contains("://") {
+        return Err(SafeError::invalid_request(
+            "identifier must be venue-qualified.",
+        ));
+    }
+    let separator_count = identifier
+        .chars()
+        .filter(|ch| matches!(ch, '/' | ':'))
+        .count();
+    if separator_count != 1 {
+        return Err(SafeError::invalid_request(
+            "identifier must be venue-qualified.",
+        ));
+    }
+    let mut parts = identifier.split(['/', ':']);
+    let venue = parts.next().unwrap_or_default();
+    let symbol = parts.next().unwrap_or_default();
+    if venue.is_empty() || symbol.is_empty() {
+        return Err(SafeError::invalid_request(
+            "identifier must be venue-qualified.",
+        ));
+    }
+    Ok(())
+}
+
+fn market_details_section_supported_in_v0(section: MarketDetailsSection) -> bool {
+    matches!(
+        section,
+        MarketDetailsSection::Identity
+            | MarketDetailsSection::Listing
+            | MarketDetailsSection::Quote
+            | MarketDetailsSection::Profile
+            | MarketDetailsSection::Etf
+            | MarketDetailsSection::Stock
+            | MarketDetailsSection::Holdings
+            | MarketDetailsSection::Exposures
+            | MarketDetailsSection::Returns
+            | MarketDetailsSection::Risk
+            | MarketDetailsSection::Ratios
+    )
 }
 
 impl Request {
@@ -758,6 +1490,214 @@ impl Client {
     }
 }
 
+// ===== Authenticated market-control protocol (gateway <-> controller) =======
+//
+// A sibling of refresh-control on a controller-owned socket. The gateway may ask
+// for allowlisted authenticated Fineco market data, but still never talks to the
+// credentialed live socket directly.
+
+/// An authenticated market command from the gateway to the controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "command", content = "params", rename_all = "snake_case")]
+pub enum MarketControlRequest {
+    MarketSearchAsset(MarketSearchParams),
+    MarketGetAssetDetails(MarketDetailsParams),
+}
+
+impl MarketControlRequest {
+    /// Parse and fully validate a market-control envelope from JSON.
+    ///
+    /// # Errors
+    /// [`SafeError::invalid_request`] on malformed JSON, unknown fields,
+    /// unknown commands, or out-of-bounds params.
+    pub fn from_json(json: &str) -> Result<Self, SafeError> {
+        let value: serde_json::Value = serde_json::from_str(json)
+            .map_err(|_| SafeError::invalid_request("Request is not valid JSON."))?;
+        validate_envelope_keys(&value)?;
+        let request: MarketControlRequest = serde_json::from_value(value)
+            .map_err(|_| SafeError::invalid_request("Request is not an allowed command."))?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Serialize the request to its JSON envelope.
+    ///
+    /// # Errors
+    /// [`SafeError::internal`] if serialization fails (should not happen).
+    pub fn to_json(&self) -> Result<String, SafeError> {
+        serde_json::to_string(self).map_err(|_| SafeError::internal())
+    }
+
+    /// The capability required for this market-control command.
+    #[must_use]
+    pub fn required_capability(&self) -> Capability {
+        match self {
+            MarketControlRequest::MarketSearchAsset(_)
+            | MarketControlRequest::MarketGetAssetDetails(_) => Capability::MarketAuthenticatedRead,
+        }
+    }
+
+    /// Stable audit tool label.
+    #[must_use]
+    pub fn audit_tool(&self) -> &'static str {
+        match self {
+            MarketControlRequest::MarketSearchAsset(_) => "market_search_asset",
+            MarketControlRequest::MarketGetAssetDetails(_) => "market_get_asset_details",
+        }
+    }
+
+    /// Validate request bounds.
+    ///
+    /// # Errors
+    /// [`SafeError::invalid_request`] on out-of-bounds params.
+    pub fn validate(&self) -> Result<(), SafeError> {
+        match self {
+            MarketControlRequest::MarketSearchAsset(params) => params.validate(),
+            MarketControlRequest::MarketGetAssetDetails(params) => params.validate(),
+        }
+    }
+}
+
+/// A successful market-control result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "result", content = "data", rename_all = "snake_case")]
+pub enum MarketControlOutcome {
+    Search {
+        result: MarketSearchResult,
+        session: MarketSessionStatus,
+    },
+    Details {
+        result: Box<MarketAssetDetailsResult>,
+        session: MarketSessionStatus,
+    },
+}
+
+/// A reply to a [`MarketControlRequest`]: typed outcome or safe error envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "status", content = "body", rename_all = "snake_case")]
+pub enum MarketControlWireReply {
+    Ok(MarketControlOutcome),
+    Err(SafeErrorDto),
+}
+
+impl MarketControlWireReply {
+    /// Build a reply from a handler result.
+    #[must_use]
+    pub fn from_result(result: Result<MarketControlOutcome, SafeError>) -> Self {
+        match result {
+            Ok(outcome) => MarketControlWireReply::Ok(outcome),
+            Err(error) => MarketControlWireReply::Err(SafeErrorDto::from(&error)),
+        }
+    }
+
+    /// Collapse the reply into a `Result`, surfacing the safe error DTO.
+    ///
+    /// # Errors
+    /// Returns the [`SafeErrorDto`] when the reply is the `err` form.
+    pub fn into_result(self) -> Result<MarketControlOutcome, SafeErrorDto> {
+        match self {
+            MarketControlWireReply::Ok(outcome) => Ok(outcome),
+            MarketControlWireReply::Err(error) => Err(error),
+        }
+    }
+}
+
+/// Read timeout for market search replies. The controller's live-client timeout
+/// for search is sized to the worker's bounded retry budget; the gateway timeout
+/// needs extra margin because it starts before the controller begins its own
+/// live-socket wait.
+const MARKET_SEARCH_REPLY_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// Read timeout for market details replies. Details can fan out across retried
+/// authenticated Fineco endpoints; this must exceed the live client details
+/// timeout so the gateway does not fail locally while the controller keeps
+/// spending the login.
+const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(1020);
+
+fn market_reply_timeout_for(request: &MarketControlRequest) -> Duration {
+    match request {
+        MarketControlRequest::MarketSearchAsset(_) => MARKET_SEARCH_REPLY_TIMEOUT,
+        MarketControlRequest::MarketGetAssetDetails(_) => MARKET_DETAILS_REPLY_TIMEOUT,
+    }
+}
+
+/// Serve validated market-control commands on `listener`.
+///
+/// # Errors
+/// Returns an error only if accepting connections fails irrecoverably.
+pub fn serve_market_control_blocking<H>(listener: &UnixListener, handler: H) -> io::Result<()>
+where
+    H: Fn(MarketControlRequest) -> Result<MarketControlOutcome, SafeError>,
+{
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let _ = serve_one_market_control(&mut stream, &handler);
+    }
+    Ok(())
+}
+
+/// Handle exactly one market-control request/reply on `stream`.
+fn serve_one_market_control<H>(stream: &mut UnixStream, handler: &H) -> io::Result<()>
+where
+    H: Fn(MarketControlRequest) -> Result<MarketControlOutcome, SafeError>,
+{
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+    let raw = {
+        let mut reader = DeadlineReader::new(stream, Instant::now() + SOCKET_TIMEOUT);
+        read_frame(&mut reader)?
+    };
+    let validated = std::str::from_utf8(&raw)
+        .map_err(|_| SafeError::invalid_request("Request is not valid UTF-8."))
+        .and_then(MarketControlRequest::from_json);
+    let reply = match validated {
+        Ok(request) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(request))) {
+                Ok(result) => MarketControlWireReply::from_result(result),
+                Err(_) => MarketControlWireReply::Err(SafeErrorDto::from(&SafeError::internal())),
+            }
+        }
+        Err(error) => MarketControlWireReply::Err(SafeErrorDto::from(&error)),
+    };
+    write_message(stream, &reply)
+}
+
+/// A blocking client for the authenticated market-control socket.
+#[derive(Debug, Clone)]
+pub struct MarketControlClient {
+    path: PathBuf,
+}
+
+impl MarketControlClient {
+    /// Target the market-control socket at `path`. No connection until [`call`].
+    ///
+    /// [`call`]: MarketControlClient::call
+    #[must_use]
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Send `request` and return the controller outcome.
+    ///
+    /// # Errors
+    /// The [`SafeErrorDto`] the controller returned, or an `internal` envelope on
+    /// connect/transport failure.
+    pub fn call(
+        &self,
+        request: &MarketControlRequest,
+    ) -> Result<MarketControlOutcome, SafeErrorDto> {
+        let internal = || SafeErrorDto::from(&SafeError::internal());
+        let mut stream = UnixStream::connect(&self.path).map_err(|_| internal())?;
+        let _ = stream.set_read_timeout(Some(market_reply_timeout_for(request)));
+        let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+        write_message(&mut stream, request).map_err(|_| internal())?;
+        let reply: MarketControlWireReply = read_message(&mut stream).map_err(|_| internal())?;
+        reply.into_result()
+    }
+}
+
 // ===== Refresh-control protocol (gateway <-> refresh controller) =============
 //
 // A SECOND, dedicated protocol on its own socket (`refresh-control.sock`), kept
@@ -1019,5 +1959,55 @@ impl RefreshClient {
         write_message(&mut stream, request).map_err(|_| internal())?;
         let reply: RefreshWireReply = read_message(&mut stream).map_err(|_| internal())?;
         reply.into_result()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_field_metadata_is_sanitized() {
+        let field = MarketField::high(
+            42.0,
+            Some(" EUR\n\x1b[31m percent "),
+            "fineco",
+            "authenticated_market",
+            "stock.snapshot",
+            Some(" 2026-06-14\tclose "),
+            "2026-06-15T08:30:00Z",
+        );
+
+        assert_eq!(field.unit.as_deref(), Some("EUR [31m percent"));
+        assert_eq!(field.as_of.as_deref(), Some("2026-06-14 close"));
+    }
+
+    #[test]
+    fn market_details_uses_a_fanout_sized_reply_timeout() {
+        use std::time::Duration;
+
+        let search = MarketControlRequest::MarketSearchAsset(MarketSearchParams {
+            query: "AAPL".to_string(),
+            asset_type: None,
+            limit: None,
+        });
+        let details = MarketControlRequest::MarketGetAssetDetails(MarketDetailsParams {
+            identifier: "NASDAQ/AAPL".to_string(),
+            expected_isin: None,
+            sections: None,
+        });
+
+        assert_eq!(
+            market_reply_timeout_for(&search),
+            MARKET_SEARCH_REPLY_TIMEOUT
+        );
+        assert_eq!(
+            market_reply_timeout_for(&details),
+            MARKET_DETAILS_REPLY_TIMEOUT
+        );
+        assert!(MARKET_SEARCH_REPLY_TIMEOUT > REFRESH_REPLY_TIMEOUT);
+        assert!(MARKET_SEARCH_REPLY_TIMEOUT >= Duration::from_secs(240));
+        assert!(MARKET_DETAILS_REPLY_TIMEOUT > MARKET_SEARCH_REPLY_TIMEOUT);
+        assert!(MARKET_DETAILS_REPLY_TIMEOUT >= Duration::from_secs(1020));
     }
 }

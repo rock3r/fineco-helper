@@ -3,8 +3,9 @@
 //! scoped to live refresh; the *source* map is `docs/LIVE-REFRESH-GATES.md`).
 //!
 //! The real script is run against **stubbed** `nft` / `journalctl` / `systemctl`
-//! so every one of the eight named alerts (incl. gateway egress deny + scheduled
-//! refresh failed) is proven to fire end-to-end into the configured notifier —
+//! so the named live-refresh alerts (incl. gateway egress deny + scheduled
+//! refresh failed) and authenticated-market alerts are proven to fire end-to-end
+//! into the configured notifier —
 //! without needing a real Fineco event on a host. It also
 //! proves the FIRST run only seeds state, the forwarded message is payload-free,
 //! a FAILED delivery does not advance state (at-least-once re-fire), a FAILED
@@ -109,6 +110,8 @@ impl Sandbox {
             .env("FINECO_ALERT_EGRESS_MIN", "1")
             .env("FINECO_ALERT_GATEWAY_EGRESS_MIN", "1")
             .env("FINECO_ALERT_AUTHFAIL_MIN", "2")
+            .env("FINECO_ALERT_MARKET_AUTHFAIL_MIN", "2")
+            .env("FINECO_ALERT_MARKET_UPSTREAM_MIN", "2")
             .env("FINECO_ALERT_SPIKE_MIN", "2")
             .env("FINECO_ALERT_RESTART_MIN", "2")
             .env("STUB_EGRESS", egress)
@@ -150,6 +153,14 @@ const ALL_ALERTS: [&str; 8] = [
     "scheduled portfolio refresh failed",
 ];
 
+const MARKET_AUDIT_WINDOW: &str = "\
+{\"ts\":\"2026-06-14T13:00:00Z\",\"auth_id\":\"owner\",\"tool\":\"market_search_asset\",\"data_class\":\"authenticated_market\",\"outcome\":\"error\",\"error_code\":\"market_auth_required\",\"duration_ms\":2}\n\
+{\"ts\":\"2026-06-14T13:00:01Z\",\"auth_id\":\"owner\",\"tool\":\"market_search_asset\",\"data_class\":\"authenticated_market\",\"outcome\":\"error\",\"error_code\":\"market_auth_required\",\"duration_ms\":2}\n\
+{\"ts\":\"2026-06-14T13:00:02Z\",\"auth_id\":\"owner\",\"tool\":\"market_search_asset\",\"data_class\":\"authenticated_market\",\"outcome\":\"error\",\"error_code\":\"market_upstream_failure\",\"duration_ms\":2}\n\
+{\"ts\":\"2026-06-14T13:00:03Z\",\"auth_id\":\"owner\",\"tool\":\"market_search_asset\",\"data_class\":\"authenticated_market\",\"outcome\":\"error\",\"error_code\":\"fineco_timeout\",\"duration_ms\":2}\n\
+{\"ts\":\"2026-06-14T13:00:04Z\",\"auth_id\":\"owner\",\"tool\":\"market_search_asset\",\"data_class\":\"authenticated_market\",\"outcome\":\"error\",\"error_code\":\"market_circuit_open\",\"duration_ms\":1}\n\
+{\"ts\":\"2026-06-14T13:00:05Z\",\"auth_id\":\"owner\",\"tool\":\"market_search_asset\",\"data_class\":\"authenticated_market\",\"outcome\":\"ok\",\"duration_ms\":4,\"result_count\":1,\"login_performed\":true,\"session_reused\":true,\"reused_session_401_recovered\":true}\n";
+
 #[test]
 fn each_named_live_refresh_alert_fires_and_first_run_only_seeds() {
     let sb = Sandbox::new("fire");
@@ -186,6 +197,46 @@ fn each_named_live_refresh_alert_fires_and_first_run_only_seeds() {
         assert!(
             !out.contains(leaked),
             "the forwarded alert must not echo raw journal field {leaked:?}; sink:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn authenticated_market_alerts_are_scoped_to_market_audit_lines() {
+    let sb = Sandbox::new("market");
+    let sink = sb.root.join("sink.txt");
+    let cmd = format!("cat >> {}", sink.display());
+
+    assert!(sb.run(&cmd, "0", "0", &[]).status.success(), "seed failed");
+    fs::write(&sb.journal, MARKET_AUDIT_WINDOW).expect("write market audit journal");
+
+    let run = sb.run(&cmd, "0", "0", &[]);
+    assert!(
+        run.status.success(),
+        "alert run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let out = fs::read_to_string(&sink).expect("read sink");
+    for needle in [
+        "authenticated-market auth failures",
+        "authenticated-market upstream failures",
+        "authenticated-market circuit breaker opened",
+        "authenticated-market reused session recovered after 401",
+    ] {
+        assert!(
+            out.contains(needle),
+            "expected market alert {needle:?}; sink:\n{out}"
+        );
+    }
+    for leaked in [
+        "data_class",
+        "authenticated_market",
+        "duration_ms",
+        "result_count",
+    ] {
+        assert!(
+            !out.contains(leaked),
+            "the forwarded market alert must not echo raw journal field {leaked:?}; sink:\n{out}"
         );
     }
 }

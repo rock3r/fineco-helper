@@ -36,6 +36,22 @@ pub struct AuditRecord {
     /// Omitted for scalar/per-area reports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_count: Option<usize>,
+    /// Whether the credentialed worker performed a Fineco login during this
+    /// call. Status-only; no cookie/session material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_performed: Option<bool>,
+    /// Whether the credentialed worker reused an existing Fineco session.
+    /// Status-only; no cookie/session material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_reused: Option<bool>,
+    /// Whether the credentialed worker evicted a held Fineco session.
+    /// Status-only; no cookie/session material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_evicted: Option<bool>,
+    /// Whether a stale reused session was repaired by the single allowed
+    /// fresh-login retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused_session_401_recovered: Option<bool>,
 }
 
 impl AuditRecord {

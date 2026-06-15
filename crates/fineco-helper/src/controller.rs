@@ -5,8 +5,8 @@
 //! the shared policy (defense in depth — the gateway checked first); re-validates
 //! the bounded params; runs the pre-flight gate (cooldown / daily budget /
 //! circuit breaker, whose denials create no `job_runs` row); then runs the
-//! refresh against an injected fetcher wrapped in [`Retrying`] (so a transient
-//! Fineco blip is absorbed within one `job_runs` row). It returns
+//! refresh against an injected fetcher exactly once, while sharing the
+//! controller-local in-flight login lock with authenticated market reads. It returns
 //! operation/snapshot **status only** — never the refreshed payload.
 //!
 //! The fetcher is generic: in production it is the
@@ -15,15 +15,49 @@
 //! the `Store` behind a `Mutex` so the (sequential) refresh accept loop can mutate
 //! it while the snapshot-query loop reads the DB over its own connection.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use fineco_core::SafeError;
-use fineco_ipc::{OWNER_AUTH_ID, Policy, RefreshOutcome, RefreshRequest};
+use fineco_core::{SafeError, parse_iso8601_utc};
+use fineco_ipc::{
+    MarketAssetDetailsLiveFetcher, MarketControlOutcome, MarketControlRequest,
+    MarketSearchLiveFetcher, MarketSessionStatus, OWNER_AUTH_ID, Policy, RefreshOutcome,
+    RefreshRequest,
+};
 use fineco_refresh::{
-    OrdersFetcher, PortfolioFetcher, RefreshLimits, RetryPolicy, Retrying, TaxFetcher,
-    refresh_orders, refresh_portfolio, refresh_preflight, refresh_tax,
+    OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher, refresh_orders, refresh_portfolio,
+    refresh_preflight, refresh_tax,
 };
 use fineco_store::Store;
+
+/// Initial market login budget from the authenticated-market plan. Applies to
+/// controller-governed on-demand Fineco market reads, counted per account/hour.
+pub const MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR: u32 = 12;
+
+/// Minimum spacing between controller-admitted fresh Fineco logins for market
+/// reads until cookie-lifetime evidence supports broader session reuse.
+pub const MARKET_LOGIN_MIN_COOLDOWN_SECS: u64 = 60;
+
+/// Market live reads are single-account and login-sensitive, so only one
+/// session operation may run at a time for the account.
+pub const MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT: u32 = 1;
+
+/// A stale reused session may be repaired with at most one fresh login retry.
+pub const MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS: u32 = 1;
+
+/// Cross-call reuse TTL is evidence-gated. `None` means the worker remains
+/// honest/stateless across calls until cookie lifetime metadata is captured.
+pub const MARKET_SESSION_REUSE_TTL_SECS: Option<u64> = None;
+
+/// Open the authenticated-market circuit after this many consecutive
+/// upstream/timeout failures.
+pub const MARKET_CIRCUIT_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Keep the authenticated-market circuit open this many seconds after the most
+/// recent upstream/timeout failure, then allow one half-open probe.
+pub const MARKET_CIRCUIT_COOLDOWN_SECS: u64 = 600;
+
+const MARKET_LOGIN_BUDGET_WINDOW_SECS: i64 = 60 * 60;
 
 /// Per-area live-refresh limits. Defaults follow the plan's "Rate Limits And
 /// Circuit Breakers": tighter cooldown/budget on the heavier areas; a shared
@@ -79,18 +113,6 @@ impl RefreshLimitsByArea {
     }
 }
 
-/// The default per-fetch retry policy: up to 3 attempts with a 500ms base
-/// exponential backoff. Retries happen INSIDE one fetch, so the refresh remains a
-/// single `job_runs` row no matter how many transient tries it took. Only
-/// retryable (5xx/timeout) errors are retried.
-#[must_use]
-pub fn default_retry_policy() -> RetryPolicy {
-    RetryPolicy {
-        max_attempts: 3,
-        backoff_base: std::time::Duration::from_millis(500),
-    }
-}
-
 /// The refresh controller. Generic over the fetcher (the live client in
 /// production, a fake in tests).
 pub struct RefreshController<F> {
@@ -98,7 +120,176 @@ pub struct RefreshController<F> {
     fetcher: F,
     policy: Policy,
     limits: RefreshLimitsByArea,
-    retry: RetryPolicy,
+    live_login_state: Mutex<LiveLoginState>,
+    market_circuit_state: Mutex<MarketCircuitState>,
+}
+
+#[derive(Debug, Default)]
+struct LiveLoginState {
+    in_flight: bool,
+    pending_epoch: Option<i64>,
+    last_login_epoch: Option<i64>,
+    login_attempts: VecDeque<i64>,
+}
+
+impl LiveLoginState {
+    fn admit_refresh_operation(&mut self) -> Result<(), SafeError> {
+        if self.in_flight {
+            return Err(SafeError::already_refreshing());
+        }
+        self.in_flight = true;
+        debug_assert!(self.pending_epoch.is_none());
+        Ok(())
+    }
+
+    fn admit_market_operation(&mut self, now_iso: &str) -> Result<(), SafeError> {
+        let now_epoch = parse_iso8601_utc(now_iso).ok_or_else(SafeError::internal)?;
+        if self.in_flight {
+            return Err(SafeError::market_rate_limited());
+        }
+        if let Some(last_login) = self.last_login_epoch {
+            let age = now_epoch.saturating_sub(last_login);
+            if age
+                < i64::try_from(MARKET_LOGIN_MIN_COOLDOWN_SECS)
+                    .map_err(|_| SafeError::internal())?
+            {
+                return Err(SafeError::market_rate_limited());
+            }
+        }
+        while self.login_attempts.front().is_some_and(|attempt| {
+            now_epoch.saturating_sub(*attempt) >= MARKET_LOGIN_BUDGET_WINDOW_SECS
+        }) {
+            let _ = self.login_attempts.pop_front();
+        }
+        if self.login_attempts.len()
+            >= usize::try_from(MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR)
+                .map_err(|_| SafeError::internal())?
+        {
+            return Err(SafeError::market_rate_limited());
+        }
+        self.in_flight = true;
+        self.pending_epoch = Some(now_epoch);
+        Ok(())
+    }
+
+    fn finish(&mut self, should_record_login: bool) {
+        if should_record_login && let Some(epoch) = self.pending_epoch {
+            self.last_login_epoch = Some(epoch);
+            self.login_attempts.push_back(epoch);
+        }
+        self.in_flight = false;
+        self.pending_epoch = None;
+    }
+}
+
+#[derive(Debug, Default)]
+struct MarketCircuitState {
+    consecutive_upstream_failures: u32,
+    newest_failure_epoch: Option<i64>,
+}
+
+impl MarketCircuitState {
+    fn check_closed(&self, now_iso: &str) -> Result<(), SafeError> {
+        if self.consecutive_upstream_failures < MARKET_CIRCUIT_CONSECUTIVE_FAILURES {
+            return Ok(());
+        }
+        let Some(newest_failure_epoch) = self.newest_failure_epoch else {
+            return Ok(());
+        };
+        let now_epoch = parse_iso8601_utc(now_iso).ok_or_else(SafeError::internal)?;
+        let cooldown =
+            i64::try_from(MARKET_CIRCUIT_COOLDOWN_SECS).map_err(|_| SafeError::internal())?;
+        if now_epoch.saturating_sub(newest_failure_epoch) < cooldown {
+            return Err(SafeError::market_circuit_open());
+        }
+        Ok(())
+    }
+
+    fn record_outcome(
+        &mut self,
+        now_iso: &str,
+        error: Option<&SafeError>,
+    ) -> Result<(), SafeError> {
+        if error.is_some_and(is_market_upstream_failure) {
+            let now_epoch = parse_iso8601_utc(now_iso).ok_or_else(SafeError::internal)?;
+            self.consecutive_upstream_failures =
+                self.consecutive_upstream_failures.saturating_add(1);
+            self.newest_failure_epoch = Some(now_epoch);
+        } else {
+            self.consecutive_upstream_failures = 0;
+            self.newest_failure_epoch = None;
+        }
+        Ok(())
+    }
+}
+
+fn is_market_upstream_failure(error: &SafeError) -> bool {
+    matches!(
+        error.code(),
+        "market_upstream_failure" | "fineco_timeout" | "fineco_upstream_error"
+    )
+}
+
+struct LiveLoginPermit<'a> {
+    state: &'a Mutex<LiveLoginState>,
+    finished: bool,
+}
+
+impl LiveLoginPermit<'_> {
+    fn finish_after_error(self, error: &SafeError) -> Result<(), SafeError> {
+        self.finish_recording(should_record_assumed_fresh_login(error))
+    }
+
+    fn finish_with_session_status(self, session: MarketSessionStatus) -> Result<(), SafeError> {
+        self.finish_recording(session.login_performed || session.reused_session_401_recovered)
+    }
+
+    fn finish_recording(mut self, should_record_login: bool) -> Result<(), SafeError> {
+        self.state
+            .lock()
+            .map_err(|_| SafeError::internal())?
+            .finish(should_record_login);
+        self.finished = true;
+        Ok(())
+    }
+}
+
+fn should_record_assumed_fresh_login(error: &SafeError) -> bool {
+    error.code() != "live_transport_failure"
+}
+
+impl Drop for LiveLoginPermit<'_> {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Ok(mut state) = self.state.lock()
+        {
+            state.finish(false);
+        }
+    }
+}
+
+impl<F> RefreshController<F> {
+    fn begin_refresh_live_operation(&self) -> Result<LiveLoginPermit<'_>, SafeError> {
+        self.live_login_state
+            .lock()
+            .map_err(|_| SafeError::internal())?
+            .admit_refresh_operation()?;
+        Ok(LiveLoginPermit {
+            state: &self.live_login_state,
+            finished: false,
+        })
+    }
+
+    fn begin_market_live_operation(&self, now_iso: &str) -> Result<LiveLoginPermit<'_>, SafeError> {
+        self.live_login_state
+            .lock()
+            .map_err(|_| SafeError::internal())?
+            .admit_market_operation(now_iso)?;
+        Ok(LiveLoginPermit {
+            state: &self.live_login_state,
+            finished: false,
+        })
+    }
 }
 
 impl<F> RefreshController<F>
@@ -107,19 +298,14 @@ where
 {
     /// Build a controller over `store`, sourcing fresh data from `fetcher`.
     #[must_use]
-    pub fn new(
-        store: Store,
-        fetcher: F,
-        policy: Policy,
-        limits: RefreshLimitsByArea,
-        retry: RetryPolicy,
-    ) -> Self {
+    pub fn new(store: Store, fetcher: F, policy: Policy, limits: RefreshLimitsByArea) -> Self {
         Self {
             store: Mutex::new(store),
             fetcher,
             policy,
             limits,
-            retry,
+            live_login_state: Mutex::new(LiveLoginState::default()),
+            market_circuit_state: Mutex::new(MarketCircuitState::default()),
         }
     }
 
@@ -161,56 +347,146 @@ where
         // 3. Pre-flight gate: a denial here creates no job_runs row.
         refresh_preflight(&store, area, &limits, now_iso)?;
 
-        // 4. Run the refresh against the retrying fetcher (one job_runs row).
-        let retrying = Retrying::new(&self.fetcher, self.retry);
-        match &request {
+        // 4. Run the refresh once. Controller-level retries would re-enter the
+        // credentialed worker and may perform multiple Fineco logins under one
+        // admitted live-login permit.
+        let permit = self.begin_refresh_live_operation()?;
+        let result = match &request {
             RefreshRequest::PortfolioRefreshLive => {
-                let snapshot_id = refresh_portfolio(&mut store, &retrying, OWNER_AUTH_ID, now_iso)?;
-                // A row count (positions), never the values. A failure reading it
-                // back right after the capture is a genuine storage error, not an
-                // empty snapshot — surface it rather than masking it as count=0.
-                let count = store
-                    .positions_for_snapshot(snapshot_id)
-                    .map_err(|_| SafeError::internal())?
-                    .len();
-                Ok(RefreshOutcome {
-                    data_area: area.to_string(),
-                    captured_at: now_iso.to_string(),
-                    snapshot_id: Some(snapshot_id),
-                    count,
-                })
+                refresh_portfolio(&mut store, &self.fetcher, OWNER_AUTH_ID, now_iso).and_then(
+                    |snapshot_id| {
+                        // A row count (positions), never the values. A failure reading it
+                        // back right after the capture is a genuine storage error, not an
+                        // empty snapshot — surface it rather than masking it as count=0.
+                        let count = store
+                            .positions_for_snapshot(snapshot_id)
+                            .map_err(|_| SafeError::internal())?
+                            .len();
+                        Ok(RefreshOutcome {
+                            data_area: area.to_string(),
+                            captured_at: now_iso.to_string(),
+                            snapshot_id: Some(snapshot_id),
+                            count,
+                        })
+                    },
+                )
             }
-            RefreshRequest::OrdersRefreshLive(params) => {
-                let count = refresh_orders(
-                    &mut store,
-                    &retrying,
-                    OWNER_AUTH_ID,
-                    &params.instrument_kind,
-                    params.days,
-                    now_iso,
-                )?;
-                Ok(RefreshOutcome {
-                    data_area: area.to_string(),
-                    captured_at: now_iso.to_string(),
-                    snapshot_id: None,
-                    count,
-                })
+            RefreshRequest::OrdersRefreshLive(params) => refresh_orders(
+                &mut store,
+                &self.fetcher,
+                OWNER_AUTH_ID,
+                &params.instrument_kind,
+                params.days,
+                now_iso,
+            )
+            .map(|count| RefreshOutcome {
+                data_area: area.to_string(),
+                captured_at: now_iso.to_string(),
+                snapshot_id: None,
+                count,
+            }),
+            RefreshRequest::TaxRefreshLive(params) => refresh_tax(
+                &mut store,
+                &self.fetcher,
+                OWNER_AUTH_ID,
+                &params.date_from,
+                &params.date_to,
+                now_iso,
+            )
+            .map(|count| RefreshOutcome {
+                data_area: area.to_string(),
+                captured_at: now_iso.to_string(),
+                snapshot_id: None,
+                count,
+            }),
+        };
+        permit.finish_recording(false)?;
+        result
+    }
+}
+
+impl<F> RefreshController<F>
+where
+    F: MarketSearchLiveFetcher + MarketAssetDetailsLiveFetcher,
+{
+    /// Handle one authenticated market-control request, stamping the resulting
+    /// payload with `now_iso`. Capability and bounds are re-checked here even
+    /// though the gateway already checked them.
+    ///
+    /// # Errors
+    /// [`SafeError::invalid_request`] on denied capability or invalid params, or
+    /// the fetcher's safe error on auth/upstream/internal failure.
+    pub fn handle_market_control(
+        &self,
+        request: MarketControlRequest,
+        now_iso: &str,
+    ) -> Result<MarketControlOutcome, SafeError> {
+        if !self
+            .policy
+            .allows(OWNER_AUTH_ID, request.required_capability())
+        {
+            return Err(SafeError::invalid_request(
+                "the configured policy does not permit this market read.",
+            ));
+        }
+        request.validate()?;
+        self.market_circuit_state
+            .lock()
+            .map_err(|_| SafeError::internal())?
+            .check_closed(now_iso)?;
+        let permit = self.begin_market_live_operation(now_iso)?;
+        match request {
+            MarketControlRequest::MarketSearchAsset(params) => {
+                let live = self.fetcher.fetch_market_search(&params, now_iso);
+                match live {
+                    Ok(live) => {
+                        let session = live.session;
+                        permit.finish_with_session_status(session)?;
+                        self.market_circuit_state
+                            .lock()
+                            .map_err(|_| SafeError::internal())?
+                            .record_outcome(now_iso, None)?;
+                        Ok(MarketControlOutcome::Search {
+                            result: live.result,
+                            session,
+                        })
+                    }
+                    Err(error) => {
+                        permit.finish_after_error(&error)?;
+                        self.market_circuit_state
+                            .lock()
+                            .map_err(|_| SafeError::internal())?
+                            .record_outcome(now_iso, Some(&error))?;
+                        Err(error)
+                    }
+                }
             }
-            RefreshRequest::TaxRefreshLive(params) => {
-                let count = refresh_tax(
-                    &mut store,
-                    &retrying,
-                    OWNER_AUTH_ID,
-                    &params.date_from,
-                    &params.date_to,
-                    now_iso,
-                )?;
-                Ok(RefreshOutcome {
-                    data_area: area.to_string(),
-                    captured_at: now_iso.to_string(),
-                    snapshot_id: None,
-                    count,
-                })
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                let live = self.fetcher.fetch_market_asset_details(&params, now_iso);
+                match live {
+                    Ok(live) => {
+                        let session = live.session;
+                        permit.finish_with_session_status(session)?;
+                        let validation = live.result.validate_response_size();
+                        self.market_circuit_state
+                            .lock()
+                            .map_err(|_| SafeError::internal())?
+                            .record_outcome(now_iso, validation.as_ref().err())?;
+                        validation?;
+                        Ok(MarketControlOutcome::Details {
+                            result: Box::new(live.result),
+                            session,
+                        })
+                    }
+                    Err(error) => {
+                        permit.finish_after_error(&error)?;
+                        self.market_circuit_state
+                            .lock()
+                            .map_err(|_| SafeError::internal())?
+                            .record_outcome(now_iso, Some(&error))?;
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -218,10 +494,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{RefreshController, RefreshLimitsByArea};
+    use super::{
+        LiveLoginState, MARKET_CIRCUIT_CONSECUTIVE_FAILURES, MARKET_CIRCUIT_COOLDOWN_SECS,
+        MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR, MARKET_LOGIN_MIN_COOLDOWN_SECS,
+        MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT,
+        MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS, MARKET_SESSION_REUSE_TTL_SECS,
+        RefreshController, RefreshLimitsByArea,
+    };
     use fineco_core::SafeError;
-    use fineco_ipc::{OrdersRefreshParams, Policy, RefreshRequest, TaxRefreshParams};
-    use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RetryPolicy, TaxFetcher};
+    use fineco_ipc::{
+        MarketAssetDetailsLiveResult, MarketAssetDetailsResult, MarketAssetIdentity,
+        MarketAssetSections, MarketAssetType, MarketControlRequest, MarketDetailsParams,
+        MarketField, MarketSearchCandidate, MarketSearchGroup, MarketSearchLiveResult,
+        MarketSearchParams, MarketSearchResult, MarketSessionStatus, OrdersRefreshParams, Policy,
+        RefreshRequest, TaxRefreshParams,
+    };
+    use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher};
     use fineco_store::{
         NewAsset, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward, NewTaxMinusByYear,
         RawOrder, Store,
@@ -231,13 +519,15 @@ mod tests {
     const NOW: &str = "2026-06-05T10:00:00Z";
 
     /// A fake worker the controller drives. Each fetch returns a canned result; a
-    /// `Cell` counts portfolio fetches so a test can prove the retry happens
-    /// inside one refresh.
+    /// `Cell` counts portfolio fetches so tests can prove the controller does not
+    /// re-enter the worker after one admitted live-login operation.
     struct FakeWorker {
         portfolio: Box<dyn Fn() -> Result<NewPortfolioSnapshot, SafeError>>,
         orders: Result<Vec<RawOrder>, SafeError>,
         carry_forward: Result<NewTaxCarryForward, SafeError>,
         minus_by_year: Result<Vec<NewTaxMinusByYear>, SafeError>,
+        market_session: MarketSessionStatus,
+        market_result: Box<dyn Fn() -> Result<(), SafeError>>,
     }
 
     impl FakeWorker {
@@ -255,6 +545,8 @@ mod tests {
                     minus_residue: Some(0.0),
                     expiration_date: None,
                 }]),
+                market_session: MarketSessionStatus::fresh_login(),
+                market_result: Box::new(|| Ok(())),
             }
         }
     }
@@ -294,6 +586,118 @@ mod tests {
         }
         fn fetch_tax_minus_by_year(&self) -> Result<Vec<NewTaxMinusByYear>, SafeError> {
             self.minus_by_year.clone()
+        }
+    }
+
+    impl fineco_ipc::MarketSearchLiveFetcher for FakeWorker {
+        fn fetch_market_search(
+            &self,
+            params: &MarketSearchParams,
+            now_iso: &str,
+        ) -> Result<MarketSearchLiveResult, SafeError> {
+            (self.market_result)()?;
+            Ok(MarketSearchLiveResult {
+                result: MarketSearchResult {
+                    query: params.query.clone(),
+                    data_class: "authenticated_market".to_string(),
+                    source: "fineco.search.global".to_string(),
+                    captured_at: now_iso.to_string(),
+                    groups: vec![MarketSearchGroup {
+                        asset_type: MarketAssetType::Etf,
+                        result_count: 1,
+                        candidates: vec![MarketSearchCandidate {
+                            fineco_key: "IE00B8GKDB10.AFF".to_string(),
+                            identifier: "AFF/VHYL".to_string(),
+                            name: "Vanguard FTSE All-World High Dividend Yield UCITS ETF Dis"
+                                .to_string(),
+                            venue: "AFF".to_string(),
+                            symbol: "VHYL".to_string(),
+                            display_symbol: "VHYL.MI".to_string(),
+                            isin: Some("IE00B8GKDB10".to_string()),
+                            currency: Some("EUR".to_string()),
+                            asset_type: MarketAssetType::Etf,
+                            preferred: true,
+                        }],
+                    }],
+                },
+                session: self.market_session,
+            })
+        }
+    }
+
+    impl fineco_ipc::MarketAssetDetailsLiveFetcher for FakeWorker {
+        fn fetch_market_asset_details(
+            &self,
+            params: &MarketDetailsParams,
+            now_iso: &str,
+        ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
+            (self.market_result)()?;
+            Ok(MarketAssetDetailsLiveResult {
+                result: MarketAssetDetailsResult {
+                    schema_version: 1,
+                    data_class: "authenticated_market".to_string(),
+                    captured_at: now_iso.to_string(),
+                    asset: MarketAssetIdentity {
+                        identifier: params.identifier.clone(),
+                        fineco_key: MarketField::high_string(
+                            "IE00B8GKDB10.AFF",
+                            "fineco",
+                            "authenticated_market",
+                            "search.global",
+                            now_iso,
+                        ),
+                        asset_type: MarketField::high(
+                            MarketAssetType::Etf,
+                            None,
+                            "fineco",
+                            "authenticated_market",
+                            "search.global",
+                            None,
+                            now_iso,
+                        ),
+                        name: None,
+                        isin: Some(MarketField::high_string(
+                            "IE00B8GKDB10",
+                            "fineco",
+                            "authenticated_market",
+                            "search.global",
+                            now_iso,
+                        )),
+                        venue: MarketField::high_string(
+                            "AFF",
+                            "fineco",
+                            "authenticated_market",
+                            "search.global",
+                            now_iso,
+                        ),
+                        symbol: MarketField::medium_string(
+                            "VHYL",
+                            "fineco",
+                            "authenticated_market",
+                            "search.global",
+                            now_iso,
+                        ),
+                        display_symbol: Some(MarketField::medium_string(
+                            "VHYL.MI",
+                            "fineco",
+                            "authenticated_market",
+                            "search.global",
+                            now_iso,
+                        )),
+                        currency: Some(MarketField::high_string(
+                            "EUR",
+                            "fineco",
+                            "authenticated_market",
+                            "search.global",
+                            now_iso,
+                        )),
+                    },
+                    sections: MarketAssetSections::default(),
+                    sources: vec![],
+                    warnings: vec![],
+                },
+                session: self.market_session,
+            })
         }
     }
 
@@ -356,6 +760,21 @@ mod tests {
         .expect("policy")
     }
 
+    fn market_policy() -> Policy {
+        Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":["market.authenticated.read"]}}}"#,
+        )
+        .expect("policy")
+    }
+
+    fn market_search_request() -> MarketControlRequest {
+        MarketControlRequest::MarketSearchAsset(MarketSearchParams {
+            query: "VHYL".to_string(),
+            asset_type: Some(MarketAssetType::Etf),
+            limit: Some(5),
+        })
+    }
+
     fn cached_only_policy() -> Policy {
         Policy::from_json(
             r#"{"version":1,"auth_ids":{"owner":{"capabilities":["portfolio.cached.full_read"]}}}"#,
@@ -369,9 +788,373 @@ mod tests {
             worker,
             policy,
             RefreshLimitsByArea::defaults(),
-            // Immediate (no real sleeps) so retry tests are fast.
-            RetryPolicy::immediate(3),
         )
+    }
+
+    fn controller_with_limits(
+        worker: FakeWorker,
+        policy: Policy,
+        limits: RefreshLimitsByArea,
+    ) -> RefreshController<FakeWorker> {
+        RefreshController::new(
+            Store::open_in_memory().expect("store"),
+            worker,
+            policy,
+            limits,
+        )
+    }
+
+    fn permissive_refresh_limits() -> RefreshLimitsByArea {
+        let area = RefreshLimits {
+            cooldown_secs: 0,
+            daily_budget: MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR + 1,
+            circuit_consecutive_failures: MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR + 1,
+            circuit_cooldown_secs: 0,
+        };
+        RefreshLimitsByArea {
+            portfolio: area,
+            orders: area,
+            tax: area,
+        }
+    }
+
+    #[test]
+    fn market_live_session_defaults_match_the_ratified_plan() {
+        assert_eq!(MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR, 12);
+        assert_eq!(MARKET_LOGIN_MIN_COOLDOWN_SECS, 60);
+        assert_eq!(MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT, 1);
+        assert_eq!(MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS, 1);
+        assert_eq!(MARKET_SESSION_REUSE_TTL_SECS, None);
+        assert_eq!(MARKET_CIRCUIT_CONSECUTIVE_FAILURES, 3);
+        assert_eq!(MARKET_CIRCUIT_COOLDOWN_SECS, 600);
+    }
+
+    #[test]
+    fn refresh_and_market_operations_share_one_in_flight_login_lock() {
+        let mut state = LiveLoginState::default();
+        state
+            .admit_refresh_operation()
+            .expect("refresh admitted first");
+        let err = state
+            .admit_market_operation("2026-06-14T10:00:00Z")
+            .expect_err("market waits while refresh is in flight");
+        assert_eq!(err.code(), "market_rate_limited");
+
+        state.finish(false);
+        state
+            .admit_market_operation("2026-06-14T10:00:00Z")
+            .expect("market admitted first");
+        let err = state
+            .admit_refresh_operation()
+            .expect_err("refresh waits while market is in flight");
+        assert_eq!(err.code(), "already_refreshing");
+    }
+
+    #[test]
+    fn market_search_enforces_the_fresh_login_cooldown() {
+        let ctrl = controller(FakeWorker::ok(), market_policy());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("first search admitted");
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect_err("second fresh login inside cooldown is denied");
+        assert_eq!(err.code(), "market_rate_limited");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:01:00Z")
+            .expect("cooldown boundary is admitted");
+    }
+
+    #[test]
+    fn market_search_reused_session_status_does_not_burn_fresh_login_cooldown() {
+        let mut worker = FakeWorker::ok();
+        worker.market_session = MarketSessionStatus {
+            login_performed: false,
+            session_reused: true,
+            session_evicted: false,
+            reused_session_401_recovered: false,
+            session_expires_in_secs: Some(300),
+        };
+        let ctrl = controller(worker, market_policy());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("reused-session search admitted");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:01Z")
+            .expect("reused session does not burn fresh-login cooldown");
+    }
+
+    #[test]
+    fn market_search_recovered_reused_session_401_burns_fresh_login_cooldown() {
+        let mut worker = FakeWorker::ok();
+        worker.market_session = MarketSessionStatus {
+            login_performed: false,
+            session_reused: true,
+            session_evicted: true,
+            reused_session_401_recovered: true,
+            session_expires_in_secs: None,
+        };
+        let ctrl = controller(worker, market_policy());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("recovered reused-session search admitted");
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect_err("recovered reused-session 401 consumes a fresh-login cooldown slot");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn market_search_enforces_the_hourly_login_budget() {
+        let ctrl = controller(FakeWorker::ok(), market_policy());
+        for minute in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+            let now = format!("2026-06-14T10:{minute:02}:00Z");
+            ctrl.handle_market_control(market_search_request(), &now)
+                .expect("within market login budget");
+        }
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:12:00Z")
+            .expect_err("13th login inside the rolling hour is denied");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn market_search_cooldown_does_not_block_refresh_policy() {
+        let policy = Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
+                "market.authenticated.read","portfolio.live.refresh"]}}}"#,
+        )
+        .expect("policy");
+        let ctrl = controller_with_limits(FakeWorker::ok(), policy, permissive_refresh_limits());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("market search admitted");
+
+        ctrl.handle(RefreshRequest::PortfolioRefreshLive, "2026-06-14T10:00:30Z")
+            .expect("refresh uses its own policy after market search");
+    }
+
+    #[test]
+    fn refresh_does_not_clear_an_active_market_login_cooldown() {
+        let policy = Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
+                "market.authenticated.read","portfolio.live.refresh"]}}}"#,
+        )
+        .expect("policy");
+        let ctrl = controller_with_limits(FakeWorker::ok(), policy, permissive_refresh_limits());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("market search admitted");
+        ctrl.handle(RefreshRequest::PortfolioRefreshLive, "2026-06-14T10:00:30Z")
+            .expect("refresh does not obey market cooldown");
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:45Z")
+            .expect_err("market cooldown still applies after the refresh");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn refresh_does_not_burn_market_login_cooldown() {
+        let policy = Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
+                "market.authenticated.read","portfolio.live.refresh"]}}}"#,
+        )
+        .expect("policy");
+        let ctrl = controller_with_limits(FakeWorker::ok(), policy, permissive_refresh_limits());
+        ctrl.handle(RefreshRequest::PortfolioRefreshLive, "2026-06-14T10:00:00Z")
+            .expect("refresh admitted");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect("refresh login does not burn market cooldown");
+    }
+
+    #[test]
+    fn failed_refresh_does_not_burn_market_login_cooldown() {
+        let policy = Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
+                "market.authenticated.read","portfolio.live.refresh"]}}}"#,
+        )
+        .expect("policy");
+        let mut worker = FakeWorker::ok();
+        worker.portfolio = Box::new(|| Err(SafeError::auth_required()));
+        let ctrl = controller(worker, policy);
+
+        let refresh_err = ctrl
+            .handle(RefreshRequest::PortfolioRefreshLive, "2026-06-14T10:00:00Z")
+            .expect_err("fresh-login refresh failure");
+        assert_eq!(refresh_err.code(), "auth_required");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect("failed refresh login does not burn market cooldown");
+    }
+
+    #[test]
+    fn failed_refreshes_do_not_burn_the_market_hourly_login_budget() {
+        let policy = Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
+                "market.authenticated.read","portfolio.live.refresh"]}}}"#,
+        )
+        .expect("policy");
+        let mut worker = FakeWorker::ok();
+        worker.portfolio = Box::new(|| Err(SafeError::auth_required()));
+        let ctrl = controller_with_limits(worker, policy, permissive_refresh_limits());
+
+        for minute in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+            let now = format!("2026-06-14T10:{minute:02}:00Z");
+            let err = ctrl
+                .handle(RefreshRequest::PortfolioRefreshLive, &now)
+                .expect_err("failed refresh reached Fineco");
+            assert_eq!(err.code(), "auth_required");
+        }
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:12:00Z")
+            .expect("failed refresh logins do not exhaust the market budget");
+    }
+
+    #[test]
+    fn market_search_opens_the_market_circuit_after_repeated_upstream_failures() {
+        let mut worker = FakeWorker::ok();
+        worker.market_result = Box::new(|| Err(SafeError::market_upstream_failure()));
+        let ctrl = controller(worker, market_policy());
+
+        for minute in 0..MARKET_CIRCUIT_CONSECUTIVE_FAILURES {
+            let now = format!("2026-06-14T10:{minute:02}:00Z");
+            let err = ctrl
+                .handle_market_control(market_search_request(), &now)
+                .expect_err("upstream failure reaches Fineco");
+            assert_eq!(err.code(), "market_upstream_failure");
+        }
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:03:00Z")
+            .expect_err("market circuit is open");
+        assert_eq!(err.code(), "market_circuit_open");
+    }
+
+    #[test]
+    fn controller_does_not_retry_the_whole_market_worker_call() {
+        let calls = std::rc::Rc::new(Cell::new(0u32));
+        let calls_in = std::rc::Rc::clone(&calls);
+        let mut worker = FakeWorker::ok();
+        worker.market_result = Box::new(move || {
+            calls_in.set(calls_in.get() + 1);
+            Err(SafeError::market_upstream_failure())
+        });
+        let ctrl = controller(worker, market_policy());
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), NOW)
+            .expect_err("upstream failure propagates");
+
+        assert_eq!(err.code(), "market_upstream_failure");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn market_transport_failure_does_not_burn_fresh_login_cooldown() {
+        let mut worker = FakeWorker::ok();
+        worker.market_result = Box::new(|| Err(SafeError::live_transport_failure()));
+        let ctrl = controller(worker, market_policy());
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect_err("local transport failure");
+        assert_eq!(err.code(), "live_transport_failure");
+
+        let second_err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect_err("worker is still failing, but the login cooldown was not burned");
+        assert_eq!(second_err.code(), "live_transport_failure");
+    }
+
+    #[test]
+    fn market_worker_internal_failure_burns_fresh_login_cooldown() {
+        let mut worker = FakeWorker::ok();
+        worker.market_result = Box::new(|| Err(SafeError::internal()));
+        let ctrl = controller(worker, market_policy());
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect_err("worker-side failure after the live call was admitted");
+        assert_eq!(err.code(), "internal");
+
+        let second_err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect_err("worker internal failure burned the login cooldown");
+        assert_eq!(second_err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn refresh_transport_internal_failure_does_not_burn_market_login_cooldown() {
+        let policy = Policy::from_json(
+            r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
+                "market.authenticated.read","portfolio.live.refresh"]}}}"#,
+        )
+        .expect("policy");
+        let mut worker = FakeWorker::ok();
+        worker.portfolio = Box::new(|| Err(SafeError::internal()));
+        let ctrl = controller(worker, policy);
+
+        let refresh_err = ctrl
+            .handle(RefreshRequest::PortfolioRefreshLive, "2026-06-14T10:00:00Z")
+            .expect_err("local transport failure");
+        assert_eq!(refresh_err.code(), "internal");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect("transport failure did not burn market login cooldown");
+    }
+
+    #[test]
+    fn market_search_circuit_half_opens_after_cooldown_and_closes_on_success() {
+        let mut worker = FakeWorker::ok();
+        let failures_remaining = std::rc::Rc::new(Cell::new(MARKET_CIRCUIT_CONSECUTIVE_FAILURES));
+        let failures_in = std::rc::Rc::clone(&failures_remaining);
+        worker.market_result = Box::new(move || {
+            if failures_in.get() > 0 {
+                failures_in.set(failures_in.get() - 1);
+                Err(SafeError::market_upstream_failure())
+            } else {
+                Ok(())
+            }
+        });
+        let ctrl = controller(worker, market_policy());
+
+        for minute in 0..MARKET_CIRCUIT_CONSECUTIVE_FAILURES {
+            let now = format!("2026-06-14T10:{minute:02}:00Z");
+            let _ = ctrl
+                .handle_market_control(market_search_request(), &now)
+                .expect_err("upstream failure reaches Fineco");
+        }
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:03:00Z")
+            .expect_err("circuit open before cooldown");
+        assert_eq!(err.code(), "market_circuit_open");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:12:00Z")
+            .expect("half-open probe succeeds and closes the circuit");
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:13:00Z")
+            .expect("success cleared the market upstream failure streak");
+    }
+
+    #[test]
+    fn market_auth_failures_do_not_trip_the_upstream_circuit() {
+        let mut worker = FakeWorker::ok();
+        worker.market_result = Box::new(|| Err(SafeError::market_auth_required()));
+        let ctrl = controller(worker, market_policy());
+
+        for minute in 0..MARKET_CIRCUIT_CONSECUTIVE_FAILURES {
+            let now = format!("2026-06-14T10:{minute:02}:00Z");
+            let err = ctrl
+                .handle_market_control(market_search_request(), &now)
+                .expect_err("auth failure reaches Fineco");
+            assert_eq!(err.code(), "market_auth_required");
+        }
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:03:00Z")
+            .expect_err("auth failure does not become circuit-open");
+        assert_eq!(err.code(), "market_auth_required");
     }
 
     #[test]
@@ -408,7 +1191,7 @@ mod tests {
                     date_from: "2026-01-01".to_string(),
                     date_to: "2026-01-31".to_string(),
                 }),
-                NOW,
+                "2026-06-05T10:01:00Z",
             )
             .expect("tax refresh");
         assert_eq!(tax.data_area, "tax");
@@ -454,33 +1237,35 @@ mod tests {
     }
 
     #[test]
-    fn a_transient_timeout_is_absorbed_within_one_refresh() {
-        // Fail once with a retryable timeout, then succeed — the Retrying wrapper
-        // absorbs it within a single job_runs row.
-        let remaining = std::rc::Rc::new(Cell::new(1u32));
-        let remaining_in = std::rc::Rc::clone(&remaining);
+    fn a_transient_timeout_does_not_reenter_the_live_worker() {
+        let calls = std::rc::Rc::new(Cell::new(0u32));
+        let calls_in = std::rc::Rc::clone(&calls);
         let mut worker = FakeWorker::ok();
         worker.portfolio = Box::new(move || {
-            if remaining_in.get() > 0 {
-                remaining_in.set(remaining_in.get() - 1);
-                Err(SafeError::fineco_timeout())
-            } else {
-                Ok(one_position_snapshot())
-            }
+            calls_in.set(calls_in.get() + 1);
+            Err(SafeError::fineco_timeout())
         });
         let ctrl = controller(worker, live_policy());
-        let outcome = ctrl
+        let err = ctrl
             .handle(RefreshRequest::PortfolioRefreshLive, NOW)
-            .expect("the transient timeout is absorbed");
-        assert!(outcome.snapshot_id.is_some());
+            .expect_err("timeout propagates without a controller-level retry");
+        assert_eq!(err.code(), "fineco_timeout");
+        // Retrying here would re-enter LiveClient and make another fresh Fineco
+        // login inside one admitted controller operation.
+        assert_eq!(calls.get(), 1);
         let store = ctrl.store.lock().expect("lock");
-        // Exactly one job row, completed — the retry was inside the one fetch.
         assert_eq!(
             store
                 .count_jobs_on_utc_date("portfolio", "2026-06-05")
                 .expect("q"),
             1
         );
+        let job = store
+            .latest_job_run("portfolio")
+            .expect("q")
+            .expect("a job");
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.safe_error_code.as_deref(), Some("fineco_timeout"));
     }
 
     #[test]

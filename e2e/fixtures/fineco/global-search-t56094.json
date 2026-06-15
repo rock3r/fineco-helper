@@ -1,0 +1,32 @@
+{
+  "Azione": [],
+  "Obbligazione": [
+    {
+      "d": "Synthetic Italian Government Bond",
+      "m": "MOT",
+      "s": "T56094.MOT",
+      "i": "IT0005560948",
+      "c": "EUR",
+      "t": "Obbligazione",
+      "lg": "IT0005560948"
+    }
+  ],
+  "LevaFissa": [],
+  "Turbo": [],
+  "Knockout": [],
+  "CFD": [],
+  "FxCfd": [],
+  "ETF": [],
+  "resultCounter": [
+    {
+      "Azione": 0,
+      "Obbligazione": 1,
+      "LevaFissa": 0,
+      "Turbo": 0,
+      "Knockout": 0,
+      "CFD": 0,
+      "FxCfd": 0,
+      "ETF": 0
+    }
+  ]
+}

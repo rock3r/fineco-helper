@@ -1,0 +1,25 @@
+{
+  "Azione": [
+    {
+      "d": "APPLE",
+      "m": "NASDAQ",
+      "s": "AAPL.O",
+      "i": "US0378331005",
+      "c": "USD",
+      "t": "Azione",
+      "be": true,
+      "lg": "US0378331005"
+    }
+  ],
+  "ETF": [],
+  "Obbligazione": [],
+  "CFD": [],
+  "resultCounter": [
+    {
+      "Azione": 1,
+      "ETF": 0,
+      "Obbligazione": 0,
+      "CFD": 0
+    }
+  ]
+}

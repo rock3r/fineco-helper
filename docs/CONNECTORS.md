@@ -12,8 +12,10 @@ per-client steps.
 > *owner + whichever model provider you use*. To bound that, the connector
 > (email/OAuth) channel is restricted to a **tool allowlist** that, by default,
 > **excludes the four detailed-portfolio tools** that expose absolute € values
-> (your CLI keeps the full set). Orders, tax, market, the shareable portfolio
-> report, allocation history, freshness, and the credentialed live-refresh tools
+> plus the authenticated Fineco market-read tools
+> (your CLI keeps the full set). Orders, tax, the shareable portfolio report,
+> allocation history, freshness, the public/third-party market tools, and the
+> credentialed live-refresh tools
 > *are* reachable by default — the allowlist is configurable (see
 > [Connector tool scoping](#connector-tool-scoping-configurable)). Decide, per
 > provider, whether you are comfortable before enabling.
@@ -71,19 +73,23 @@ On a **dual-pin** deployment the two Access channels are scoped differently:
 - The **CLI** channel (service token → `common_name`) always sees **every** tool.
 - The **connector** channel (OAuth → `email`) is restricted to a tool
   **allowlist** — by default, every tool **except** the four detailed-portfolio
-  tools that expose absolute € values:
+  tools that expose absolute € values and the authenticated Fineco market-read
+  tools:
   `portfolio_get_latest_snapshot_summary`, `portfolio_get_latest_full_snapshot`,
-  `portfolio_get_history`, `portfolio_get_position_history`. Those are hidden from
-  `tools/list` and refused by `tools/call` on the connector channel.
+  `portfolio_get_history`, `portfolio_get_position_history`,
+  `market_search_asset`, `market_get_asset_details`.
+  Those are hidden from `tools/list` and refused by `tools/call` on the connector
+  channel.
 
 Everything else — `portfolio_get_freshness`, `portfolio_get_latest_shareable_report`,
 `portfolio_get_allocation_history`, `orders_get_latest_monitor`, both tax tools,
-both market tools, and all three `private_*_refresh_live_sensitive` tools — is in
-the default connector set.
+the public/third-party market tools (`market_get_zero_commission_etfs`,
+`market_get_stock_enrichment`), and all three `private_*_refresh_live_sensitive`
+tools — is in the default connector set.
 
 Override it per deployment with `FINECO_CONNECTOR_TOOLS` in `/etc/fineco/access.env`:
 
-    # unset                  -> the default allowlist (all tools except the four above)
+    # unset                  -> the default allowlist (all tools except the blocked set above)
     # FINECO_CONNECTOR_TOOLS="*"      (or "all")  -> no restriction (connectors get every tool)
     # FINECO_CONNECTOR_TOOLS="a,b,c"             -> exactly tools a, b, c
 
@@ -173,10 +179,11 @@ gateway-side session to clear; revoke at Cloudflare Access.
 ## Security notes (read before enabling)
 
 - **Data egress.** Tool results flow to OpenAI / Anthropic. The connector
-  allowlist keeps the **absolute-€ detailed-portfolio tools off** that path by
+  allowlist keeps the **absolute-€ detailed-portfolio tools and authenticated
+  Fineco market reads off** that path by
   default; the shareable report (`portfolio_get_latest_shareable_report`) carries
-  weights / percentages / ISINs only. Note that orders, tax, and market results
-  *are* sent by default (they're in the default allowlist) — tighten
+  weights / percentages / ISINs only. Note that orders, tax, and public/third-party
+  market results *are* sent by default (they're in the default allowlist) — tighten
   `FINECO_CONNECTOR_TOOLS` if you want less.
 - **Credentialed live-refresh tools are in the default connector set** (the three
   `private_*_refresh_live_sensitive` tools log in to Fineco). A prompt-injected

@@ -25,15 +25,15 @@ use std::sync::Arc;
 use axum::response::IntoResponse;
 use fineco_gateway::Gateway;
 use fineco_gateway::access::{AccessConfig, AccessVerifier, fetch_jwks};
-use fineco_ipc::{Policy, RefreshClient, RefreshRequest};
-use fineco_live::LiveClient;
+use fineco_ipc::{MarketControlClient, Policy, RefreshClient, RefreshRequest};
+use fineco_live::{LiveClient, MarketAssetDetailsLiveFetcher, MarketSearchLiveFetcher};
 use fineco_market::{DEFAULT_ZERO_COMMISSION_ETFS_URL, EnrichmentHostAllowlist, MarketClient};
 use fineco_query::{FreshnessMaxAge, QueryHandler};
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::Store;
 use fineco_worker::{EnvCredentialSource, FinecoEndpoints, FinecoWorker};
 
-use crate::controller::{RefreshController, RefreshLimitsByArea, default_retry_policy};
+use crate::controller::{RefreshController, RefreshLimitsByArea};
 
 /// An error configuring or running a server role. Carries only safe,
 /// developer-authored messages — never a secret, payload, or raw cause.
@@ -118,6 +118,9 @@ pub struct GatewayConfig {
     /// returning a safe "not configured" error (a cached-only gateway). The
     /// gateway never gets a `fineco-live` client — only this refresh-control path.
     pub refresh_socket_path: Option<PathBuf>,
+    /// Path to the controller-owned authenticated market-control socket. `Some`
+    /// wires the gateway's Fineco authenticated market tools to the controller.
+    pub market_control_socket_path: Option<PathBuf>,
     /// Connector (email/OAuth) tool allowlist. `Some` restricts the connector
     /// Access channel to exactly these tools (the CLI/service-token channel is
     /// never restricted); `None` leaves connectors unrestricted. `Some` whenever
@@ -143,6 +146,11 @@ impl GatewayConfig {
     /// - `FINECO_ALLOWED_ORIGINS` (optional, comma-separated) — Origin allowlist.
     /// - `FINECO_REFRESH_SOCKET` (optional) — the refresh-control socket; set it to
     ///   enable the live-refresh tools, leave it unset for a cached-only gateway.
+    /// - `FINECO_MARKET_CONTROL_SOCKET` (optional, explicit-only) — the
+    ///   authenticated market-control socket; leave unset until market
+    ///   live-session controls are enabled. Requires `FINECO_REFRESH_SOCKET`
+    ///   and `FINECO_LIVE_SOCKET`, because the same controller serves both
+    ///   refresh and authenticated-market live commands.
     ///
     /// # Errors
     /// [`ServeError`] on a missing required var, a non-loopback bind, or a
@@ -174,6 +182,10 @@ impl GatewayConfig {
             .map(|path| path.trim().to_string())
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
+        let market_control_socket_path = get("FINECO_MARKET_CONTROL_SOCKET")
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
         Ok(Self {
             bind,
             socket_path,
@@ -182,6 +194,7 @@ impl GatewayConfig {
             access,
             allowed_origins,
             refresh_socket_path,
+            market_control_socket_path,
             connector_allowlist,
         })
     }
@@ -196,8 +209,8 @@ impl GatewayConfig {
 /// exposing the blocked tools. With no email pin there is no connector channel, so
 /// this is `None`, and setting the var then is a hard error.
 ///
-/// - unset → the default allowlist (every tool except the four detailed-portfolio
-///   tools — see [`fineco_gateway::DEFAULT_CONNECTOR_TOOLS`]);
+/// - unset → the default allowlist (every tool except the default blocked tools
+///   — see [`fineco_gateway::DEFAULT_CONNECTOR_TOOLS`]);
 /// - `*` / `all` → `None` (connectors get the full tool set — explicit opt-out);
 /// - a comma-separated list → exactly those tools.
 ///
@@ -396,6 +409,9 @@ pub struct StoreServerConfig {
     ///
     /// [`live_socket_path`]: StoreServerConfig::live_socket_path
     pub refresh_socket_path: Option<PathBuf>,
+    /// Path to bind the authenticated market-control Unix socket on. Explicitly
+    /// set only when authenticated market tools are intentionally enabled.
+    pub market_control_socket_path: Option<PathBuf>,
     /// Path to the credential worker's `fineco-live.sock`, which the controller's
     /// live client reaches. Required iff [`refresh_socket_path`] is set.
     ///
@@ -433,12 +449,12 @@ impl StoreServerConfig {
             Some(raw) => parse_socket_mode(&raw)?,
             None => DEFAULT_SOCKET_MODE,
         };
-        // Live refresh is opt-in: the refresh-control socket and the worker's live
-        // socket must be set together (the controller can't function without the
-        // worker). A partial config fails closed rather than silently disabling it.
-        // A blank/whitespace value means "unset" (cached-only) — matching
-        // `GatewayConfig` — so two stray empties can't enable the controller with
-        // empty socket paths.
+        // Controller-backed live reads are opt-in: the refresh-control socket,
+        // authenticated market-control socket, and worker live socket must be
+        // configured consistently. A partial config fails closed rather than
+        // silently disabling it. A blank/whitespace value means "unset"
+        // (cached-only) — matching `GatewayConfig` — so stray empties can't enable
+        // the controller with empty socket paths.
         let refresh_socket_path = get("FINECO_REFRESH_SOCKET")
             .map(|path| path.trim().to_string())
             .filter(|path| !path.is_empty())
@@ -447,9 +463,20 @@ impl StoreServerConfig {
             .map(|path| path.trim().to_string())
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
+        let market_control_socket_path = get("FINECO_MARKET_CONTROL_SOCKET")
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
         if refresh_socket_path.is_some() != live_socket_path.is_some() {
             return Err(ServeError::new(
                 "live refresh needs FINECO_REFRESH_SOCKET and FINECO_LIVE_SOCKET together (or neither)",
+            ));
+        }
+        if market_control_socket_path.is_some()
+            && (refresh_socket_path.is_none() || live_socket_path.is_none())
+        {
+            return Err(ServeError::new(
+                "authenticated market reads need FINECO_REFRESH_SOCKET and FINECO_LIVE_SOCKET (or unset FINECO_MARKET_CONTROL_SOCKET)",
             ));
         }
         let refresh_socket_mode = match get("FINECO_REFRESH_SOCKET_MODE") {
@@ -462,6 +489,7 @@ impl StoreServerConfig {
             policy_path,
             socket_mode,
             refresh_socket_path,
+            market_control_socket_path,
             live_socket_path,
             refresh_socket_mode,
         })
@@ -496,6 +524,10 @@ pub async fn run_gateway(config: GatewayConfig) -> Result<(), ServeError> {
     // configured (the gateway holds NO live-socket client — only this path).
     if let Some(refresh_socket) = config.refresh_socket_path {
         gateway = gateway.with_refresh_client(RefreshClient::new(refresh_socket));
+    }
+    if let Some(market_control_socket) = config.market_control_socket_path {
+        gateway =
+            gateway.with_market_control_client(MarketControlClient::new(market_control_socket));
     }
     // Scope the connector (email/OAuth) channel to its tool allowlist when one is
     // configured (any email-pinned deployment; the CLI/service-token channel stays
@@ -638,39 +670,68 @@ async fn shutdown_signal() {
 /// # Errors
 /// [`ServeError`] if the store cannot be opened or the socket cannot be bound.
 pub fn run_store_server(config: StoreServerConfig) -> Result<(), ServeError> {
+    if config.market_control_socket_path.is_some()
+        && (config.refresh_socket_path.is_none() || config.live_socket_path.is_none())
+    {
+        return Err(ServeError::new(
+            "authenticated market reads need refresh-control and fineco-live sockets",
+        ));
+    }
+
     let policy = load_policy(&config.policy_path)?;
 
-    // Optionally stand up the live-refresh controller on a second socket/thread,
-    // with its OWN Store connection (the snapshot-query loop keeps its own; SQLite
-    // serializes the two via `busy_timeout`). The controller reaches the
-    // credential worker over `fineco-live.sock`; the gateway never does.
-    if let (Some(refresh_socket), Some(live_socket)) = (
-        config.refresh_socket_path.clone(),
-        config.live_socket_path.clone(),
-    ) {
+    // Optionally stand up controller sockets, with their OWN Store connection (the
+    // snapshot-query loop keeps its own; SQLite serializes the two via
+    // `busy_timeout`). The controller reaches the credential worker over
+    // `fineco-live.sock`; the gateway never does.
+    if config.refresh_socket_path.is_some() || config.market_control_socket_path.is_some() {
+        let live_socket = config.live_socket_path.clone().ok_or_else(|| {
+            ServeError::new(
+                "controller sockets need FINECO_LIVE_SOCKET (or unset controller sockets)",
+            )
+        })?;
         let refresh_store = Store::open(&config.db_path)
             .map_err(|_| ServeError::new("failed to open the store for the refresh controller"))?;
-        let controller = RefreshController::new(
+        let controller = Arc::new(RefreshController::new(
             refresh_store,
             LiveClient::new(&live_socket),
             policy.clone(),
             RefreshLimitsByArea::defaults(),
-            default_retry_policy(),
-        );
-        prepare_socket_path(&refresh_socket)?;
-        let refresh_listener = std::os::unix::net::UnixListener::bind(&refresh_socket)?;
-        restrict_socket_permissions(&refresh_socket, config.refresh_socket_mode)?;
-        // `serve_refresh_blocking` is a SINGLE-consumer accept loop (one request at
-        // a time), so refreshes never overlap within this process. The
-        // authoritative cross-connection concurrency guard is still
-        // `already_refreshing` (the running-job lock that `refresh_preflight`
-        // checks) — it holds even across a process restart or a future move to a
-        // concurrent accept loop, where the single-thread serialization would not.
-        std::thread::spawn(move || {
-            let _ = fineco_ipc::serve_refresh_blocking(&refresh_listener, move |request| {
-                controller.handle(request, &fineco_core::now_iso8601_utc())
+        ));
+
+        if let Some(refresh_socket) = config.refresh_socket_path.clone() {
+            prepare_socket_path(&refresh_socket)?;
+            let refresh_listener = std::os::unix::net::UnixListener::bind(&refresh_socket)?;
+            restrict_socket_permissions(&refresh_socket, config.refresh_socket_mode)?;
+            // `serve_refresh_blocking` is a SINGLE-consumer accept loop (one request
+            // at a time), so refreshes never overlap within this process. The
+            // authoritative cross-connection concurrency guard is still
+            // `already_refreshing` (the running-job lock that `refresh_preflight`
+            // checks) — it holds even across a process restart or a future move to a
+            // concurrent accept loop, where the single-thread serialization would not.
+            let refresh_controller = Arc::clone(&controller);
+            std::thread::spawn(move || {
+                let _ = fineco_ipc::serve_refresh_blocking(&refresh_listener, move |request| {
+                    refresh_controller.handle(request, &fineco_core::now_iso8601_utc())
+                });
             });
-        });
+        }
+        if let Some(market_control_socket) = config.market_control_socket_path.clone() {
+            prepare_socket_path(&market_control_socket)?;
+            let market_control_listener =
+                std::os::unix::net::UnixListener::bind(&market_control_socket)?;
+            restrict_socket_permissions(&market_control_socket, config.refresh_socket_mode)?;
+            let market_controller = Arc::clone(&controller);
+            std::thread::spawn(move || {
+                let _ = fineco_ipc::serve_market_control_blocking(
+                    &market_control_listener,
+                    move |request| {
+                        market_controller
+                            .handle_market_control(request, &fineco_core::now_iso8601_utc())
+                    },
+                );
+            });
+        }
     }
 
     let store =
@@ -791,7 +852,11 @@ pub fn run_private_worker(config: PrivateWorkerConfig) -> Result<(), ServeError>
 /// [`ServeError`] if the socket path cannot be prepared, bound, or restricted.
 pub fn serve_live<W>(worker: &W, socket_path: &Path, socket_mode: u32) -> Result<(), ServeError>
 where
-    W: PortfolioFetcher + RawOrdersFetcher + TaxFetcher,
+    W: PortfolioFetcher
+        + RawOrdersFetcher
+        + TaxFetcher
+        + MarketSearchLiveFetcher
+        + MarketAssetDetailsLiveFetcher,
 {
     prepare_socket_path(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;

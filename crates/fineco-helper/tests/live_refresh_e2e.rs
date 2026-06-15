@@ -76,6 +76,7 @@ fn real_worker_live_refresh_through_the_controller_captures_a_snapshot() {
         policy_path: policy_path.clone(),
         socket_mode: 0o600,
         refresh_socket_path: Some(refresh_socket.clone()),
+        market_control_socket_path: None,
         live_socket_path: Some(live_socket.clone()),
         refresh_socket_mode: 0o600,
     };
@@ -106,18 +107,16 @@ fn real_worker_live_refresh_through_the_controller_captures_a_snapshot() {
         "two positions captured (a count, never values)"
     );
 
-    // 3b. Drive an orders live refresh: the worker returns RAW orders, the
-    //     controller hashes them (its DB key) and captures. The synthetic monitor
-    //     carries two transactions.
+    // 3b. A second immediate refresh uses refresh-owned gates rather than the
+    //     authenticated-market fresh-login cooldown/budget.
     let orders = client
         .call(&RefreshRequest::OrdersRefreshLive(OrdersRefreshParams {
             instrument_kind: "equity".to_string(),
             days: 7,
         }))
-        .expect("a live orders refresh completed");
+        .expect("orders refresh is not blocked by the market login policy");
     assert_eq!(orders.data_area, "orders");
-    assert_eq!(orders.snapshot_id, None);
-    assert_eq!(orders.count, 2, "two orders captured");
+    assert_eq!(orders.count, 2);
 
     for path in [
         &db_path,

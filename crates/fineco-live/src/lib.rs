@@ -31,7 +31,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fineco_core::SafeError;
-use fineco_ipc::SafeErrorDto;
+pub use fineco_ipc::{MarketAssetDetailsLiveFetcher, MarketSearchLiveFetcher};
+use fineco_ipc::{
+    MarketAssetDetailsLiveResult, MarketDetailsParams, MarketSearchLiveResult, MarketSearchParams,
+    SafeErrorDto,
+};
 use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{
     NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder, Store,
@@ -51,6 +55,21 @@ const LIVE_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// whole call, so this is a generous hang-stop, not a latency budget.
 const LIVE_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Authenticated market search can retry Fineco's global-search endpoint inside
+/// the worker after a preflight + login. This must cover the worker's bounded
+/// worst case (roughly 30s preflight + 30s login + 3 * 30s search attempts)
+/// with margin, so the controller does not give up before the worker's own retry
+/// budget is exhausted.
+const LIVE_MARKET_SEARCH_CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Market details may fan out across authenticated search, static identity,
+/// snapshot, and stock/ETF report endpoints under one worker-held session. Its
+/// live-socket read timeout must cover the allowed retried fan-out (preflight +
+/// login, up to four alias searches, and the optional ETF composition/returns
+/// endpoints) so the controller does not report a local transport failure while
+/// the worker is still making bounded Fineco reads.
+const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(960);
+
 /// A command from the refresh controller to the private worker. Adjacently tagged
 /// as `{"command": "...", "params": {...}}` (commands without params omit it).
 /// Command-enum only — there is no generic proxy, URL, or raw field.
@@ -65,6 +84,10 @@ pub enum LiveRequest {
     TaxCarryForward(LiveTaxCarryForwardParams),
     /// Fetch the tax minus-by-year residues.
     TaxMinusByYear,
+    /// Search authenticated Fineco market instruments, stamped with controller time.
+    MarketSearch(LiveMarketSearchParams),
+    /// Resolve and fetch authenticated Fineco market details, stamped with controller time.
+    MarketAssetDetails(LiveMarketDetailsParams),
 }
 
 /// Parameters for [`LiveRequest::Portfolio`].
@@ -92,6 +115,24 @@ pub struct LiveTaxCarryForwardParams {
     pub date_to: String,
 }
 
+/// Parameters for [`LiveRequest::MarketSearch`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveMarketSearchParams {
+    pub search: MarketSearchParams,
+    /// The controller's clock (ISO-8601 UTC); used as result `captured_at`.
+    pub now_iso: String,
+}
+
+/// Parameters for [`LiveRequest::MarketAssetDetails`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveMarketDetailsParams {
+    pub details: MarketDetailsParams,
+    /// The controller's clock (ISO-8601 UTC); used as result `captured_at`.
+    pub now_iso: String,
+}
+
 /// A successful worker result, typed per command (the plan forbids generic raw
 /// JSON for private payloads). Orders are [`RawOrder`]s — the worker holds no DB
 /// key — and are hashed by the controller after they cross the socket.
@@ -102,6 +143,8 @@ pub enum LiveResponse {
     Orders(Vec<RawOrder>),
     TaxCarryForward(NewTaxCarryForward),
     TaxMinusByYear(Vec<NewTaxMinusByYear>),
+    MarketSearch(MarketSearchLiveResult),
+    MarketAssetDetails(Box<MarketAssetDetailsLiveResult>),
 }
 
 /// The worker's reply: a typed result or the safe error envelope. Every worker
@@ -123,7 +166,12 @@ enum LiveReply {
 /// The fetcher's [`SafeError`] on validation/auth/upstream/internal failure.
 pub fn handle_live_request<F>(fetcher: &F, request: LiveRequest) -> Result<LiveResponse, SafeError>
 where
-    F: PortfolioFetcher + RawOrdersFetcher + TaxFetcher + ?Sized,
+    F: PortfolioFetcher
+        + RawOrdersFetcher
+        + TaxFetcher
+        + MarketSearchLiveFetcher
+        + MarketAssetDetailsLiveFetcher
+        + ?Sized,
 {
     match request {
         LiveRequest::Portfolio(p) => fetcher
@@ -138,6 +186,12 @@ where
         LiveRequest::TaxMinusByYear => fetcher
             .fetch_tax_minus_by_year()
             .map(LiveResponse::TaxMinusByYear),
+        LiveRequest::MarketSearch(p) => fetcher
+            .fetch_market_search(&p.search, &p.now_iso)
+            .map(LiveResponse::MarketSearch),
+        LiveRequest::MarketAssetDetails(p) => fetcher
+            .fetch_market_asset_details(&p.details, &p.now_iso)
+            .map(|result| LiveResponse::MarketAssetDetails(Box::new(result))),
     }
 }
 
@@ -151,7 +205,12 @@ where
 /// Returns an error only if accepting connections fails irrecoverably.
 pub fn serve_live_blocking<F>(listener: &UnixListener, fetcher: &F) -> std::io::Result<()>
 where
-    F: PortfolioFetcher + RawOrdersFetcher + TaxFetcher + ?Sized,
+    F: PortfolioFetcher
+        + RawOrdersFetcher
+        + TaxFetcher
+        + MarketSearchLiveFetcher
+        + MarketAssetDetailsLiveFetcher
+        + ?Sized,
 {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
@@ -163,7 +222,12 @@ where
 /// Handle exactly one request/reply on `stream`.
 fn serve_one<F>(stream: &mut UnixStream, fetcher: &F) -> std::io::Result<()>
 where
-    F: PortfolioFetcher + RawOrdersFetcher + TaxFetcher + ?Sized,
+    F: PortfolioFetcher
+        + RawOrdersFetcher
+        + TaxFetcher
+        + MarketSearchLiveFetcher
+        + MarketAssetDetailsLiveFetcher
+        + ?Sized,
 {
     // Bound a stalled peer so one half-open connection cannot pin the accept loop.
     let _ = stream.set_read_timeout(Some(LIVE_SERVER_TIMEOUT));
@@ -197,9 +261,10 @@ where
 /// round-tripping a typed request; for orders it hashes the worker's [`RawOrder`]s
 /// into store-ready [`NewOrder`]s with the passed store's key.
 ///
-/// Wrap it in `fineco_refresh::Retrying` to absorb a transient Fineco blip within
-/// one refresh (one `job_runs` row): the worker's retryable failures cross the
-/// socket as their safe codes and are reconstructed with `retryable` intact.
+/// The refresh controller calls it once per admitted live operation so its shared
+/// login budget matches the worker's Fineco login footprint. Any future retry must
+/// either debit/report each fresh worker login or happen inside the worker under
+/// one authenticated session.
 #[derive(Debug, Clone)]
 pub struct LiveClient {
     path: PathBuf,
@@ -217,18 +282,34 @@ impl LiveClient {
     /// Send one request and decode the worker's reply. A worker failure is
     /// reconstructed from its wire DTO via [`safe_error_from_dto`] so the
     /// controller's retry and circuit-breaker logic keys on the right `code` and
-    /// `retryable`. A transport failure surfaces as `internal` (not retryable).
+    /// `retryable`. A local connect/write failure surfaces as
+    /// `live_transport_failure` so the controller does not infer that a worker
+    /// Fineco login happened. Once the request is written, a missing reply is
+    /// ambiguous and stays `internal`; the controller debits conservatively.
     fn call(&self, request: &LiveRequest) -> Result<LiveResponse, SafeError> {
-        let mut stream = UnixStream::connect(&self.path).map_err(|_| SafeError::internal())?;
-        let _ = stream.set_read_timeout(Some(LIVE_CLIENT_TIMEOUT));
+        let mut stream =
+            UnixStream::connect(&self.path).map_err(|_| SafeError::live_transport_failure())?;
+        let _ = stream.set_read_timeout(Some(client_timeout_for(request)));
         let _ = stream.set_write_timeout(Some(LIVE_SERVER_TIMEOUT));
-        fineco_ipc::write_message(&mut stream, request).map_err(|_| SafeError::internal())?;
+        fineco_ipc::write_message(&mut stream, request)
+            .map_err(|_| SafeError::live_transport_failure())?;
         let reply: LiveReply =
             fineco_ipc::read_message(&mut stream).map_err(|_| SafeError::internal())?;
         match reply {
             LiveReply::Ok(body) => Ok(body),
             LiveReply::Err(dto) => Err(safe_error_from_dto(&dto)),
         }
+    }
+}
+
+fn client_timeout_for(request: &LiveRequest) -> Duration {
+    match request {
+        LiveRequest::MarketSearch(_) => LIVE_MARKET_SEARCH_CLIENT_TIMEOUT,
+        LiveRequest::MarketAssetDetails(_) => LIVE_MARKET_DETAILS_CLIENT_TIMEOUT,
+        LiveRequest::Portfolio(_)
+        | LiveRequest::Orders(_)
+        | LiveRequest::TaxCarryForward(_)
+        | LiveRequest::TaxMinusByYear => LIVE_CLIENT_TIMEOUT,
     }
 }
 
@@ -245,6 +326,66 @@ impl PortfolioFetcher for LiveClient {
     }
 }
 
+impl LiveClient {
+    /// Return the authenticated Fineco market search with status-only worker
+    /// session facts. This is the controller-facing form; callers that only need
+    /// the normalized candidates can use the trait method and unwrap `.result`.
+    ///
+    /// # Errors
+    /// [`SafeError`] on worker/transport failure.
+    pub fn fetch_market_search_live(
+        &self,
+        params: &MarketSearchParams,
+        now_iso: &str,
+    ) -> Result<MarketSearchLiveResult, SafeError> {
+        match self.call(&LiveRequest::MarketSearch(LiveMarketSearchParams {
+            search: params.clone(),
+            now_iso: now_iso.to_string(),
+        }))? {
+            LiveResponse::MarketSearch(result) => Ok(result),
+            _ => Err(SafeError::internal()),
+        }
+    }
+
+    /// Return authenticated Fineco market details with status-only worker
+    /// session facts.
+    ///
+    /// # Errors
+    /// [`SafeError`] on worker/transport failure.
+    pub fn fetch_market_asset_details_live(
+        &self,
+        params: &MarketDetailsParams,
+        now_iso: &str,
+    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
+        match self.call(&LiveRequest::MarketAssetDetails(LiveMarketDetailsParams {
+            details: params.clone(),
+            now_iso: now_iso.to_string(),
+        }))? {
+            LiveResponse::MarketAssetDetails(result) => Ok(*result),
+            _ => Err(SafeError::internal()),
+        }
+    }
+}
+
+impl MarketSearchLiveFetcher for LiveClient {
+    fn fetch_market_search(
+        &self,
+        params: &MarketSearchParams,
+        now_iso: &str,
+    ) -> Result<MarketSearchLiveResult, SafeError> {
+        self.fetch_market_search_live(params, now_iso)
+    }
+}
+
+impl MarketAssetDetailsLiveFetcher for LiveClient {
+    fn fetch_market_asset_details(
+        &self,
+        params: &MarketDetailsParams,
+        now_iso: &str,
+    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
+        self.fetch_market_asset_details_live(params, now_iso)
+    }
+}
 impl OrdersFetcher for LiveClient {
     fn fetch_orders(
         &self,
@@ -305,10 +446,132 @@ fn safe_error_from_dto(dto: &SafeErrorDto) -> SafeError {
         "fineco_upstream_error" => SafeError::from_upstream_status(500),
         "not_found" => SafeError::not_found(),
         "rate_limited" => SafeError::rate_limited(),
+        "market_auth_required" => SafeError::market_auth_required(),
+        "market_not_found" => SafeError::market_not_found(),
+        "market_ambiguous_identifier" => {
+            SafeError::market_ambiguous_identifier_from_safe_message(&dto.safe_message)
+        }
+        "market_unsupported_asset_type" => {
+            SafeError::market_unsupported_asset_type_from_safe_message(&dto.safe_message)
+        }
+        "market_rate_limited" => SafeError::market_rate_limited(),
+        "market_upstream_failure" => SafeError::market_upstream_failure(),
+        "market_circuit_open" => SafeError::market_circuit_open(),
+        "market_unexpected_response" => SafeError::market_unexpected_response(),
+        "live_transport_failure" => SafeError::live_transport_failure(),
         "already_refreshing" => SafeError::already_refreshing(),
         // The worker re-validates as defense in depth; the controller already
         // validated, so the specific message is not needed across the socket.
         "invalid_request" => SafeError::invalid_request("the live worker rejected the request"),
         _ => SafeError::internal(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{
+        LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LIVE_MARKET_SEARCH_CLIENT_TIMEOUT,
+        LiveClient, LiveMarketDetailsParams, LiveMarketSearchParams, LiveRequest,
+        client_timeout_for,
+    };
+    use fineco_ipc::{MarketDetailsParams, MarketSearchParams};
+
+    #[test]
+    fn market_details_uses_a_fanout_sized_client_timeout() {
+        let request = LiveRequest::MarketAssetDetails(LiveMarketDetailsParams {
+            details: MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10".to_string()),
+                sections: None,
+            },
+            now_iso: "2026-06-14T09:30:00Z".to_string(),
+        });
+
+        assert_eq!(
+            client_timeout_for(&request),
+            LIVE_MARKET_DETAILS_CLIENT_TIMEOUT
+        );
+        assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
+        assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT >= Duration::from_secs(960));
+    }
+
+    #[test]
+    fn market_search_uses_a_retry_sized_client_timeout() {
+        let request = LiveRequest::MarketSearch(LiveMarketSearchParams {
+            search: MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: None,
+                limit: None,
+            },
+            now_iso: "2026-06-14T09:30:00Z".to_string(),
+        });
+
+        assert_eq!(
+            client_timeout_for(&request),
+            LIVE_MARKET_SEARCH_CLIENT_TIMEOUT
+        );
+        assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
+        assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT >= Duration::from_secs(180));
+    }
+
+    #[test]
+    fn local_live_socket_failure_uses_transport_error_code() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "fineco-live-missing-{}-{}.sock",
+            std::process::id(),
+            "transport-error"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let client = LiveClient::new(&path);
+
+        let err = client
+            .fetch_market_search_live(
+                &MarketSearchParams {
+                    query: "VHYL".to_string(),
+                    limit: None,
+                    asset_type: None,
+                },
+                "2026-06-14T09:30:00Z",
+            )
+            .expect_err("missing live socket is a local transport failure");
+
+        assert_eq!(err.code(), "live_transport_failure");
+    }
+
+    #[test]
+    fn missing_live_socket_reply_after_write_uses_internal_error_code() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "fineco-live-drop-reply-{}-{}.sock",
+            std::process::id(),
+            "transport-error"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind live socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let _: LiveRequest = fineco_ipc::read_message(&mut stream).expect("read request");
+        });
+        let client = LiveClient::new(&path);
+
+        let err = client
+            .fetch_market_search_live(
+                &MarketSearchParams {
+                    query: "VHYL".to_string(),
+                    limit: None,
+                    asset_type: None,
+                },
+                "2026-06-14T09:30:00Z",
+            )
+            .expect_err("server accepted the request but did not reply");
+
+        server.join().expect("server joined");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.code(), "internal");
     }
 }

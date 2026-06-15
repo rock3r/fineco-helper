@@ -40,6 +40,10 @@ fn audit_line_logs_the_count_never_the_values() {
         error_code: None,
         duration_ms: 4,
         result_count: body.audit_count(),
+        login_performed: None,
+        session_reused: None,
+        session_evicted: None,
+        reused_session_401_recovered: None,
     };
     let line = record.to_log_line();
 
@@ -112,10 +116,15 @@ fn audit_record_omits_optional_fields_when_absent() {
         error_code: None,
         duration_ms: 1,
         result_count: None,
+        login_performed: None,
+        session_reused: None,
+        session_evicted: None,
+        reused_session_401_recovered: None,
     };
     let line = ok.to_log_line();
     assert!(!line.contains("error_code"), "{line}");
     assert!(!line.contains("result_count"), "{line}");
+    assert!(!line.contains("login_performed"), "{line}");
 
     let err = AuditRecord {
         ts: "t".to_string(),
@@ -126,8 +135,35 @@ fn audit_record_omits_optional_fields_when_absent() {
         error_code: Some("fineco_timeout".to_string()),
         duration_ms: 1,
         result_count: None,
+        login_performed: None,
+        session_reused: None,
+        session_evicted: None,
+        reused_session_401_recovered: None,
     };
     let line = err.to_log_line();
     assert!(line.contains(r#""error_code":"fineco_timeout""#), "{line}");
     assert!(line.contains(r#""outcome":"error""#), "{line}");
+}
+
+#[test]
+fn audit_record_can_include_status_only_session_facts() {
+    let record = AuditRecord {
+        ts: "t".to_string(),
+        auth_id: "owner",
+        tool: "market_search_asset",
+        data_class: "authenticated_market",
+        outcome: "ok",
+        error_code: None,
+        duration_ms: 1,
+        result_count: Some(1),
+        login_performed: Some(true),
+        session_reused: Some(false),
+        session_evicted: Some(false),
+        reused_session_401_recovered: Some(false),
+    };
+    let line = record.to_log_line();
+    assert!(line.contains(r#""login_performed":true"#), "{line}");
+    assert!(line.contains(r#""session_reused":false"#), "{line}");
+    assert!(!line.contains("cookie"), "{line}");
+    assert!(!line.contains("session_id"), "{line}");
 }
