@@ -275,12 +275,17 @@ impl LiveClient {
     /// Send one request and decode the worker's reply. A worker failure is
     /// reconstructed from its wire DTO via [`safe_error_from_dto`] so the
     /// controller's retry and circuit-breaker logic keys on the right `code` and
-    /// `retryable`. A transport failure surfaces as `internal` (not retryable).
+    /// `retryable`. A local connect/write failure surfaces as
+    /// `live_transport_failure` so the controller does not infer that a worker
+    /// Fineco login happened. Once the request is written, a missing reply is
+    /// ambiguous and stays `internal`; the controller debits conservatively.
     fn call(&self, request: &LiveRequest) -> Result<LiveResponse, SafeError> {
-        let mut stream = UnixStream::connect(&self.path).map_err(|_| SafeError::internal())?;
+        let mut stream =
+            UnixStream::connect(&self.path).map_err(|_| SafeError::live_transport_failure())?;
         let _ = stream.set_read_timeout(Some(client_timeout_for(request)));
         let _ = stream.set_write_timeout(Some(LIVE_SERVER_TIMEOUT));
-        fineco_ipc::write_message(&mut stream, request).map_err(|_| SafeError::internal())?;
+        fineco_ipc::write_message(&mut stream, request)
+            .map_err(|_| SafeError::live_transport_failure())?;
         let reply: LiveReply =
             fineco_ipc::read_message(&mut stream).map_err(|_| SafeError::internal())?;
         match reply {
@@ -446,6 +451,7 @@ fn safe_error_from_dto(dto: &SafeErrorDto) -> SafeError {
         "market_upstream_failure" => SafeError::market_upstream_failure(),
         "market_circuit_open" => SafeError::market_circuit_open(),
         "market_unexpected_response" => SafeError::market_unexpected_response(),
+        "live_transport_failure" => SafeError::live_transport_failure(),
         "already_refreshing" => SafeError::already_refreshing(),
         // The worker re-validates as defense in depth; the controller already
         // validated, so the specific message is not needed across the socket.
@@ -456,13 +462,15 @@ fn safe_error_from_dto(dto: &SafeErrorDto) -> SafeError {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixListener;
+    use std::thread;
     use std::time::Duration;
 
     use super::{
-        LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LiveMarketDetailsParams,
-        LiveRequest, client_timeout_for,
+        LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LiveClient,
+        LiveMarketDetailsParams, LiveRequest, client_timeout_for,
     };
-    use fineco_ipc::MarketDetailsParams;
+    use fineco_ipc::{MarketDetailsParams, MarketSearchParams};
 
     #[test]
     fn market_details_uses_a_fanout_sized_client_timeout() {
@@ -481,5 +489,62 @@ mod tests {
         );
         assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
         assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT >= Duration::from_secs(960));
+    }
+
+    #[test]
+    fn local_live_socket_failure_uses_transport_error_code() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "fineco-live-missing-{}-{}.sock",
+            std::process::id(),
+            "transport-error"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let client = LiveClient::new(&path);
+
+        let err = client
+            .fetch_market_search_live(
+                &MarketSearchParams {
+                    query: "VHYL".to_string(),
+                    limit: None,
+                    asset_type: None,
+                },
+                "2026-06-14T09:30:00Z",
+            )
+            .expect_err("missing live socket is a local transport failure");
+
+        assert_eq!(err.code(), "live_transport_failure");
+    }
+
+    #[test]
+    fn missing_live_socket_reply_after_write_uses_internal_error_code() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "fineco-live-drop-reply-{}-{}.sock",
+            std::process::id(),
+            "transport-error"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind live socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let _: LiveRequest = fineco_ipc::read_message(&mut stream).expect("read request");
+        });
+        let client = LiveClient::new(&path);
+
+        let err = client
+            .fetch_market_search_live(
+                &MarketSearchParams {
+                    query: "VHYL".to_string(),
+                    limit: None,
+                    asset_type: None,
+                },
+                "2026-06-14T09:30:00Z",
+            )
+            .expect_err("server accepted the request but did not reply");
+
+        server.join().expect("server joined");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.code(), "internal");
     }
 }

@@ -255,7 +255,7 @@ impl LiveLoginPermit<'_> {
 }
 
 fn should_record_assumed_fresh_login(error: &SafeError) -> bool {
-    error.code() != "internal"
+    error.code() != "live_transport_failure"
 }
 
 impl Drop for LiveLoginPermit<'_> {
@@ -1050,20 +1050,37 @@ mod tests {
     }
 
     #[test]
-    fn market_transport_internal_failure_does_not_burn_fresh_login_cooldown() {
+    fn market_transport_failure_does_not_burn_fresh_login_cooldown() {
+        let mut worker = FakeWorker::ok();
+        worker.market_result = Box::new(|| Err(SafeError::live_transport_failure()));
+        let ctrl = controller(worker, market_policy());
+
+        let err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect_err("local transport failure");
+        assert_eq!(err.code(), "live_transport_failure");
+
+        let second_err = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
+            .expect_err("worker is still failing, but the login cooldown was not burned");
+        assert_eq!(second_err.code(), "live_transport_failure");
+    }
+
+    #[test]
+    fn market_worker_internal_failure_burns_fresh_login_cooldown() {
         let mut worker = FakeWorker::ok();
         worker.market_result = Box::new(|| Err(SafeError::internal()));
         let ctrl = controller(worker, market_policy());
 
         let err = ctrl
             .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
-            .expect_err("local transport failure");
+            .expect_err("worker-side failure after the live call was admitted");
         assert_eq!(err.code(), "internal");
 
         let second_err = ctrl
             .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
-            .expect_err("worker is still failing, but the login cooldown was not burned");
-        assert_eq!(second_err.code(), "internal");
+            .expect_err("worker internal failure burned the login cooldown");
+        assert_eq!(second_err.code(), "market_rate_limited");
     }
 
     #[test]

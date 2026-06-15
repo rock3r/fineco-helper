@@ -360,6 +360,18 @@ impl SafeError {
         )
     }
 
+    /// The local controller-to-worker socket failed before a live worker result
+    /// could be observed. This does not prove a Fineco login happened.
+    #[must_use]
+    pub fn live_transport_failure() -> Self {
+        Self::new(
+            "live_transport_failure",
+            ErrorClass::Internal,
+            false,
+            "The live worker transport failed.",
+        )
+    }
+
     /// A validation failure. `safe_message` must be developer-authored and free
     /// of payloads (e.g. `"days must be <= 30"`).
     #[must_use]
