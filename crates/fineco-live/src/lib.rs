@@ -55,6 +55,13 @@ const LIVE_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// whole call, so this is a generous hang-stop, not a latency budget.
 const LIVE_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Authenticated market search can retry Fineco's global-search endpoint inside
+/// the worker after a preflight + login. This must cover the worker's bounded
+/// worst case (roughly 30s preflight + 30s login + 3 * 30s search attempts)
+/// with margin, so the controller does not give up before the worker's own retry
+/// budget is exhausted.
+const LIVE_MARKET_SEARCH_CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Market details may fan out across authenticated search, static identity,
 /// snapshot, and stock/ETF report endpoints under one worker-held session. Its
 /// live-socket read timeout must cover the allowed retried fan-out (preflight +
@@ -297,12 +304,12 @@ impl LiveClient {
 
 fn client_timeout_for(request: &LiveRequest) -> Duration {
     match request {
+        LiveRequest::MarketSearch(_) => LIVE_MARKET_SEARCH_CLIENT_TIMEOUT,
         LiveRequest::MarketAssetDetails(_) => LIVE_MARKET_DETAILS_CLIENT_TIMEOUT,
         LiveRequest::Portfolio(_)
         | LiveRequest::Orders(_)
         | LiveRequest::TaxCarryForward(_)
-        | LiveRequest::TaxMinusByYear
-        | LiveRequest::MarketSearch(_) => LIVE_CLIENT_TIMEOUT,
+        | LiveRequest::TaxMinusByYear => LIVE_CLIENT_TIMEOUT,
     }
 }
 
@@ -467,8 +474,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LiveClient,
-        LiveMarketDetailsParams, LiveRequest, client_timeout_for,
+        LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LIVE_MARKET_SEARCH_CLIENT_TIMEOUT,
+        LiveClient, LiveMarketDetailsParams, LiveMarketSearchParams, LiveRequest,
+        client_timeout_for,
     };
     use fineco_ipc::{MarketDetailsParams, MarketSearchParams};
 
@@ -489,6 +497,25 @@ mod tests {
         );
         assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
         assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT >= Duration::from_secs(960));
+    }
+
+    #[test]
+    fn market_search_uses_a_retry_sized_client_timeout() {
+        let request = LiveRequest::MarketSearch(LiveMarketSearchParams {
+            search: MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: None,
+                limit: None,
+            },
+            now_iso: "2026-06-14T09:30:00Z".to_string(),
+        });
+
+        assert_eq!(
+            client_timeout_for(&request),
+            LIVE_MARKET_SEARCH_CLIENT_TIMEOUT
+        );
+        assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
+        assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT >= Duration::from_secs(180));
     }
 
     #[test]

@@ -1602,15 +1602,21 @@ impl MarketControlWireReply {
     }
 }
 
+/// Read timeout for market search replies. The controller's live-client timeout
+/// for search is sized to the worker's bounded retry budget; the gateway timeout
+/// needs extra margin because it starts before the controller begins its own
+/// live-socket wait.
+const MARKET_SEARCH_REPLY_TIMEOUT: Duration = Duration::from_secs(240);
+
 /// Read timeout for market details replies. Details can fan out across retried
-/// authenticated Fineco endpoints; this must stay aligned with the live client
-/// details timeout so the gateway does not fail locally while the controller
-/// keeps spending the login.
-const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(960);
+/// authenticated Fineco endpoints; this must exceed the live client details
+/// timeout so the gateway does not fail locally while the controller keeps
+/// spending the login.
+const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(1020);
 
 fn market_reply_timeout_for(request: &MarketControlRequest) -> Duration {
     match request {
-        MarketControlRequest::MarketSearchAsset(_) => REFRESH_REPLY_TIMEOUT,
+        MarketControlRequest::MarketSearchAsset(_) => MARKET_SEARCH_REPLY_TIMEOUT,
         MarketControlRequest::MarketGetAssetDetails(_) => MARKET_DETAILS_REPLY_TIMEOUT,
     }
 }
@@ -1991,12 +1997,17 @@ mod tests {
             sections: None,
         });
 
-        assert_eq!(market_reply_timeout_for(&search), REFRESH_REPLY_TIMEOUT);
+        assert_eq!(
+            market_reply_timeout_for(&search),
+            MARKET_SEARCH_REPLY_TIMEOUT
+        );
         assert_eq!(
             market_reply_timeout_for(&details),
             MARKET_DETAILS_REPLY_TIMEOUT
         );
-        assert!(MARKET_DETAILS_REPLY_TIMEOUT > REFRESH_REPLY_TIMEOUT);
-        assert!(MARKET_DETAILS_REPLY_TIMEOUT >= Duration::from_secs(960));
+        assert!(MARKET_SEARCH_REPLY_TIMEOUT > REFRESH_REPLY_TIMEOUT);
+        assert!(MARKET_SEARCH_REPLY_TIMEOUT >= Duration::from_secs(240));
+        assert!(MARKET_DETAILS_REPLY_TIMEOUT > MARKET_SEARCH_REPLY_TIMEOUT);
+        assert!(MARKET_DETAILS_REPLY_TIMEOUT >= Duration::from_secs(1020));
     }
 }
