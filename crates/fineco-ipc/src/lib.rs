@@ -47,6 +47,13 @@ pub const MAX_AMBIGUITY_SUGGESTIONS: usize = 10;
 /// Max number of candidates returned in one search result group.
 pub const MAX_CANDIDATES_PER_GROUP: usize = 10;
 
+/// Max number of asset-type groups in one market-search result (plan D-20).
+/// Fineco's global search exposes a fixed set of asset-type buckets and the
+/// normalizer emits one group per populated type, so this bound is already met
+/// structurally; it is a named, defensively enforced cap so the limit cannot
+/// silently grow if a new bucket is ever added to the search response shape.
+pub const MAX_SEARCH_GROUPS: usize = 8;
+
 /// Max characters in a public market-details identifier (`<venue>/<symbol>`).
 pub const MAX_IDENTIFIER_CHARS: usize = 64;
 
