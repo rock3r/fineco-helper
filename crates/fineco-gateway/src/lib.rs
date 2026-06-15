@@ -827,15 +827,18 @@ impl Gateway {
             wants_details_section(&params, MarketDetailsSection::ExternalEnrichment);
         let dispatched = match self.authorize(Capability::MarketAuthenticatedRead) {
             Err(err) => Err(("policy_denied".to_string(), err)),
-            Ok(()) => match params.validate() {
-                Err(err) => Err(audit_market_error(err)),
-                Ok(()) => {
-                    let fineco_params = details_params_for_fineco_worker(&params);
-                    self.market_control_dispatch(MarketControlRequest::MarketGetAssetDetails(
-                        fineco_params,
-                    ))
-                    .await
-                }
+            Ok(()) => match self.authorize_external_enrichment_for_details(needs_external) {
+                Err(err) => Err(("policy_denied".to_string(), err)),
+                Ok(()) => match params.validate() {
+                    Err(err) => Err(audit_market_error(err)),
+                    Ok(()) => {
+                        let fineco_params = details_params_for_fineco_worker(&params);
+                        self.market_control_dispatch(MarketControlRequest::MarketGetAssetDetails(
+                            fineco_params,
+                        ))
+                        .await
+                    }
+                },
             },
         };
         let result = match dispatched {
@@ -887,6 +890,17 @@ impl Gateway {
                 .map(|status| status.reused_session_401_recovered),
         });
         response
+    }
+
+    fn authorize_external_enrichment_for_details(
+        &self,
+        needs_external: bool,
+    ) -> Result<(), ErrorData> {
+        if needs_external {
+            self.authorize(Capability::MarketRead)
+        } else {
+            Ok(())
+        }
     }
 
     async fn append_external_enrichment(

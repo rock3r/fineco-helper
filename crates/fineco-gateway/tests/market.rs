@@ -454,7 +454,7 @@ async fn asset_details_can_fold_stock_external_enrichment_outside_the_worker() {
     });
 
     let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_policy(owner_authenticated_market_policy())
+        .with_policy(owner_all_market_policy())
         .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
         .with_market_control_client(MarketControlClient::new(&path));
 
@@ -596,6 +596,50 @@ async fn asset_details_external_enrichment_still_requires_authenticated_market_r
 }
 
 #[tokio::test]
+async fn asset_details_external_enrichment_also_requires_market_read() {
+    let enrichment_hits = Arc::new(AtomicU32::new(0));
+    let enrichment_hits_for_server = Arc::clone(&enrichment_hits);
+    let enrichment = spawn(move |_req| {
+        enrichment_hits_for_server.fetch_add(1, Ordering::SeqCst);
+        httptiny::Response::not_found()
+    });
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                assert_eq!(params.sections, Some(vec![MarketDetailsSection::Identity]));
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(sample_stock_details_result(&params.identifier)),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            MarketControlRequest::MarketSearchAsset(_) => panic!("unexpected search request"),
+        });
+    });
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let err = match gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "BIT/TIP".to_string(),
+            expected_isin: Some("IT0003153621".to_string()),
+            sections: Some(vec![MarketDetailsSection::ExternalEnrichment]),
+        }))
+        .await
+    {
+        Ok(_) => panic!("details external_enrichment must require market.read"),
+        Err(err) => err,
+    };
+
+    assert!(err.message.contains("policy"), "message: {}", err.message);
+    assert_eq!(enrichment_hits.load(Ordering::SeqCst), 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn asset_details_rejects_over_limit_sections_before_stripping_external_enrichment() {
     let enrichment_hits = Arc::new(AtomicU32::new(0));
     let enrichment_hits_for_server = Arc::clone(&enrichment_hits);
@@ -604,7 +648,7 @@ async fn asset_details_rejects_over_limit_sections_before_stripping_external_enr
         httptiny::Response::not_found()
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_policy(owner_authenticated_market_policy())
+        .with_policy(owner_all_market_policy())
         .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
         .with_market_control_client(MarketControlClient::new(
             "/tmp/fineco-gateway-market-control-dead.sock",
@@ -716,7 +760,7 @@ async fn asset_details_warns_when_external_enrichment_identity_disagrees() {
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_policy(owner_authenticated_market_policy())
+        .with_policy(owner_all_market_policy())
         .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
         .with_market_control_client(MarketControlClient::new(&path));
 
@@ -754,7 +798,7 @@ async fn asset_details_keeps_fineco_details_when_external_enrichment_fails() {
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_policy(owner_authenticated_market_policy())
+        .with_policy(owner_all_market_policy())
         .with_market(market_client(
             "http://127.0.0.1:9",
             "http://127.0.0.1:9/etf",
@@ -811,7 +855,7 @@ async fn asset_details_does_not_warn_for_external_exchange_suffix() {
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_policy(owner_authenticated_market_policy())
+        .with_policy(owner_all_market_policy())
         .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
         .with_market_control_client(MarketControlClient::new(&path));
 
@@ -880,7 +924,7 @@ async fn asset_details_external_enrichment_keeps_warning_and_source_caps() {
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_policy(owner_authenticated_market_policy())
+        .with_policy(owner_all_market_policy())
         .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
         .with_market_control_client(MarketControlClient::new(&path));
 
