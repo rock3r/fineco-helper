@@ -380,7 +380,7 @@ struct RawHolding {
 pub(crate) struct MarketDetailsInputs {
     pub(crate) static_response: StaticSearchResponse,
     pub(crate) snapshot_response: Option<SnapshotResponse>,
-    pub(crate) etf_snapshot: EtfQueryResponse,
+    pub(crate) etf_snapshot: Option<EtfQueryResponse>,
     pub(crate) etf_composition: Option<EtfQueryResponse>,
     pub(crate) etf_returns: Option<EtfQueryResponse>,
 }
@@ -388,7 +388,7 @@ pub(crate) struct MarketDetailsInputs {
 pub(crate) struct StockDetailsInputs {
     pub(crate) static_response: StaticSearchResponse,
     pub(crate) snapshot_response: Option<SnapshotResponse>,
-    pub(crate) stock_snapshot: StockSnapshotResponse,
+    pub(crate) stock_snapshot: Option<StockSnapshotResponse>,
     pub(crate) stock_reports: Option<StockReportsResponse>,
 }
 
@@ -520,8 +520,13 @@ pub(crate) fn to_market_asset_details(
         .snapshot_response
         .as_ref()
         .and_then(|response| response.get(&candidate.fineco_key));
-    let etf = matching_etf(&inputs.etf_snapshot, candidate)
-        .ok_or_else(SafeError::market_unexpected_response)?;
+    let etf = inputs
+        .etf_snapshot
+        .as_ref()
+        .map(|response| {
+            matching_etf(response, candidate).ok_or_else(SafeError::market_unexpected_response)
+        })
+        .transpose()?;
     let composition = inputs
         .etf_composition
         .as_ref()
@@ -554,7 +559,7 @@ pub(crate) fn to_market_asset_details(
         name: Some(text_field(
             static_item
                 .and_then(|item| item.description.clone())
-                .or_else(|| etf.description.clone())
+                .or_else(|| etf.and_then(|item| item.description.clone()))
                 .unwrap_or_else(|| candidate.name.clone()),
             "static.search",
             captured_at,
@@ -577,8 +582,7 @@ pub(crate) fn to_market_asset_details(
             fineco_ipc::MarketConfidence::High,
         ),
         symbol: text_field(
-            etf.ticker
-                .clone()
+            etf.and_then(|item| item.ticker.clone())
                 .or_else(|| {
                     static_item
                         .and_then(|item| item.symbol.clone())
@@ -707,7 +711,9 @@ pub(crate) fn to_market_asset_details(
             ));
         }
     }
-    if default_or_requested(params, MarketDetailsSection::Profile) {
+    if default_or_requested(params, MarketDetailsSection::Profile)
+        && let Some(etf) = etf
+    {
         sections.profile = Some(MarketProfileSection {
             description: None,
             sector: None,
@@ -754,7 +760,9 @@ pub(crate) fn to_market_asset_details(
             }),
         });
     }
-    if default_or_requested(params, MarketDetailsSection::Etf) {
+    if default_or_requested(params, MarketDetailsSection::Etf)
+        && let Some(etf) = etf
+    {
         sections.etf = Some(MarketEtfSection {
             ongoing_charge: number_field(
                 etf.ongoing_charge,
@@ -856,7 +864,7 @@ pub(crate) fn to_market_asset_details(
         }
     }
     if requested(params, MarketDetailsSection::Risk) {
-        sections.risk = risk_section(etf, captured_at);
+        sections.risk = etf.and_then(|item| risk_section(item, captured_at));
         if sections.risk.is_none() {
             warnings.push(warning(
                 "section_missing",
@@ -886,6 +894,7 @@ pub(crate) fn to_market_asset_details(
         sources: sources(
             captured_at,
             inputs.snapshot_response.is_some(),
+            etf.is_some(),
             fetched_matching_composition,
             fetched_matching_returns,
         ),
@@ -915,8 +924,9 @@ pub(crate) fn to_stock_asset_details(
     {
         return Err(SafeError::market_unexpected_response());
     }
-    let stock = &inputs.stock_snapshot;
-    verify_stock_snapshot_identity(stock, candidate)?;
+    if let Some(stock) = &inputs.stock_snapshot {
+        verify_stock_snapshot_identity(stock, candidate)?;
+    }
     let mut warnings = Vec::new();
     let (name, name_source_ref) = static_item
         .and_then(|item| item.description.clone())
@@ -927,12 +937,20 @@ pub(crate) fn to_stock_asset_details(
     let (venue, venue_source_ref) =
         if let Some(venue) = static_item.and_then(|item| item.venue_system.clone()) {
             (venue, "static.search")
-        } else if let Some(exchange) = stock.exchange.clone() {
+        } else if let Some(exchange) = inputs
+            .stock_snapshot
+            .as_ref()
+            .and_then(|stock| stock.exchange.clone())
+        {
             (exchange, "stock.snapshot")
         } else {
             (candidate.venue.clone(), "search.global")
         };
-    let (symbol, symbol_source_ref) = if let Some(ticker) = stock.ticker.clone() {
+    let (symbol, symbol_source_ref) = if let Some(ticker) = inputs
+        .stock_snapshot
+        .as_ref()
+        .and_then(|stock| stock.ticker.clone())
+    {
         (ticker, "stock.snapshot")
     } else if let Some(symbol) = static_item.and_then(|item| item.symbol.clone()) {
         (display_symbol_base(&symbol), "static.search")
@@ -950,9 +968,10 @@ pub(crate) fn to_stock_asset_details(
     } else if let Some(currency) = static_item.and_then(|item| item.currency_cd.clone()) {
         Some((currency, "static.search"))
     } else {
-        stock
-            .price_currency
-            .clone()
+        inputs
+            .stock_snapshot
+            .as_ref()
+            .and_then(|stock| stock.price_currency.clone())
             .map(|currency| (currency, "stock.snapshot"))
     };
 
@@ -1111,7 +1130,9 @@ pub(crate) fn to_stock_asset_details(
             ));
         }
     }
-    if default_or_requested_stock(params, MarketDetailsSection::Profile) {
+    if default_or_requested_stock(params, MarketDetailsSection::Profile)
+        && let Some(stock) = &inputs.stock_snapshot
+    {
         sections.profile = Some(MarketProfileSection {
             description: stock.description.clone().map(|value| {
                 text_field(
@@ -1145,7 +1166,10 @@ pub(crate) fn to_stock_asset_details(
         });
     }
     if default_or_requested_stock(params, MarketDetailsSection::Stock) {
-        sections.stock = Some(stock_section(stock, captured_at));
+        sections.stock = inputs
+            .stock_snapshot
+            .as_ref()
+            .map(|stock| stock_section(stock, captured_at));
     }
     if requested(params, MarketDetailsSection::Ratios) {
         sections.ratios = inputs
@@ -1195,6 +1219,7 @@ pub(crate) fn to_stock_asset_details(
         sources: stock_sources(
             captured_at,
             inputs.snapshot_response.is_some(),
+            inputs.stock_snapshot.is_some(),
             inputs.stock_reports.is_some(),
         ),
         warnings: warnings
@@ -1774,12 +1799,16 @@ fn ratios_section(item: &StockReportsResponse, captured_at: &str) -> Option<Mark
 fn sources(
     captured_at: &str,
     fetched_snapshot: bool,
+    fetched_etf_snapshot: bool,
     fetched_composition: bool,
     fetched_returns: bool,
 ) -> Vec<MarketSource> {
-    let mut source_refs = vec!["search.global", "static.search", "etf.query.snapshot"];
+    let mut source_refs = vec!["search.global", "static.search"];
     if fetched_snapshot {
         source_refs.push("snapshot");
+    }
+    if fetched_etf_snapshot {
+        source_refs.push("etf.query.snapshot");
     }
     if fetched_composition {
         source_refs.push("etf.query.composition");
@@ -1802,11 +1831,15 @@ fn sources(
 fn stock_sources(
     captured_at: &str,
     fetched_snapshot: bool,
+    fetched_stock_snapshot: bool,
     fetched_reports: bool,
 ) -> Vec<MarketSource> {
-    let mut source_refs = vec!["search.global", "static.search", "stock.snapshot"];
+    let mut source_refs = vec!["search.global", "static.search"];
     if fetched_snapshot {
         source_refs.push("snapshot");
+    }
+    if fetched_stock_snapshot {
+        source_refs.push("stock.snapshot");
     }
     if fetched_reports {
         source_refs.push("stock.reports");
@@ -2255,14 +2288,14 @@ mod tests {
             MarketDetailsInputs {
                 static_response: static_response(),
                 snapshot_response: Some(snapshot_response(Some("2026-06-12T15:35:29Z"))),
-                etf_snapshot: serde_json::from_str(
+                etf_snapshot: Some(serde_json::from_str(
                     r#"{"etfetcs":[
                         {"id":"OTHER.AFF","ticker":"OTHER","isinCusip":"IE0000000000","venueSystem":"AFF","costiGestioneOngoingCharge":9.99},
                         {"id":"DIFFERENT.AFF","ticker":"VHYL","isinCusip":"IE00DIFFERENT","venueSystem":"AFF","costiGestioneOngoingCharge":7.77},
                         {"id":"IE00B8GKDB10.AFF","ticker":"VHYL","isinCusip":"IE00B8GKDB10","venueSystem":"AFF","costiGestioneOngoingCharge":0.32}
                     ]}"#,
                 )
-                .expect("snapshot"),
+                .expect("snapshot")),
                 etf_composition: None,
                 etf_returns: Some(
                     serde_json::from_str(
@@ -2350,7 +2383,7 @@ mod tests {
             MarketDetailsInputs {
                 static_response: static_response(),
                 snapshot_response: Some(snapshot_response(Some("2026-06-12T15:35:29Z"))),
-                etf_snapshot: etf_snapshot_with_dates(),
+                etf_snapshot: Some(etf_snapshot_with_dates()),
                 etf_composition: None,
                 etf_returns: None,
             },
@@ -2380,10 +2413,10 @@ mod tests {
             MarketDetailsInputs {
                 static_response: static_response(),
                 snapshot_response: Some(snapshot_response(None)),
-                etf_snapshot: serde_json::from_str(
+                etf_snapshot: Some(serde_json::from_str(
                     r#"{"etfetcs":[{"id":"IE00B8GKDB10.AFF","ticker":"VHYL","venueSystem":"AFF","assetNetAssetValues":{"currencyId":"EUR","dayEndValue":100.0},"lastNAV":{"value":78.5}}]}"#,
                 )
-                .expect("etf"),
+                .expect("etf")),
                 etf_composition: None,
                 etf_returns: None,
             },
@@ -2424,7 +2457,7 @@ mod tests {
             MarketDetailsInputs {
                 static_response: static_response(),
                 snapshot_response: Some(snapshot_response(Some("2026-06-12T15:35:29Z"))),
-                etf_snapshot: etf_snapshot_with_dates(),
+                etf_snapshot: Some(etf_snapshot_with_dates()),
                 etf_composition: None,
                 etf_returns: None,
             },
@@ -2574,8 +2607,9 @@ mod tests {
             StockDetailsInputs {
                 static_response: stock_static_response(),
                 snapshot_response: Some(stock_quote_response()),
-                stock_snapshot: serde_json::from_str(
-                    r#"{
+                stock_snapshot: Some(
+                    serde_json::from_str(
+                        r#"{
                         "descrizione":"Apple Inc. designs devices and services.",
                         "reutersSector":"Technology",
                         "reutersIndustry":"Consumer Electronics",
@@ -2601,8 +2635,9 @@ mod tests {
                             "recommendation":{"numberOfRecommendations":49}
                         }
                     }"#,
-                )
-                .expect("stock snapshot"),
+                    )
+                    .expect("stock snapshot"),
+                ),
                 stock_reports: Some(
                     serde_json::from_str(
                         r#"{
@@ -2698,8 +2733,10 @@ mod tests {
             StockDetailsInputs {
                 static_response: stock_static_response(),
                 snapshot_response: Some(stock_quote_response()),
-                stock_snapshot: serde_json::from_str(r#"{"ticker":"MSFT","exchange":"NASDAQ"}"#)
-                    .expect("stock snapshot"),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"MSFT","exchange":"NASDAQ"}"#)
+                        .expect("stock snapshot"),
+                ),
                 stock_reports: None,
             },
             "2026-06-14T09:30:00Z",
@@ -2722,8 +2759,10 @@ mod tests {
             StockDetailsInputs {
                 static_response: stock_static_response(),
                 snapshot_response: Some(stock_quote_response()),
-                stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL.O","exchange":"NASDAQ"}"#)
-                    .expect("stock snapshot"),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"AAPL.O","exchange":"NASDAQ"}"#)
+                        .expect("stock snapshot"),
+                ),
                 stock_reports: None,
             },
             "2026-06-14T09:30:00Z",
@@ -2754,8 +2793,10 @@ mod tests {
             StockDetailsInputs {
                 static_response: StaticSearchResponse::new(),
                 snapshot_response: None,
-                stock_snapshot: serde_json::from_str(r#"{"ticker":"BRK.B.N","exchange":"NYSE"}"#)
-                    .expect("stock snapshot"),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"BRK.B.N","exchange":"NYSE"}"#)
+                        .expect("stock snapshot"),
+                ),
                 stock_reports: None,
             },
             "2026-06-14T09:30:00Z",
@@ -2786,8 +2827,10 @@ mod tests {
             StockDetailsInputs {
                 static_response: StaticSearchResponse::new(),
                 snapshot_response: None,
-                stock_snapshot: serde_json::from_str(r#"{"ticker":"BRK.A.N","exchange":"NYSE"}"#)
-                    .expect("stock snapshot"),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"BRK.A.N","exchange":"NYSE"}"#)
+                        .expect("stock snapshot"),
+                ),
                 stock_reports: None,
             },
             "2026-06-14T09:30:00Z",
@@ -2810,8 +2853,10 @@ mod tests {
             StockDetailsInputs {
                 static_response: StaticSearchResponse::new(),
                 snapshot_response: None,
-                stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
-                    .expect("stock snapshot"),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
+                        .expect("stock snapshot"),
+                ),
                 stock_reports: None,
             },
             "2026-06-14T09:30:00Z",
@@ -2839,8 +2884,10 @@ mod tests {
                     r#"{"US0378331005.NASDAQ":{"last":291.13,"bid":0.0,"ask":0.0,"prevClosePrice":295.63,"percVar":-1.52,"volume":38784789}}"#,
                 )
                 .expect("snapshot")),
-                stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
-                    .expect("stock snapshot"),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
+                        .expect("stock snapshot"),
+                ),
                 stock_reports: None,
             },
             "2026-06-14T09:30:00Z",
@@ -2882,8 +2929,10 @@ mod tests {
             StockDetailsInputs {
                 static_response: stock_static_response(),
                 snapshot_response: Some(stock_quote_response()),
-                stock_snapshot: serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
-                    .expect("stock snapshot"),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"AAPL","exchange":"NASDAQ"}"#)
+                        .expect("stock snapshot"),
+                ),
                 stock_reports: None,
             },
             "2026-06-14T09:30:00Z",

@@ -53,6 +53,39 @@ fn spawn_mock_fineco_with_broken_quote_snapshot() -> String {
     format!("http://{addr}")
 }
 
+fn spawn_mock_fineco_with_broken_etf_detail_snapshot() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "GET"
+                && path == "/v1/private/tol/etf/query"
+                && req.path.contains("view=snapshot")
+            {
+                return httptiny::Response::json(503, "{\"error\":\"etf snapshot unavailable\"}");
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
+fn spawn_mock_fineco_with_broken_stock_detail_snapshot() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "GET" && path == "/v1/private/snapshot/NASDAQ/US0378331005" {
+                return httptiny::Response::json(503, "{\"error\":\"stock snapshot unavailable\"}");
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
 fn worker_for(base: &str) -> FinecoWorker {
     FinecoWorker::new(
         FinecoEndpoints::for_base(base),
@@ -402,6 +435,37 @@ fn etf_details_skip_quote_snapshot_when_quote_section_is_not_requested() {
 }
 
 #[test]
+fn etf_details_skip_detail_snapshot_for_identity_and_listing_only() {
+    let base = spawn_mock_fineco_with_broken_etf_detail_snapshot();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10.AFF".to_string()),
+                sections: Some(vec![
+                    MarketDetailsSection::Identity,
+                    MarketDetailsSection::Listing,
+                ]),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("identity/listing-only ETF details should not require ETF snapshot");
+    let result = live.result;
+
+    assert_eq!(result.asset.identifier, "AFF/VHYL");
+    assert!(result.sections.listing.is_some());
+    assert!(result.sections.profile.is_none());
+    assert!(result.sections.etf.is_none());
+    let sources: Vec<_> = result
+        .sources
+        .iter()
+        .map(|source| source.source_ref.as_str())
+        .collect();
+    assert!(sources.contains(&"static.search"));
+    assert!(!sources.contains(&"etf.query.snapshot"));
+}
+
+#[test]
 fn logs_in_and_fetches_authenticated_stock_details() {
     let base = spawn_mock_fineco();
     let live = worker_for(&base)
@@ -450,6 +514,39 @@ fn logs_in_and_fetches_authenticated_stock_details() {
     let ratios = result.sections.ratios.expect("ratios");
     assert!(ratios.ratios.iter().any(|row| row.name.value == "NPRICE"));
     assert!(live.session.login_performed);
+}
+
+#[test]
+fn stock_details_skip_detail_snapshot_for_listing_and_ratios_only() {
+    let base = spawn_mock_fineco_with_broken_stock_detail_snapshot();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "NASDAQ/AAPL".to_string(),
+                expected_isin: Some("US0378331005".to_string()),
+                sections: Some(vec![
+                    MarketDetailsSection::Listing,
+                    MarketDetailsSection::Ratios,
+                ]),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("listing/ratios-only stock details should not require stock snapshot");
+    let result = live.result;
+
+    assert_eq!(result.asset.identifier, "NASDAQ/AAPL");
+    assert!(result.sections.listing.is_some());
+    assert!(result.sections.ratios.is_some());
+    assert!(result.sections.profile.is_none());
+    assert!(result.sections.stock.is_none());
+    let sources: Vec<_> = result
+        .sources
+        .iter()
+        .map(|source| source.source_ref.as_str())
+        .collect();
+    assert!(sources.contains(&"static.search"));
+    assert!(sources.contains(&"stock.reports"));
+    assert!(!sources.contains(&"stock.snapshot"));
 }
 
 #[test]

@@ -521,10 +521,24 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
 
         let result = match candidate.asset_type {
             MarketAssetType::Etf => {
-                let etf_snapshot_url =
-                    etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "snapshot");
-                let etf_snapshot: parse::EtfQueryResponse =
-                    self.get_market_json(&etf_snapshot_url, &cookie, MARKET_DETAILS_REFERER)?;
+                let etf_snapshot = if wants_default_or_any_section(
+                    params,
+                    &[
+                        MarketDetailsSection::Profile,
+                        MarketDetailsSection::Etf,
+                        MarketDetailsSection::Risk,
+                    ],
+                ) {
+                    let etf_snapshot_url =
+                        etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "snapshot");
+                    Some(self.get_market_json(
+                        &etf_snapshot_url,
+                        &cookie,
+                        MARKET_DETAILS_REFERER,
+                    )?)
+                } else {
+                    None
+                };
 
                 let etf_composition = if wants_any_section(
                     params,
@@ -566,10 +580,20 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
             }
             MarketAssetType::Stock => {
                 let (instr_id, venue) = fineco_key_parts(&candidate.fineco_key)?;
-                let stock_snapshot_url =
-                    stock_details_url(&self.endpoints.stock_snapshot, venue, instr_id);
-                let stock_snapshot: parse::StockSnapshotResponse =
-                    self.get_market_json(&stock_snapshot_url, &cookie, MARKET_DETAILS_REFERER)?;
+                let stock_snapshot = if wants_default_or_any_section(
+                    params,
+                    &[MarketDetailsSection::Profile, MarketDetailsSection::Stock],
+                ) {
+                    let stock_snapshot_url =
+                        stock_details_url(&self.endpoints.stock_snapshot, venue, instr_id);
+                    Some(self.get_market_json(
+                        &stock_snapshot_url,
+                        &cookie,
+                        MARKET_DETAILS_REFERER,
+                    )?)
+                } else {
+                    None
+                };
                 let stock_reports = if wants_section(params, MarketDetailsSection::Ratios) {
                     let url = stock_details_url(&self.endpoints.stock_reports, venue, instr_id);
                     Some(self.get_market_json(&url, &cookie, MARKET_DETAILS_REFERER)?)
@@ -780,6 +804,18 @@ fn wants_default_or_section(params: &MarketDetailsParams, section: MarketDetails
         .sections
         .as_ref()
         .is_none_or(|sections| sections.contains(&section))
+}
+
+fn wants_default_or_any_section(
+    params: &MarketDetailsParams,
+    sections: &[MarketDetailsSection],
+) -> bool {
+    params.sections.as_ref().is_none_or(|requested| {
+        sections
+            .iter()
+            .copied()
+            .any(|section| requested.contains(&section))
+    })
 }
 
 fn wants_any_section(params: &MarketDetailsParams, sections: &[MarketDetailsSection]) -> bool {
