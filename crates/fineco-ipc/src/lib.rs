@@ -17,7 +17,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fineco_core::{SafeError, normalize_expected_isin, validate_order_request, validate_tax_range};
+use fineco_core::{
+    SafeError, normalize_expected_isin, sanitize_text, validate_order_request, validate_tax_range,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -348,11 +350,11 @@ impl<T> MarketField<T> {
     ) -> Self {
         Self {
             value,
-            unit: unit.map(str::to_string),
+            unit: sanitize_optional_metadata(unit),
             source: source.to_string(),
             data_class: data_class.to_string(),
             source_ref: source_ref.to_string(),
-            as_of: as_of.map(str::to_string),
+            as_of: sanitize_optional_metadata(as_of),
             captured_at: captured_at.to_string(),
             confidence: MarketConfidence::High,
         }
@@ -370,11 +372,11 @@ impl<T> MarketField<T> {
     ) -> Self {
         Self {
             value,
-            unit: unit.map(str::to_string),
+            unit: sanitize_optional_metadata(unit),
             source: source.to_string(),
             data_class: data_class.to_string(),
             source_ref: source_ref.to_string(),
-            as_of: as_of.map(str::to_string),
+            as_of: sanitize_optional_metadata(as_of),
             captured_at: captured_at.to_string(),
             confidence: MarketConfidence::Medium,
         }
@@ -392,15 +394,21 @@ impl<T> MarketField<T> {
     ) -> Self {
         Self {
             value,
-            unit: unit.map(str::to_string),
+            unit: sanitize_optional_metadata(unit),
             source: source.to_string(),
             data_class: data_class.to_string(),
             source_ref: source_ref.to_string(),
-            as_of: as_of.map(str::to_string),
+            as_of: sanitize_optional_metadata(as_of),
             captured_at: captured_at.to_string(),
             confidence: MarketConfidence::Low,
         }
     }
+}
+
+fn sanitize_optional_metadata(value: Option<&str>) -> Option<String> {
+    value
+        .map(sanitize_text)
+        .filter(|cleaned| !cleaned.is_empty())
 }
 
 impl MarketField<String> {
@@ -1951,6 +1959,22 @@ impl RefreshClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_field_metadata_is_sanitized() {
+        let field = MarketField::high(
+            42.0,
+            Some(" EUR\n\x1b[31m percent "),
+            "fineco",
+            "authenticated_market",
+            "stock.snapshot",
+            Some(" 2026-06-14\tclose "),
+            "2026-06-15T08:30:00Z",
+        );
+
+        assert_eq!(field.unit.as_deref(), Some("EUR [31m percent"));
+        assert_eq!(field.as_of.as_deref(), Some("2026-06-14 close"));
+    }
 
     #[test]
     fn market_details_uses_a_fanout_sized_reply_timeout() {
