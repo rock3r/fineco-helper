@@ -366,6 +366,42 @@ fn logs_in_and_fetches_authenticated_etf_details() {
 }
 
 #[test]
+fn etf_details_skip_quote_snapshot_when_quote_section_is_not_requested() {
+    let base = spawn_mock_fineco_with_broken_quote_snapshot();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "AFF/VHYL".to_string(),
+                expected_isin: Some("IE00B8GKDB10.AFF".to_string()),
+                sections: Some(vec![MarketDetailsSection::Etf]),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("ETF details without quote should not require quote snapshot");
+    let result = live.result;
+
+    assert_eq!(result.asset.identifier, "AFF/VHYL");
+    assert!(result.sections.quote.is_none());
+    assert_eq!(
+        result
+            .sections
+            .etf
+            .expect("etf")
+            .ongoing_charge
+            .expect("ongoing charge")
+            .value,
+        0.32
+    );
+    let sources: Vec<_> = result
+        .sources
+        .iter()
+        .map(|source| source.source_ref.as_str())
+        .collect();
+    assert!(sources.contains(&"etf.query.snapshot"));
+    assert!(!sources.contains(&"snapshot"));
+}
+
+#[test]
 fn logs_in_and_fetches_authenticated_stock_details() {
     let base = spawn_mock_fineco();
     let live = worker_for(&base)
@@ -443,6 +479,13 @@ fn stock_details_skip_quote_snapshot_when_quote_section_is_not_requested() {
             .value,
         "Technology"
     );
+    let sources: Vec<_> = result
+        .sources
+        .iter()
+        .map(|source| source.source_ref.as_str())
+        .collect();
+    assert!(sources.contains(&"stock.snapshot"));
+    assert!(!sources.contains(&"snapshot"));
 }
 
 #[test]

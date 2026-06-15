@@ -885,6 +885,7 @@ pub(crate) fn to_market_asset_details(
         sections,
         sources: sources(
             captured_at,
+            inputs.snapshot_response.is_some(),
             fetched_matching_composition,
             fetched_matching_returns,
         ),
@@ -1174,7 +1175,11 @@ pub(crate) fn to_stock_asset_details(
         captured_at: captured_at.to_string(),
         asset,
         sections,
-        sources: stock_sources(captured_at, inputs.stock_reports.is_some()),
+        sources: stock_sources(
+            captured_at,
+            inputs.snapshot_response.is_some(),
+            inputs.stock_reports.is_some(),
+        ),
         warnings: warnings
             .into_iter()
             .take(fineco_ipc::MAX_WARNINGS)
@@ -1745,15 +1750,14 @@ fn ratios_section(item: &StockReportsResponse, captured_at: &str) -> Option<Mark
 
 fn sources(
     captured_at: &str,
+    fetched_snapshot: bool,
     fetched_composition: bool,
     fetched_returns: bool,
 ) -> Vec<MarketSource> {
-    let mut source_refs = vec![
-        "search.global",
-        "static.search",
-        "snapshot",
-        "etf.query.snapshot",
-    ];
+    let mut source_refs = vec!["search.global", "static.search", "etf.query.snapshot"];
+    if fetched_snapshot {
+        source_refs.push("snapshot");
+    }
     if fetched_composition {
         source_refs.push("etf.query.composition");
     }
@@ -1772,13 +1776,15 @@ fn sources(
         .collect()
 }
 
-fn stock_sources(captured_at: &str, fetched_reports: bool) -> Vec<MarketSource> {
-    let mut source_refs = vec![
-        "search.global",
-        "static.search",
-        "snapshot",
-        "stock.snapshot",
-    ];
+fn stock_sources(
+    captured_at: &str,
+    fetched_snapshot: bool,
+    fetched_reports: bool,
+) -> Vec<MarketSource> {
+    let mut source_refs = vec!["search.global", "static.search", "stock.snapshot"];
+    if fetched_snapshot {
+        source_refs.push("snapshot");
+    }
     if fetched_reports {
         source_refs.push("stock.reports");
     }
