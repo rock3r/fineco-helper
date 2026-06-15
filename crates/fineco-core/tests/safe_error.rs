@@ -87,6 +87,12 @@ fn expected_isin_normalization_accepts_plain_and_dotted_suffixes() {
 }
 
 #[test]
+fn expected_isin_normalization_rejects_non_numeric_check_digit() {
+    assert!(fineco_core::normalize_expected_isin("IE00B8GKDB1A").is_err());
+    assert!(fineco_core::normalize_expected_isin("IE00B8GKDB1A.AFF").is_err());
+}
+
+#[test]
 fn upstream_status_maps_to_safe_class_and_retryability() {
     assert_eq!(
         SafeError::from_upstream_status(401).class(),

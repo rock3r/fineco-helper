@@ -424,6 +424,7 @@ fn is_isin(value: &str) -> bool {
             .chars()
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
         && value.chars().take(2).all(|ch| ch.is_ascii_uppercase())
+        && value.chars().last().is_some_and(|ch| ch.is_ascii_digit())
 }
 
 impl std::fmt::Display for SafeError {
