@@ -1598,7 +1598,7 @@ impl MarketControlWireReply {
 /// authenticated Fineco endpoints; this must stay aligned with the live client
 /// details timeout so the gateway does not fail locally while the controller
 /// keeps spending the login.
-const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
+const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(420);
 
 fn market_reply_timeout_for(request: &MarketControlRequest) -> Duration {
     match request {

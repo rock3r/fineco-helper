@@ -60,7 +60,7 @@ const LIVE_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 /// live-socket read timeout must cover that allowed fan-out so the controller
 /// does not report a local transport failure while the worker is still making
 /// bounded Fineco reads.
-const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(300);
+const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(420);
 
 /// A command from the refresh controller to the private worker. Adjacently tagged
 /// as `{"command": "...", "params": {...}}` (commands without params omit it).
