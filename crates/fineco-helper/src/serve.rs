@@ -856,7 +856,8 @@ where
         + RawOrdersFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
-        + MarketAssetDetailsLiveFetcher,
+        + MarketAssetDetailsLiveFetcher
+        + fineco_live::MarketIndicesLiveFetcher,
 {
     prepare_socket_path(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;

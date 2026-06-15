@@ -15,9 +15,10 @@ use fineco_gateway::Gateway;
 use fineco_ipc::{
     MarketAssetDetailsResult, MarketAssetIdentity, MarketAssetSections, MarketAssetType,
     MarketControlClient, MarketControlOutcome, MarketControlRequest, MarketDetailsParams,
-    MarketDetailsSection, MarketEnrichmentParams, MarketEtfsParams, MarketField,
-    MarketSearchCandidate, MarketSearchGroup, MarketSearchParams, MarketSearchResult, MarketSource,
-    MarketWarning, Policy, serve_market_control_blocking,
+    MarketDetailsSection, MarketEnrichmentParams, MarketEtfsParams, MarketField, MarketIndexCard,
+    MarketIndexRegion, MarketIndicesParams, MarketIndicesResult, MarketSearchCandidate,
+    MarketSearchGroup, MarketSearchParams, MarketSearchResult, MarketSource, MarketWarning, Policy,
+    serve_market_control_blocking,
 };
 use fineco_market::{EnrichmentHostAllowlist, MarketClient};
 use rmcp::handler::server::wrapper::Parameters;
@@ -100,6 +101,43 @@ fn sample_search_result(query: &str) -> MarketSearchResult {
                 preferred: true,
             }],
         }],
+    }
+}
+
+fn sample_indices_result() -> MarketIndicesResult {
+    MarketIndicesResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        source: "fineco.indicesbar".to_string(),
+        captured_at: "2026-06-14T09:30:00Z".to_string(),
+        indices: vec![MarketIndexCard {
+            symbol: MarketField::high_string(
+                "^FTMIB.affIdx",
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                "2026-06-14T09:30:00Z",
+            ),
+            label: MarketField::high_string(
+                "Ftse mib",
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                "2026-06-14T09:30:00Z",
+            ),
+            region: MarketIndexRegion::Europe,
+            value: None,
+            change_percent: Some(MarketField::medium(
+                1.97,
+                Some("percent"),
+                "fineco.indicesbar",
+                "authenticated_market",
+                "indicesbar",
+                None,
+                "2026-06-14T09:30:00Z",
+            )),
+        }],
+        warnings: vec![],
     }
 }
 
@@ -338,7 +376,7 @@ async fn authenticated_market_search_routes_through_the_controller_socket() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketGetAssetDetails(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
 
@@ -366,6 +404,43 @@ async fn authenticated_market_search_routes_through_the_controller_socket() {
 }
 
 #[tokio::test]
+async fn authenticated_market_indices_routes_through_the_controller_socket() {
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetIndices(params) => {
+                assert_eq!(params.region, Some(MarketIndexRegion::Europe));
+                assert_eq!(params.limit, Some(10));
+                Ok(MarketControlOutcome::Indices {
+                    result: sample_indices_result(),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            _ => panic!("wrong request"),
+        });
+    });
+
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_authenticated_market_policy())
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let result = gateway
+        .market_get_indices(Parameters(MarketIndicesParams {
+            region: Some(MarketIndexRegion::Europe),
+            limit: Some(10),
+        }))
+        .await
+        .expect("authenticated market indices")
+        .0;
+
+    assert_eq!(result.data_class, "authenticated_market");
+    assert_eq!(result.source, "fineco.indicesbar");
+    assert_eq!(result.indices[0].symbol.value, "^FTMIB.affIdx");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn authenticated_market_details_routes_through_the_controller_socket() {
     let path = market_control_socket_path();
     let listener = UnixListener::bind(&path).expect("bind market-control socket");
@@ -386,7 +461,7 @@ async fn authenticated_market_details_routes_through_the_controller_socket() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
 
@@ -449,7 +524,7 @@ async fn asset_details_can_fold_stock_external_enrichment_outside_the_worker() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
 
@@ -521,7 +596,7 @@ async fn folded_external_enrichment_matches_the_wrapper_payload() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
 
@@ -614,7 +689,7 @@ async fn asset_details_external_enrichment_also_requires_market_read() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("unexpected search request"),
+            _ => panic!("unexpected search request"),
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
@@ -756,7 +831,7 @@ async fn asset_details_warns_when_external_enrichment_identity_disagrees() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
@@ -794,7 +869,7 @@ async fn asset_details_keeps_fineco_details_when_external_enrichment_fails() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
@@ -851,7 +926,7 @@ async fn asset_details_does_not_warn_for_external_exchange_suffix() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)
@@ -920,7 +995,7 @@ async fn asset_details_external_enrichment_keeps_warning_and_source_caps() {
                     session: fineco_ipc::MarketSessionStatus::fresh_login(),
                 })
             }
-            MarketControlRequest::MarketSearchAsset(_) => panic!("wrong request"),
+            _ => panic!("wrong request"),
         });
     });
     let gateway = Gateway::new(UNUSED_SOCKET)

@@ -49,6 +49,19 @@ const ETF_RETURNS_VHYL: &str = include_str!("../../fixtures/fineco/etf-returns-v
 const STOCK_SNAPSHOT_AAPL: &str = include_str!("../../fixtures/fineco/stock-snapshot-aapl.json");
 /// Canned synthetic stock reports fixture.
 const STOCK_REPORTS_AAPL: &str = include_str!("../../fixtures/fineco/stock-reports-aapl.json");
+/// Canned synthetic Fineco indices-bar fixture, shaped from captured HARs with
+/// no auth/session material.
+const INDICES_BAR: &str = r#"{
+  "nextToken": "redacted",
+  "indices": [
+    {"symbol":"^FTMIB.affIdx","url":"/pvt/trading/stocklist/ftsemib","label":"Ftse mib","var":1.97},
+    {"symbol":"^GDAXI.XETRA","url":"/pvt/trading/stocklist/dax","label":"Dax","var":1.76},
+    {"symbol":"^DJI.NYSE","url":"/pvt/trading/stocklist/usadj","label":"Dow Jones","var":0.7},
+    {"symbol":"^NDX.nasdaq-nm","url":"/pvt/trading/stocklist/nasdaq100","label":"Nasdaq","var":0.644},
+    {"symbol":"MBTM6CFD.CFDC","url":"/pvt/trading/crypto/home/showcase","label":"BITCOIN","value":63535,"var":-0.4162},
+    {"symbol":"^N225.Tokyo","url":"/pvt/trading/indices?listname=indiciAsia&titolo=^N225.Tokyo","label":"Nikkei","var":2.81}
+  ]
+}"#;
 
 /// Path of the public, no-auth zero-commission ETF list (mirrors the real
 /// `images.finecobank.com` JSON path).
@@ -151,6 +164,7 @@ pub fn route(req: &Request) -> Response {
             }
             Response::json(400, "{\"error\":\"unexpected snapshot instrument\"}")
         }
+        ("GET", "/v1/private/tol/indicesbar/indices") => private(req, INDICES_BAR),
         ("GET", "/v1/private/tol/etf/query") => {
             if !req.path.contains("ids=IE00B8GKDB10.AFF") {
                 return Response::json(400, "{\"error\":\"unexpected etf id\"}");

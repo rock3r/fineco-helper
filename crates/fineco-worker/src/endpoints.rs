@@ -22,6 +22,7 @@ pub struct FinecoEndpoints {
     pub(crate) global_search: String,
     pub(crate) static_search: String,
     pub(crate) instruments_snapshot: String,
+    pub(crate) indicesbar: String,
     pub(crate) etf_query: String,
     pub(crate) stock_snapshot: String,
     pub(crate) stock_reports: String,
@@ -50,6 +51,8 @@ impl FinecoEndpoints {
                     .to_string(),
             instruments_snapshot:
                 "https://private-api.finecobank.com/v1/private/tol/instruments/snapshot".to_string(),
+            indicesbar: "https://private-api.finecobank.com/v1/private/tol/indicesbar/indices"
+                .to_string(),
             etf_query: "https://private-api.finecobank.com/v1/private/tol/etf/query".to_string(),
             stock_snapshot: "https://private-api.finecobank.com/v1/private/snapshot".to_string(),
             stock_reports: "https://private-api.finecobank.com/v1/private/snapshot/reports"
@@ -74,6 +77,7 @@ impl FinecoEndpoints {
             global_search: format!("{base}/v1/private/tol/stocklists/search/global"),
             static_search: format!("{base}/v1/private/tol/instruments/static/search"),
             instruments_snapshot: format!("{base}/v1/private/tol/instruments/snapshot"),
+            indicesbar: format!("{base}/v1/private/tol/indicesbar/indices"),
             etf_query: format!("{base}/v1/private/tol/etf/query"),
             stock_snapshot: format!("{base}/v1/private/snapshot"),
             stock_reports: format!("{base}/v1/private/snapshot/reports"),

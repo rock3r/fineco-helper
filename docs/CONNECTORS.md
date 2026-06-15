@@ -77,7 +77,7 @@ On a **dual-pin** deployment the two Access channels are scoped differently:
   tools:
   `portfolio_get_latest_snapshot_summary`, `portfolio_get_latest_full_snapshot`,
   `portfolio_get_history`, `portfolio_get_position_history`,
-  `market_search_asset`, `market_get_asset_details`.
+  `market_search_asset`, `market_get_asset_details`, `market_get_indices`.
   Those are hidden from `tools/list` and refused by `tools/call` on the connector
   channel. This also hides the `external_enrichment` details section by default,
   because that section is available only through `market_get_asset_details`;

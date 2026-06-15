@@ -327,6 +327,15 @@ async fn authenticated_market_mcp_schemas_are_closed() {
         serde_json::Value::Bool(false),
         "market_get_asset_details params schema must be closed: {market_details}"
     );
+    let market_indices = tools
+        .iter()
+        .find(|tool| tool["name"] == "market_get_indices")
+        .expect("market_get_indices listed on CLI channel");
+    assert_eq!(
+        market_indices["inputSchema"]["additionalProperties"],
+        serde_json::Value::Bool(false),
+        "market_get_indices params schema must be closed: {market_indices}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

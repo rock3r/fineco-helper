@@ -371,8 +371,8 @@ loopback-only with no auth):
 - `FINECO_CONNECTOR_TOOLS` (optional, **requires an email/OAuth pin** —
   `FINECO_OWNER_EMAIL`) — the connector (email/OAuth) channel's tool allowlist; the
   CLI (service-token) channel is always full. Unset = the default (every tool except
-  the four detailed-portfolio absolute-€ tools plus `market_search_asset` and
-  `market_get_asset_details`);
+  the four detailed-portfolio absolute-€ tools plus `market_search_asset`,
+  `market_get_asset_details`, and `market_get_indices`);
   `*`/`all` = no restriction; a comma
   list = exactly those tools. Unknown names fail closed; setting it without an email
   pin errors. Applies to any email-pinned deployment (incl. single-email-pin), not

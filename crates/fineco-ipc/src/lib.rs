@@ -38,6 +38,9 @@ const MAX_HISTORY_LIMIT: u32 = 1000;
 /// Max number of Fineco search candidates returned to one market-search call.
 pub const MAX_TOTAL_CANDIDATES: u32 = 30;
 
+/// Max number of Fineco headline index-bar cards returned in one call.
+pub const MAX_INDEX_CARDS: u32 = 50;
+
 /// Max candidate summaries embedded in an ambiguity safe error.
 pub const MAX_AMBIGUITY_SUGGESTIONS: usize = 10;
 
@@ -273,6 +276,53 @@ pub struct MarketSearchResult {
     pub source: String,
     pub captured_at: String,
     pub groups: Vec<MarketSearchGroup>,
+}
+
+/// Optional coarse region filter for `market_get_indices`. This is a bounded
+/// local filter over Fineco's headline index-bar widget, not a venue registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketIndexRegion {
+    Europe,
+    Americas,
+    AsiaPacific,
+    Other,
+}
+
+/// Parameters for `market_get_indices`: a bounded read of Fineco's headline
+/// indices-bar cards with an optional coarse local region filter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MarketIndicesParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<MarketIndexRegion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One normalized card from Fineco's headline indices-bar widget. Despite the
+/// tool name, Fineco also includes a few FX/commodity/crypto/spread cards; v0
+/// preserves them as headline cards and does not infer a market universe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketIndexCard {
+    pub symbol: MarketField<String>,
+    pub label: MarketField<String>,
+    pub region: MarketIndexRegion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_percent: Option<MarketField<f64>>,
+}
+
+/// Normalized result for `market_get_indices`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketIndicesResult {
+    pub schema_version: u32,
+    pub data_class: String,
+    pub source: String,
+    pub captured_at: String,
+    pub indices: Vec<MarketIndexCard>,
+    pub warnings: Vec<MarketWarning>,
 }
 
 /// Optional sections for `market_get_asset_details`. Defaults are selected by
@@ -730,6 +780,13 @@ pub struct MarketAssetDetailsLiveResult {
     pub session: MarketSessionStatus,
 }
 
+/// Authenticated Fineco indices-bar result plus status-only worker session facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MarketIndicesLiveResult {
+    pub result: MarketIndicesResult,
+    pub session: MarketSessionStatus,
+}
+
 /// Status-only Fineco session facts returned by the credentialed worker. This
 /// intentionally carries no cookie values, auth headers, raw `Set-Cookie`, or
 /// reusable session handles.
@@ -842,6 +899,19 @@ pub trait MarketAssetDetailsLiveFetcher {
     ) -> Result<MarketAssetDetailsLiveResult, SafeError>;
 }
 
+/// Authenticated market indices-bar fetcher served by the credentialed live worker.
+pub trait MarketIndicesLiveFetcher {
+    /// Fetch Fineco's normalized headline index-bar cards.
+    ///
+    /// # Errors
+    /// [`SafeError`] on validation/auth/upstream/internal failure.
+    fn fetch_market_indices(
+        &self,
+        params: &MarketIndicesParams,
+        now_iso: &str,
+    ) -> Result<MarketIndicesLiveResult, SafeError>;
+}
+
 impl MarketSearchParams {
     /// Validate search bounds at every boundary (gateway, controller, worker).
     ///
@@ -861,6 +931,21 @@ impl MarketSearchParams {
             && (limit == 0 || limit > MAX_TOTAL_CANDIDATES)
         {
             return Err(SafeError::invalid_request("limit must be 1..=30."));
+        }
+        Ok(())
+    }
+}
+
+impl MarketIndicesParams {
+    /// Validate indices request bounds at every boundary.
+    ///
+    /// # Errors
+    /// [`SafeError::invalid_request`] if the limit is outside `1..=50`.
+    pub fn validate(&self) -> Result<(), SafeError> {
+        if let Some(limit) = self.limit
+            && (limit == 0 || limit > MAX_INDEX_CARDS)
+        {
+            return Err(SafeError::invalid_request("limit must be 1..=50."));
         }
         Ok(())
     }
@@ -1537,6 +1622,7 @@ impl Client {
 pub enum MarketControlRequest {
     MarketSearchAsset(MarketSearchParams),
     MarketGetAssetDetails(MarketDetailsParams),
+    MarketGetIndices(MarketIndicesParams),
 }
 
 impl MarketControlRequest {
@@ -1568,7 +1654,8 @@ impl MarketControlRequest {
     pub fn required_capability(&self) -> Capability {
         match self {
             MarketControlRequest::MarketSearchAsset(_)
-            | MarketControlRequest::MarketGetAssetDetails(_) => Capability::MarketAuthenticatedRead,
+            | MarketControlRequest::MarketGetAssetDetails(_)
+            | MarketControlRequest::MarketGetIndices(_) => Capability::MarketAuthenticatedRead,
         }
     }
 
@@ -1578,6 +1665,7 @@ impl MarketControlRequest {
         match self {
             MarketControlRequest::MarketSearchAsset(_) => "market_search_asset",
             MarketControlRequest::MarketGetAssetDetails(_) => "market_get_asset_details",
+            MarketControlRequest::MarketGetIndices(_) => "market_get_indices",
         }
     }
 
@@ -1589,6 +1677,7 @@ impl MarketControlRequest {
         match self {
             MarketControlRequest::MarketSearchAsset(params) => params.validate(),
             MarketControlRequest::MarketGetAssetDetails(params) => params.validate(),
+            MarketControlRequest::MarketGetIndices(params) => params.validate(),
         }
     }
 }
@@ -1603,6 +1692,10 @@ pub enum MarketControlOutcome {
     },
     Details {
         result: Box<MarketAssetDetailsResult>,
+        session: MarketSessionStatus,
+    },
+    Indices {
+        result: MarketIndicesResult,
         session: MarketSessionStatus,
     },
 }
@@ -1651,7 +1744,9 @@ const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(1020);
 
 fn market_reply_timeout_for(request: &MarketControlRequest) -> Duration {
     match request {
-        MarketControlRequest::MarketSearchAsset(_) => MARKET_SEARCH_REPLY_TIMEOUT,
+        MarketControlRequest::MarketSearchAsset(_) | MarketControlRequest::MarketGetIndices(_) => {
+            MARKET_SEARCH_REPLY_TIMEOUT
+        }
         MarketControlRequest::MarketGetAssetDetails(_) => MARKET_DETAILS_REPLY_TIMEOUT,
     }
 }

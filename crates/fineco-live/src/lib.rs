@@ -31,10 +31,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fineco_core::SafeError;
-pub use fineco_ipc::{MarketAssetDetailsLiveFetcher, MarketSearchLiveFetcher};
+pub use fineco_ipc::{
+    MarketAssetDetailsLiveFetcher, MarketIndicesLiveFetcher, MarketSearchLiveFetcher,
+};
 use fineco_ipc::{
-    MarketAssetDetailsLiveResult, MarketDetailsParams, MarketSearchLiveResult, MarketSearchParams,
-    SafeErrorDto,
+    MarketAssetDetailsLiveResult, MarketDetailsParams, MarketIndicesLiveResult,
+    MarketIndicesParams, MarketSearchLiveResult, MarketSearchParams, SafeErrorDto,
 };
 use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{
@@ -88,6 +90,8 @@ pub enum LiveRequest {
     MarketSearch(LiveMarketSearchParams),
     /// Resolve and fetch authenticated Fineco market details, stamped with controller time.
     MarketAssetDetails(LiveMarketDetailsParams),
+    /// Fetch Fineco headline index-bar cards, stamped with controller time.
+    MarketIndices(LiveMarketIndicesParams),
 }
 
 /// Parameters for [`LiveRequest::Portfolio`].
@@ -133,6 +137,15 @@ pub struct LiveMarketDetailsParams {
     pub now_iso: String,
 }
 
+/// Parameters for [`LiveRequest::MarketIndices`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveMarketIndicesParams {
+    pub indices: MarketIndicesParams,
+    /// The controller's clock (ISO-8601 UTC); used as result `captured_at`.
+    pub now_iso: String,
+}
+
 /// A successful worker result, typed per command (the plan forbids generic raw
 /// JSON for private payloads). Orders are [`RawOrder`]s — the worker holds no DB
 /// key — and are hashed by the controller after they cross the socket.
@@ -145,6 +158,7 @@ pub enum LiveResponse {
     TaxMinusByYear(Vec<NewTaxMinusByYear>),
     MarketSearch(MarketSearchLiveResult),
     MarketAssetDetails(Box<MarketAssetDetailsLiveResult>),
+    MarketIndices(MarketIndicesLiveResult),
 }
 
 /// The worker's reply: a typed result or the safe error envelope. Every worker
@@ -171,6 +185,7 @@ where
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
+        + MarketIndicesLiveFetcher
         + ?Sized,
 {
     match request {
@@ -192,6 +207,9 @@ where
         LiveRequest::MarketAssetDetails(p) => fetcher
             .fetch_market_asset_details(&p.details, &p.now_iso)
             .map(|result| LiveResponse::MarketAssetDetails(Box::new(result))),
+        LiveRequest::MarketIndices(p) => fetcher
+            .fetch_market_indices(&p.indices, &p.now_iso)
+            .map(LiveResponse::MarketIndices),
     }
 }
 
@@ -210,6 +228,7 @@ where
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
+        + MarketIndicesLiveFetcher
         + ?Sized,
 {
     for stream in listener.incoming() {
@@ -227,6 +246,7 @@ where
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
+        + MarketIndicesLiveFetcher
         + ?Sized,
 {
     // Bound a stalled peer so one half-open connection cannot pin the accept loop.
@@ -304,7 +324,9 @@ impl LiveClient {
 
 fn client_timeout_for(request: &LiveRequest) -> Duration {
     match request {
-        LiveRequest::MarketSearch(_) => LIVE_MARKET_SEARCH_CLIENT_TIMEOUT,
+        LiveRequest::MarketSearch(_) | LiveRequest::MarketIndices(_) => {
+            LIVE_MARKET_SEARCH_CLIENT_TIMEOUT
+        }
         LiveRequest::MarketAssetDetails(_) => LIVE_MARKET_DETAILS_CLIENT_TIMEOUT,
         LiveRequest::Portfolio(_)
         | LiveRequest::Orders(_)
@@ -365,6 +387,25 @@ impl LiveClient {
             _ => Err(SafeError::internal()),
         }
     }
+
+    /// Return authenticated Fineco index-bar cards with status-only worker
+    /// session facts.
+    ///
+    /// # Errors
+    /// [`SafeError`] on worker/transport failure.
+    pub fn fetch_market_indices_live(
+        &self,
+        params: &MarketIndicesParams,
+        now_iso: &str,
+    ) -> Result<MarketIndicesLiveResult, SafeError> {
+        match self.call(&LiveRequest::MarketIndices(LiveMarketIndicesParams {
+            indices: params.clone(),
+            now_iso: now_iso.to_string(),
+        }))? {
+            LiveResponse::MarketIndices(result) => Ok(result),
+            _ => Err(SafeError::internal()),
+        }
+    }
 }
 
 impl MarketSearchLiveFetcher for LiveClient {
@@ -384,6 +425,16 @@ impl MarketAssetDetailsLiveFetcher for LiveClient {
         now_iso: &str,
     ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
         self.fetch_market_asset_details_live(params, now_iso)
+    }
+}
+
+impl MarketIndicesLiveFetcher for LiveClient {
+    fn fetch_market_indices(
+        &self,
+        params: &MarketIndicesParams,
+        now_iso: &str,
+    ) -> Result<MarketIndicesLiveResult, SafeError> {
+        self.fetch_market_indices_live(params, now_iso)
     }
 }
 impl OrdersFetcher for LiveClient {

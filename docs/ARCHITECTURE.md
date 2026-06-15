@@ -214,10 +214,15 @@ Product (`crates/`):
   → audit; reply is op/snapshot status only); `None` → a safe "not configured"
   error. It also holds an `Option<Arc<MarketControlClient>>` and serves
   authenticated market tools by forwarding a `MarketControlRequest` over
-  **`market-control.sock`** for `market_search_asset` and
-  `market_get_asset_details`; these require `market.authenticated.read` and are
-  hidden from connector defaults. The checked-in deployment policy intentionally
-  leaves that capability ungranted until market live-session gates are complete.
+  **`market-control.sock`** for `market_search_asset`,
+  `market_get_asset_details`, and `market_get_indices`; these require
+  `market.authenticated.read` and are hidden from connector defaults. The
+  checked-in deployment policy intentionally leaves that capability ungranted
+  until market live-session gates are complete.
+  `market_get_indices` reads the captured Fineco
+  `/v1/private/tol/indicesbar/indices` widget shape and returns bounded headline
+  cards only; Fineco includes a few FX/commodity/crypto/spread cards there, so
+  the result is not a venue registry or complete index universe.
   When stock details explicitly request `external_enrichment`, the gateway first
   resolves/fetches the requested Fineco sections through market-control, then
   appends the third-party enrichment section via the credential-free

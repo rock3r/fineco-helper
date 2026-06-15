@@ -30,9 +30,9 @@ use fineco_core::{
 use fineco_ipc::{
     MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher, MarketAssetDetailsLiveResult,
     MarketAssetDetailsResult, MarketAssetIdentity, MarketAssetSections, MarketAssetType,
-    MarketDetailsParams, MarketDetailsSection, MarketField, MarketSearchCandidate,
-    MarketSearchLiveFetcher, MarketSearchLiveResult, MarketSearchParams, MarketSessionStatus,
-    MarketSource,
+    MarketDetailsParams, MarketDetailsSection, MarketField, MarketIndicesLiveFetcher,
+    MarketIndicesLiveResult, MarketIndicesParams, MarketSearchCandidate, MarketSearchLiveFetcher,
+    MarketSearchLiveResult, MarketSearchParams, MarketSessionStatus, MarketSource,
 };
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder};
@@ -646,6 +646,26 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
         Ok(MarketAssetDetailsLiveResult {
             result,
             session: session_status,
+        })
+    }
+}
+
+impl MarketIndicesLiveFetcher for FinecoWorker {
+    fn fetch_market_indices(
+        &self,
+        params: &MarketIndicesParams,
+        now_iso: &str,
+    ) -> Result<MarketIndicesLiveResult, SafeError> {
+        params.validate()?;
+        let session = self.login().map_err(market_login_error)?;
+        let response: parse::MarketIndicesResponse = self.get_market_json(
+            &self.endpoints.indicesbar,
+            &session.cookie,
+            MARKET_SEARCH_REFERER,
+        )?;
+        Ok(MarketIndicesLiveResult {
+            result: parse::to_market_indices(response, params, now_iso),
+            session: MarketSessionStatus::fresh_login_with_expiry(session.expires_in_secs),
         })
     }
 }

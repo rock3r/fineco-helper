@@ -64,6 +64,11 @@ Authenticated Fineco market reads (controller-mediated live Fineco login):
   implemented as a typed controller path, but intentionally not granted by the
   checked-in deployment policy until the market live-session gate has been
   reviewed clean and the owner intentionally enables it)
+- `market_get_indices` (Fineco headline indices-bar cards, not a complete index
+  universe or venue registry; implemented as a typed controller path, but
+  intentionally not granted by the checked-in deployment policy until the market
+  live-session gate has been reviewed clean and the owner intentionally enables
+  it)
 
 Gated live refresh (a real, rate-limited Fineco login; returns status only — read the
 refreshed values via the cached tools afterward):
