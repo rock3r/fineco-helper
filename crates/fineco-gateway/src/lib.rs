@@ -1092,7 +1092,17 @@ fn emit_external_enrichment_audit(
     duration: std::time::Duration,
     result_count: Option<usize>,
 ) {
-    audit::emit(&audit::AuditRecord {
+    let record = external_enrichment_audit_record(outcome, error_code, duration, result_count);
+    audit::emit(&record);
+}
+
+fn external_enrichment_audit_record(
+    outcome: &'static str,
+    error_code: Option<String>,
+    duration: std::time::Duration,
+    result_count: Option<usize>,
+) -> audit::AuditRecord {
+    audit::AuditRecord {
         ts: fineco_core::now_iso8601_utc(),
         auth_id: OWNER_AUTH_ID,
         tool: "market_get_asset_details.external_enrichment",
@@ -1105,7 +1115,7 @@ fn emit_external_enrichment_audit(
         session_reused: None,
         session_evicted: None,
         reused_session_401_recovered: None,
-    });
+    }
 }
 
 fn external_enrichment_section(report: EnrichmentReport) -> MarketExternalEnrichmentSection {
@@ -1244,7 +1254,11 @@ fn unexpected() -> ErrorData {
 
 #[cfg(test)]
 mod tests {
-    use super::comparable_symbol;
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    use super::{comparable_symbol, external_enrichment_audit_record};
 
     #[test]
     fn comparable_symbol_treats_slash_and_dot_share_classes_as_equivalent() {
@@ -1257,5 +1271,40 @@ mod tests {
     fn comparable_symbol_strips_exchange_suffixes_but_not_share_classes() {
         assert_eq!(comparable_symbol("TIP.MI"), "TIP");
         assert_eq!(comparable_symbol("BRK.B"), "BRKB");
+    }
+
+    #[test]
+    fn external_enrichment_details_audit_is_payload_free_metadata() {
+        let line = external_enrichment_audit_record(
+            "error",
+            Some("fineco_timeout".to_string()),
+            Duration::from_millis(42),
+            None,
+        )
+        .to_log_line();
+        let value: Value = serde_json::from_str(&line).expect("audit json");
+        let object = value.as_object().expect("audit object");
+
+        assert_eq!(
+            object.get("tool").and_then(Value::as_str),
+            Some("market_get_asset_details.external_enrichment")
+        );
+        assert_eq!(
+            object.get("data_class").and_then(Value::as_str),
+            Some("external_enrichment")
+        );
+        assert_eq!(object.get("outcome").and_then(Value::as_str), Some("error"));
+        assert_eq!(
+            object.get("error_code").and_then(Value::as_str),
+            Some("fineco_timeout")
+        );
+        assert!(!object.contains_key("login_performed"));
+        assert!(!object.contains_key("session_reused"));
+        assert!(!object.contains_key("session_evicted"));
+        assert!(!object.contains_key("reused_session_401_recovered"));
+        assert!(!object.contains_key("source_url"));
+        assert!(!object.contains_key("company"));
+        assert!(!object.contains_key("scores"));
+        assert!(!object.contains_key("metrics"));
     }
 }
