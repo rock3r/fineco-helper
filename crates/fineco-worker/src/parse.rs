@@ -909,6 +909,7 @@ pub(crate) fn to_stock_asset_details(
         return Err(SafeError::market_unexpected_response());
     }
     let stock = &inputs.stock_snapshot;
+    verify_stock_snapshot_identity(stock, candidate)?;
     let mut warnings = Vec::new();
 
     let asset = MarketAssetIdentity {
@@ -1173,6 +1174,39 @@ pub(crate) fn to_stock_asset_details(
             .take(fineco_ipc::MAX_WARNINGS)
             .collect(),
     })
+}
+
+fn verify_stock_snapshot_identity(
+    stock: &StockSnapshotResponse,
+    candidate: &MarketSearchCandidate,
+) -> Result<(), SafeError> {
+    if stock
+        .ticker
+        .as_ref()
+        .is_some_and(|ticker| !stock_symbols_equivalent(ticker, &candidate.symbol))
+    {
+        return Err(SafeError::market_unexpected_response());
+    }
+    if stock
+        .exchange
+        .as_ref()
+        .is_some_and(|exchange| !exchange.eq_ignore_ascii_case(&candidate.venue))
+    {
+        return Err(SafeError::market_unexpected_response());
+    }
+    Ok(())
+}
+
+fn stock_symbols_equivalent(left: &str, right: &str) -> bool {
+    normalized_stock_symbol(left) == normalized_stock_symbol(right)
+}
+
+fn normalized_stock_symbol(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 fn matching_etf<'a>(
@@ -2580,6 +2614,30 @@ mod tests {
             .collect();
         assert!(sources.contains(&"stock.snapshot"));
         assert!(sources.contains(&"stock.reports"));
+    }
+
+    #[test]
+    fn stock_details_reject_mismatched_stock_snapshot() {
+        let candidate = stock_candidate();
+        let err = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "NASDAQ/AAPL".to_string(),
+                expected_isin: Some("US0378331005".to_string()),
+                sections: Some(vec![MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: stock_static_response(),
+                snapshot_response: stock_quote_response(),
+                stock_snapshot: serde_json::from_str(r#"{"ticker":"MSFT","exchange":"NASDAQ"}"#)
+                    .expect("stock snapshot"),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect_err("mismatched stock snapshot must fail closed");
+
+        assert_eq!(err.code(), "market_unexpected_response");
     }
 
     #[test]
