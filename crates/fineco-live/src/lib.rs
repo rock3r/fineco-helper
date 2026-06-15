@@ -57,10 +57,11 @@ const LIVE_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Market details may fan out across authenticated search, static identity,
 /// snapshot, and stock/ETF report endpoints under one worker-held session. Its
-/// live-socket read timeout must cover that allowed fan-out so the controller
-/// does not report a local transport failure while the worker is still making
-/// bounded Fineco reads.
-const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(420);
+/// live-socket read timeout must cover the allowed retried fan-out (preflight +
+/// login, up to four alias searches, and the optional ETF composition/returns
+/// endpoints) so the controller does not report a local transport failure while
+/// the worker is still making bounded Fineco reads.
+const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(960);
 
 /// A command from the refresh controller to the private worker. Adjacently tagged
 /// as `{"command": "...", "params": {...}}` (commands without params omit it).
@@ -455,6 +456,8 @@ fn safe_error_from_dto(dto: &SafeErrorDto) -> SafeError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LiveMarketDetailsParams,
         LiveRequest, client_timeout_for,
@@ -477,5 +480,6 @@ mod tests {
             LIVE_MARKET_DETAILS_CLIENT_TIMEOUT
         );
         assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
+        assert!(LIVE_MARKET_DETAILS_CLIENT_TIMEOUT >= Duration::from_secs(960));
     }
 }

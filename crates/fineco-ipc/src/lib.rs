@@ -1594,11 +1594,11 @@ impl MarketControlWireReply {
     }
 }
 
-/// Read timeout for market details replies. Details can fan out across several
+/// Read timeout for market details replies. Details can fan out across retried
 /// authenticated Fineco endpoints; this must stay aligned with the live client
 /// details timeout so the gateway does not fail locally while the controller
 /// keeps spending the login.
-const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(420);
+const MARKET_DETAILS_REPLY_TIMEOUT: Duration = Duration::from_secs(960);
 
 fn market_reply_timeout_for(request: &MarketControlRequest) -> Duration {
     match request {
@@ -1954,6 +1954,8 @@ mod tests {
 
     #[test]
     fn market_details_uses_a_fanout_sized_reply_timeout() {
+        use std::time::Duration;
+
         let search = MarketControlRequest::MarketSearchAsset(MarketSearchParams {
             query: "AAPL".to_string(),
             asset_type: None,
@@ -1971,5 +1973,6 @@ mod tests {
             MARKET_DETAILS_REPLY_TIMEOUT
         );
         assert!(MARKET_DETAILS_REPLY_TIMEOUT > REFRESH_REPLY_TIMEOUT);
+        assert!(MARKET_DETAILS_REPLY_TIMEOUT >= Duration::from_secs(960));
     }
 }
