@@ -37,8 +37,8 @@ with `MarketSearchLiveResult` / `MarketAssetDetailsLiveResult` carrying
 `reused_session_401_recovered`, optional expiry TTL) and no cookie values, auth
 headers, raw `Set-Cookie`, or session handles. The worker is still stateless
 across calls and reports `login_performed: true` for authenticated market reads;
-when Fineco sends safe cookie lifetime metadata such as `Max-Age`, the worker
-reports only the bounded TTL seconds in `session_expires_in_secs`.
+when Fineco sends safe cookie lifetime metadata such as `Max-Age` or `Expires`,
+the worker reports only the bounded TTL seconds in `session_expires_in_secs`.
 
 Refresh and authenticated market reads share only the controller-local
 one-in-flight live-session operation lock. Authenticated market reads enforce
