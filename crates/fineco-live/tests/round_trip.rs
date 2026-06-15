@@ -390,6 +390,36 @@ fn market_search_round_trip_carries_status_facts_without_cookie_values() {
 }
 
 #[test]
+fn market_search_round_trip_carries_status_only_expiry_ttl() {
+    let mut worker = FakeWorker::ok();
+    worker
+        .market_search
+        .as_mut()
+        .expect("market search")
+        .session = MarketSessionStatus::fresh_login_with_expiry(Some(3600));
+    let (client, path) = serve(worker);
+    let live = client
+        .fetch_market_search_live(
+            &MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(5),
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("market search");
+
+    assert_eq!(live.session.session_expires_in_secs, Some(3600));
+    let encoded = serde_json::to_string(&live.session).expect("session status JSON");
+    assert!(encoded.contains("session_expires_in_secs"));
+    assert!(!encoded.contains("cookie"));
+    assert!(!encoded.contains("set-cookie"));
+    assert!(!encoded.contains("session_id"));
+    assert!(!encoded.contains("auth"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn market_details_round_trips_and_is_stamped_with_the_controller_clock() {
     let (client, path) = serve(FakeWorker::ok());
     let live = client

@@ -137,12 +137,13 @@ Product (`crates/`):
   and the reads replay that jar plus the session. Today the worker remains
   **stateless across calls** (login → use on the stack → discard), but market
   live responses already report status-only session facts (`login_performed`,
-  `session_reused`, eviction/recovery flags, optional expiry TTL) across
-  `fineco-live` so controller-side budget/audit can govern future reuse without
-  ever seeing cookies or handles. The Fineco **password and session cookies are
-  zeroized on drop** (`zeroize::Zeroizing`, owner-approved credentialed
-  dep), and the agent **ignores proxy env vars** (`.proxy(None)`) so an env-injected
-  proxy can't reroute the credentialed login. Uses `ureq`+rustls. Depends on
+  `session_reused`, eviction/recovery flags, and optional `Max-Age`-derived
+  expiry TTL) across `fineco-live` so controller-side budget/audit can govern
+  future reuse without ever seeing cookies or handles. The Fineco **password and
+  session cookies are zeroized on drop** (`zeroize::Zeroizing`, owner-approved
+  credentialed dep), and the agent **ignores proxy env vars** (`.proxy(None)`)
+  so an env-injected proxy can't reroute the credentialed login. Uses
+  `ureq`+rustls. Depends on
   `fineco-core`, `fineco-ipc` (market-search types/trait), `fineco-store` (the
   `New*`/`RawOrder` types), `fineco-refresh` (the fetcher traits). No
   payloads/secrets logged; failures map to `SafeError`. Behind the live socket it

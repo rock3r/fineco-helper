@@ -36,7 +36,9 @@ with `MarketSearchLiveResult` / `MarketAssetDetailsLiveResult` carrying
 `MarketSessionStatus` (`login_performed`, `session_reused`, `session_evicted`,
 `reused_session_401_recovered`, optional expiry TTL) and no cookie values, auth
 headers, raw `Set-Cookie`, or session handles. The worker is still stateless
-across calls and reports `login_performed: true` for authenticated market reads.
+across calls and reports `login_performed: true` for authenticated market reads;
+when Fineco sends safe cookie lifetime metadata such as `Max-Age`, the worker
+reports only the bounded TTL seconds in `session_expires_in_secs`.
 
 Refresh and authenticated market reads share only the controller-local
 one-in-flight live-session operation lock. Authenticated market reads enforce
@@ -51,8 +53,9 @@ upstream/timeout failures and half-opens after 600 seconds. The gateway audit
 line may include these session booleans as status-only metadata, never cookies or
 handles; the alert scanner keys on those audit metadata fields for market
 auth/upstream/circuit/recovered session events. Cross-call reuse TTL remains
-unset until cookie-lifetime evidence exists, so the worker reports a fresh login
-for search today.
+disabled until cookie-lifetime evidence is reviewed and an explicit reuse window
+is approved, so the worker still performs a fresh login for each market read
+today.
 
 `market.authenticated.read` is still deliberately absent from the checked-in
 deployment policy and connector defaults. Granting it is an owner decision after

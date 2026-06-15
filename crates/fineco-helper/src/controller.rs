@@ -35,7 +35,8 @@ use fineco_store::Store;
 pub const MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR: u32 = 12;
 
 /// Minimum spacing between controller-admitted fresh Fineco logins for market
-/// reads until cookie-lifetime evidence supports broader session reuse.
+/// reads until cookie-lifetime evidence is reviewed and a broader session reuse
+/// window is explicitly approved.
 pub const MARKET_LOGIN_MIN_COOLDOWN_SECS: u64 = 60;
 
 /// Market live reads are single-account and login-sensitive, so only one
@@ -46,7 +47,8 @@ pub const MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT: u32 = 1;
 pub const MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS: u32 = 1;
 
 /// Cross-call reuse TTL is evidence-gated. `None` means the worker remains
-/// honest/stateless across calls until cookie lifetime metadata is captured.
+/// honest/stateless across calls even if it reports status-only cookie lifetime
+/// metadata for the fresh login.
 pub const MARKET_SESSION_REUSE_TTL_SECS: Option<u64> = None;
 
 /// Open the authenticated-market circuit after this many consecutive

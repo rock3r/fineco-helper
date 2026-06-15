@@ -112,8 +112,10 @@ pub fn route(req: &Request) -> Response {
             {
                 return Response::json(400, "{\"error\":\"missing origin\"}");
             }
-            Response::json(200, "{\"_fixture\":\"SYNTHETIC login ok\"}")
-                .with_header("Set-Cookie", &format!("{SESSION_COOKIE}; Path=/; HttpOnly"))
+            Response::json(200, "{\"_fixture\":\"SYNTHETIC login ok\"}").with_header(
+                "Set-Cookie",
+                &format!("{SESSION_COOKIE}; Path=/; HttpOnly; Max-Age=3600"),
+            )
         }
 
         // Private reads — gated behind the session cookie.
@@ -228,8 +230,10 @@ pub fn route_cookieless_home(req: &Request) -> Response {
             {
                 return Response::json(400, "{\"error\":\"missing origin\"}");
             }
-            Response::json(200, "{\"_fixture\":\"SYNTHETIC login ok\"}")
-                .with_header("Set-Cookie", &format!("{SESSION_COOKIE}; Path=/; HttpOnly"))
+            Response::json(200, "{\"_fixture\":\"SYNTHETIC login ok\"}").with_header(
+                "Set-Cookie",
+                &format!("{SESSION_COOKIE}; Path=/; HttpOnly; Max-Age=3600"),
+            )
         }
 
         // Everything else (private reads, public ETF list) is identical.

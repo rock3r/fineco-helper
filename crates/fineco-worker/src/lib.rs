@@ -113,6 +113,11 @@ pub struct FinecoWorker {
     credentials: Box<dyn CredentialSource>,
 }
 
+struct FinecoSession {
+    cookie: Zeroizing<String>,
+    expires_in_secs: Option<u64>,
+}
+
 impl FinecoWorker {
     /// Build a worker for `endpoints`, sourcing credentials from `credentials`.
     #[must_use]
@@ -173,8 +178,9 @@ impl FinecoWorker {
     }
 
     /// Log in and return the session `Cookie` header value (in memory only),
-    /// merged with any preflight cookies the reads then replay.
-    fn login(&self) -> Result<Zeroizing<String>, SafeError> {
+    /// merged with any preflight cookies the reads then replay, plus status-only
+    /// lifetime metadata from `Set-Cookie` attributes.
+    fn login(&self) -> Result<FinecoSession, SafeError> {
         // Never send the credential over cleartext to a non-loopback host.
         ensure_secure_transport(&self.endpoints.login)?;
         let preflight_cookie = self.preflight()?;
@@ -225,6 +231,7 @@ impl FinecoWorker {
             return Err(SafeError::from_upstream_status(status));
         }
 
+        let session_expires_in_secs = session_expires_in_secs_from(response.headers());
         let session_cookie = cookie_header_from(response.headers());
         if session_cookie.is_empty() {
             // A 200 with no session cookie is an auth failure, not a transport one.
@@ -232,7 +239,10 @@ impl FinecoWorker {
         }
         // The reads replay the full jar the browser would carry: the login
         // context (preflight or synthetic) plus the freshly minted session.
-        Ok(merge_cookies(&login_cookie, &session_cookie))
+        Ok(FinecoSession {
+            cookie: merge_cookies(&login_cookie, &session_cookie),
+            expires_in_secs: session_expires_in_secs,
+        })
     }
 
     /// Authenticated GET returning parsed JSON. `cookie` is the session header,
@@ -346,10 +356,10 @@ impl FinecoWorker {
 
 impl PortfolioFetcher for FinecoWorker {
     fn fetch_portfolio(&self, now_iso: &str) -> Result<NewPortfolioSnapshot, SafeError> {
-        let cookie = self.login()?;
+        let session = self.login()?;
         let response: parse::PositionsSummaryResponse = self.get_json(
             &self.endpoints.positions_summary,
-            &cookie,
+            &session.cookie,
             PORTFOLIO_REFERER,
         )?;
         Ok(parse::to_snapshot(response, now_iso))
@@ -374,12 +384,13 @@ impl RawOrdersFetcher for FinecoWorker {
         // worker re-validates with the SAME shared rules before any network call.
         validate_order_request(instrument_kind, days)?;
 
-        let cookie = self.login()?;
+        let session = self.login()?;
         let url = format!(
             "{}?type={instrument_kind}&days={days}",
             self.endpoints.transactions
         );
-        let response: parse::TransactionsResponse = self.get_json(&url, &cookie, ORDERS_REFERER)?;
+        let response: parse::TransactionsResponse =
+            self.get_json(&url, &session.cookie, ORDERS_REFERER)?;
         Ok(parse::to_raw_orders(response))
     }
 }
@@ -399,12 +410,13 @@ impl TaxFetcher for FinecoWorker {
         // Defense in depth: same shared validation the controller ran pre-lock.
         validate_tax_range(date_from, date_to)?;
 
-        let cookie = self.login()?;
+        let session = self.login()?;
         let url = format!(
             "{}?dateFrom={date_from}&dateTo={date_to}",
             self.endpoints.tax_carry_forward
         );
-        let response: parse::TaxCarryForwardResponse = self.get_json(&url, &cookie, TAX_REFERER)?;
+        let response: parse::TaxCarryForwardResponse =
+            self.get_json(&url, &session.cookie, TAX_REFERER)?;
         Ok(parse::to_tax_carry_forward(response, date_from, date_to))
     }
 
@@ -413,9 +425,9 @@ impl TaxFetcher for FinecoWorker {
     /// # Errors
     /// Auth/upstream/internal envelopes on login, fetch, or parse failure.
     fn fetch_tax_minus_by_year(&self) -> Result<Vec<NewTaxMinusByYear>, SafeError> {
-        let cookie = self.login()?;
+        let session = self.login()?;
         let response: parse::TaxMinusResponse =
-            self.get_json(&self.endpoints.tax_minus, &cookie, TAX_REFERER)?;
+            self.get_json(&self.endpoints.tax_minus, &session.cookie, TAX_REFERER)?;
         Ok(parse::to_tax_minus(response))
     }
 }
@@ -433,17 +445,17 @@ impl MarketSearchLiveFetcher for FinecoWorker {
         now_iso: &str,
     ) -> Result<MarketSearchLiveResult, SafeError> {
         params.validate()?;
-        let cookie = self.login().map_err(market_login_error)?;
+        let session = self.login().map_err(market_login_error)?;
         let url = format!(
             "{}?term={}",
             self.endpoints.global_search,
             percent_encode_query_component(&params.query)
         );
         let response: parse::MarketSearchResponse =
-            self.get_market_json(&url, &cookie, MARKET_SEARCH_REFERER)?;
+            self.get_market_json(&url, &session.cookie, MARKET_SEARCH_REFERER)?;
         Ok(MarketSearchLiveResult {
             result: parse::to_market_search(response, params, now_iso),
-            session: MarketSessionStatus::fresh_login(),
+            session: MarketSessionStatus::fresh_login_with_expiry(session.expires_in_secs),
         })
     }
 }
@@ -461,8 +473,8 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
     ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
         params.validate()?;
         let parsed = ParsedMarketIdentifier::parse(&params.identifier)?;
-        let cookie = self.login().map_err(market_login_error)?;
-        let session_status = MarketSessionStatus::fresh_login();
+        let session = self.login().map_err(market_login_error)?;
+        let session_status = MarketSessionStatus::fresh_login_with_expiry(session.expires_in_secs);
         let mut candidate = None;
         for query in details_search_terms(&parsed.symbol) {
             let search_params = MarketSearchParams {
@@ -476,7 +488,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                 percent_encode_query_component(&search_params.query)
             );
             let search_response: parse::MarketSearchResponse =
-                self.get_market_json(&search_url, &cookie, MARKET_SEARCH_REFERER)?;
+                self.get_market_json(&search_url, &session.cookie, MARKET_SEARCH_REFERER)?;
             let search =
                 parse::to_market_search_for_resolution(search_response, &search_params, now_iso);
             match resolve_market_candidate(&search, &parsed, params) {
@@ -511,7 +523,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
         let static_response: parse::StaticSearchResponse = self.post_market_json(
             &self.endpoints.static_search,
             &static_body,
-            &cookie,
+            &session.cookie,
             MARKET_DETAILS_REFERER,
         )?;
         verify_static_identity(
@@ -525,7 +537,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                 self.endpoints.instruments_snapshot,
                 percent_encode_query_component(&candidate.fineco_key)
             );
-            Some(self.get_market_json(&snapshot_url, &cookie, MARKET_DETAILS_REFERER)?)
+            Some(self.get_market_json(&snapshot_url, &session.cookie, MARKET_DETAILS_REFERER)?)
         } else {
             None
         };
@@ -544,7 +556,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                         etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "snapshot");
                     Some(self.get_market_json(
                         &etf_snapshot_url,
-                        &cookie,
+                        &session.cookie,
                         MARKET_DETAILS_REFERER,
                     )?)
                 } else {
@@ -563,7 +575,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                         &candidate.fineco_key,
                         "composition",
                     );
-                    Some(self.get_market_json(&url, &cookie, MARKET_DETAILS_REFERER)?)
+                    Some(self.get_market_json(&url, &session.cookie, MARKET_DETAILS_REFERER)?)
                 } else {
                     None
                 };
@@ -571,7 +583,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                 let etf_returns = if wants_section(params, MarketDetailsSection::Returns) {
                     let url =
                         etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "returns");
-                    Some(self.get_market_json(&url, &cookie, MARKET_DETAILS_REFERER)?)
+                    Some(self.get_market_json(&url, &session.cookie, MARKET_DETAILS_REFERER)?)
                 } else {
                     None
                 };
@@ -599,7 +611,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                         stock_details_url(&self.endpoints.stock_snapshot, venue, instr_id);
                     Some(self.get_market_json(
                         &stock_snapshot_url,
-                        &cookie,
+                        &session.cookie,
                         MARKET_DETAILS_REFERER,
                     )?)
                 } else {
@@ -607,7 +619,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                 };
                 let stock_reports = if wants_section(params, MarketDetailsSection::Ratios) {
                     let url = stock_details_url(&self.endpoints.stock_reports, venue, instr_id);
-                    Some(self.get_market_json(&url, &cookie, MARKET_DETAILS_REFERER)?)
+                    Some(self.get_market_json(&url, &session.cookie, MARKET_DETAILS_REFERER)?)
                 } else {
                     None
                 };
@@ -1084,6 +1096,32 @@ fn cookie_header_from(headers: &ureq::http::HeaderMap) -> Zeroizing<String> {
     )
 }
 
+/// Extract a conservative status-only session TTL from `Set-Cookie` attributes.
+///
+/// This intentionally reads only cookie metadata (`Max-Age`) and never exposes
+/// names or values. If several cookies declare a lifetime, report the shortest
+/// one so the controller never assumes a session lives longer than a component
+/// cookie says it does.
+fn session_expires_in_secs_from(headers: &ureq::http::HeaderMap) -> Option<u64> {
+    headers
+        .get_all(ureq::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(max_age_secs_from_set_cookie)
+        .min()
+}
+
+fn max_age_secs_from_set_cookie(set_cookie: &str) -> Option<u64> {
+    set_cookie.split(';').skip(1).find_map(|attribute| {
+        let (name, value) = attribute.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("Max-Age") {
+            return None;
+        }
+        let seconds = value.trim().parse::<i64>().ok()?;
+        Some(u64::try_from(seconds).unwrap_or(0))
+    })
+}
+
 /// Mint the synthetic public cookies the real Fineco home page would otherwise
 /// set, for replay on the login POST when the home preflight issues none. Ports
 /// the TS reference's `syntheticPublicCookies()` verbatim in shape. The values
@@ -1203,7 +1241,8 @@ mod tests {
     use super::{
         FinecoEndpoints, FinecoWorker, MARKET_RETRY_ATTEMPTS, ParsedMarketIdentifier,
         StaticCredentialSource, details_search_terms, market_status_error,
-        resolve_market_candidate, with_market_retry,
+        max_age_secs_from_set_cookie, resolve_market_candidate, session_expires_in_secs_from,
+        with_market_retry,
     };
     use super::{market_login_error, synthetic_public_cookies};
     use fineco_core::SafeError;
@@ -1231,6 +1270,51 @@ mod tests {
             worker.agent.config().proxy().is_none(),
             "the credentialed worker must not honor a proxy from the environment"
         );
+    }
+
+    #[test]
+    fn max_age_metadata_is_parsed_without_cookie_values() {
+        assert_eq!(
+            max_age_secs_from_set_cookie(
+                "FINECOSESSION=secret-session-value; Path=/; HttpOnly; Max-Age=3600"
+            ),
+            Some(3600)
+        );
+        assert_eq!(
+            max_age_secs_from_set_cookie("FINECOSESSION=secret; max-age=42; HttpOnly"),
+            Some(42)
+        );
+        assert_eq!(
+            max_age_secs_from_set_cookie("FINECOSESSION=secret; Path=/; HttpOnly"),
+            None
+        );
+        assert_eq!(
+            max_age_secs_from_set_cookie("FINECOSESSION=secret; Max-Age=-1"),
+            Some(0)
+        );
+        assert_eq!(
+            max_age_secs_from_set_cookie("FINECOSESSION=secret; Max-Age=not-a-number"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_expiry_metadata_uses_the_shortest_cookie_lifetime() {
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.append(
+            ureq::http::header::SET_COOKIE,
+            "PREFLIGHT=secret; Path=/; Max-Age=3600"
+                .parse()
+                .expect("header"),
+        );
+        headers.append(
+            ureq::http::header::SET_COOKIE,
+            "FINECOSESSION=secret; Path=/; HttpOnly; Max-Age=600"
+                .parse()
+                .expect("header"),
+        );
+
+        assert_eq!(session_expires_in_secs_from(&headers), Some(600));
     }
 
     #[test]
