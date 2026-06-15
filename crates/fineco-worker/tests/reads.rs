@@ -841,3 +841,29 @@ fn a_refresh_login_evicts_the_held_market_session() {
     assert!(!after.session.session_reused);
     assert_eq!(logins.load(Ordering::SeqCst), 3);
 }
+
+#[test]
+fn a_fresh_login_401_evicts_the_session_so_the_next_read_relogs_in() {
+    let logins = Arc::new(AtomicUsize::new(0));
+    // Poison the FIRST private read: the freshly-logged-in session 401s on use.
+    let poison = Arc::new(AtomicBool::new(true));
+    let base = spawn_poisoning_mock(Arc::clone(&logins), Arc::clone(&poison));
+    let worker = worker_for(&base);
+
+    // A fresh-login 401 is NOT recovered (stays market_auth_required), and the
+    // known-bad session must be evicted, not held for reuse.
+    let err = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:00Z")
+        .expect_err("a fresh-login 401 surfaces as market_auth_required");
+    assert_eq!(err.code(), "market_auth_required");
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+
+    // The next read within the window must re-login (the bad session was evicted),
+    // not reuse the known-bad cookie.
+    let after = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:30Z")
+        .expect("the next read logs in fresh");
+    assert!(after.session.login_performed);
+    assert!(!after.session.session_reused);
+    assert_eq!(logins.load(Ordering::SeqCst), 2);
+}

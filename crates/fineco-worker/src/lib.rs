@@ -31,7 +31,7 @@ pub use credentials::{
 };
 pub use endpoints::FinecoEndpoints;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fineco_core::{
     SafeError, normalize_expected_isin, parse_iso8601_utc, sanitize_text, validate_order_request,
@@ -55,6 +55,11 @@ use zeroize::Zeroizing;
 /// Cap on an authenticated JSON response body, so a hostile/buggy upstream
 /// cannot drive unbounded memory in the sole credential-holding process.
 const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How often the background reaper checks the held market session for TTL expiry.
+/// The held cookie is therefore zeroized within this much of its reuse window
+/// lapsing, bounding the in-memory credential window (AC-22).
+const SESSION_REAPER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Total attempts for one authenticated market endpoint call after a single
 /// Fineco login. Retries are local to the worker so they do not multiply logins.
@@ -131,8 +136,10 @@ pub struct FinecoWorker {
     /// live. The cookie is `Zeroizing`, so dropping/replacing it scrubs the
     /// session material from memory; the gateway never sees it. Behind a `Mutex`
     /// because the fetch methods take `&self` (the live serve loop is sequential,
-    /// so there is no real contention).
-    market_session: Mutex<Option<HeldMarketSession>>,
+    /// so there is no real contention); behind an `Arc` so the background reaper
+    /// thread ([`FinecoWorker::spawn_session_reaper`]) can hold a `Weak` to it and
+    /// zeroize the session at TTL expiry without keeping the worker alive.
+    market_session: Arc<Mutex<Option<HeldMarketSession>>>,
 }
 
 struct FinecoSession {
@@ -198,7 +205,7 @@ impl FinecoWorker {
             endpoints,
             credentials,
             reuse_ttl_secs: MARKET_SESSION_REUSE_TTL_SECS,
-            market_session: Mutex::new(None),
+            market_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -330,11 +337,17 @@ impl FinecoWorker {
                 };
                 Ok((value, session))
             }
-            // Reused-session 401: evict + zeroize, then exactly one fresh-login
-            // retry (`MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS = 1`). A 429 or any
+            // The session that served this read is unauthenticated, so evict and
+            // zeroize it immediately — whether it was reused or freshly logged in —
+            // so a known-bad jar is never held for reuse. A reused session then gets
+            // exactly one fresh-login retry (`MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS
+            // = 1`); a fresh-login 401 stays `market_auth_required`. A 429 or any
             // non-auth error is NOT a session expiry and never triggers re-login.
-            Err(error) if acquired.reused && error.code() == "market_auth_required" => {
+            Err(error) if error.code() == "market_auth_required" => {
                 self.evict_market_session();
+                if !acquired.reused {
+                    return Err(error);
+                }
                 let fresh = self.login().map_err(market_login_error)?;
                 let cookie = fresh.cookie.clone();
                 let expires = fresh.expires_in_secs;
@@ -353,9 +366,8 @@ impl FinecoWorker {
                             },
                         ))
                     }
-                    // The fresh login's own session also failed: a fresh-login 401
-                    // stays `market_auth_required`. Drop the just-stored session so
-                    // a known-bad jar is never reused.
+                    // The fresh login's own session also 401'd: drop it too and
+                    // surface `market_auth_required` (a fresh-login 401, no retry).
                     Err(error) => {
                         self.evict_market_session();
                         Err(error)
@@ -455,6 +467,30 @@ impl FinecoWorker {
     fn refresh_login(&self) -> Result<FinecoSession, SafeError> {
         self.evict_market_session();
         self.login()
+    }
+
+    /// Spawn the background reaper that zeroizes a held market session at its TTL
+    /// expiry (AC-22), so an idle worker never retains a session past the reuse
+    /// window — reuse-on-next-read would zeroize it lazily, but an idle worker
+    /// would otherwise hold a dead cookie in memory indefinitely. The reaper holds
+    /// only a `Weak` to the session, so it exits when the worker is dropped, and
+    /// uses wall-clock time (which the controller's `now_iso` also is in
+    /// production). No-op when reuse is disabled. Call once, from the serving
+    /// binary — not in tests, whose synthetic `now_iso` would not match wall clock.
+    pub fn spawn_session_reaper(&self) {
+        if self.reuse_ttl_secs.is_none() {
+            return;
+        }
+        let session = Arc::downgrade(&self.market_session);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(SESSION_REAPER_POLL_INTERVAL);
+                let Some(session) = session.upgrade() else {
+                    return; // the worker was dropped — stop reaping.
+                };
+                reap_expired_market_session(&session, now_unix_secs());
+            }
+        });
     }
 
     /// Authenticated GET returning parsed JSON. `cookie` is the session header,
@@ -1519,6 +1555,22 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+/// Zeroize the held market session if its reuse window has lapsed (the reaper's
+/// per-tick action; a free function so it can be unit-tested with a controlled
+/// clock). `now_unix_secs` and the stored `valid_until_epoch` are both UTC epoch
+/// seconds, which is what the controller's `now_iso` resolves to in production.
+fn reap_expired_market_session(session: &Mutex<Option<HeldMarketSession>>, now_unix_secs: u64) {
+    let now = i64::try_from(now_unix_secs).unwrap_or(i64::MAX);
+    if let Ok(mut guard) = session.lock()
+        && guard
+            .as_ref()
+            .is_some_and(|held| now >= held.valid_until_epoch)
+    {
+        // Dropping the `Zeroizing` cookie scrubs the session material.
+        *guard = None;
+    }
+}
+
 /// Mint the synthetic public cookies the real Fineco home page would otherwise
 /// set, for replay on the login POST when the home preflight issues none. Ports
 /// the TS reference's `syntheticPublicCookies()` verbatim in shape. The values
@@ -1636,10 +1688,10 @@ fn random_below(bound: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FinecoEndpoints, FinecoWorker, MARKET_RETRY_ATTEMPTS, ParsedMarketIdentifier,
-        StaticCredentialSource, details_search_terms, market_status_error,
-        max_age_secs_from_set_cookie, resolve_market_candidate, session_expires_in_secs_from,
-        ttl_secs_from_set_cookie_at, with_market_retry,
+        FinecoEndpoints, FinecoWorker, HeldMarketSession, MARKET_RETRY_ATTEMPTS,
+        ParsedMarketIdentifier, StaticCredentialSource, details_search_terms, market_status_error,
+        max_age_secs_from_set_cookie, reap_expired_market_session, resolve_market_candidate,
+        session_expires_in_secs_from, ttl_secs_from_set_cookie_at, with_market_retry,
     };
     use super::{market_login_error, synthetic_public_cookies};
     use fineco_core::SafeError;
@@ -1648,6 +1700,8 @@ mod tests {
         MarketSearchParams, MarketSearchResult,
     };
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use zeroize::Zeroizing;
 
     /// The credentialed worker must NEVER honor a proxy from the environment:
     /// ureq honors `HTTPS_PROXY`/`ALL_PROXY`/… by default, which would let an
@@ -1789,6 +1843,31 @@ mod tests {
         );
 
         assert_eq!(session_expires_in_secs_from(&headers), None);
+    }
+
+    #[test]
+    fn the_reaper_zeroizes_only_an_expired_held_session() {
+        let held = |valid_until_epoch: i64| {
+            Mutex::new(Some(HeldMarketSession {
+                cookie: Zeroizing::new("FINECOSESSION=secret".to_string()),
+                expires_in_secs: None,
+                valid_until_epoch,
+            }))
+        };
+
+        // Before the window lapses: the reaper leaves the session in place.
+        let session = held(1_000);
+        reap_expired_market_session(&session, 999);
+        assert!(session.lock().expect("lock").is_some());
+
+        // At/after expiry: the reaper zeroizes the held session.
+        reap_expired_market_session(&session, 1_000);
+        assert!(session.lock().expect("lock").is_none());
+
+        // An empty slot is a no-op (idle worker, nothing held).
+        let empty: Mutex<Option<HeldMarketSession>> = Mutex::new(None);
+        reap_expired_market_session(&empty, u64::MAX);
+        assert!(empty.lock().expect("lock").is_none());
     }
 
     #[test]
