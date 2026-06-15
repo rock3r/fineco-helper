@@ -142,9 +142,13 @@ fn private_reads_require_the_session_cookie() {
             r.status, 401,
             "{path} must be 401 without the session cookie"
         );
+        // The body must be the session-gate rejection, not any fixture. This is
+        // the load-bearing leak guard: every private route's 401 carries the
+        // `unauthenticated` error and no fixture markers do (the market fixtures
+        // would otherwise not trip a `SYNTHETIC`-substring check).
         assert!(
-            !r.body.contains("SYNTHETIC"),
-            "{path} must not serve fixture data when unauthenticated"
+            r.body.contains("unauthenticated") && !r.body.contains("SYNTHETIC"),
+            "{path} must return the session-gate rejection, not fixture data"
         );
     }
 
@@ -160,7 +164,9 @@ fn private_reads_require_the_session_cookie() {
         static_search.status, 401,
         "static instrument search must be 401 without the session cookie"
     );
-    assert!(!static_search.body.contains("SYNTHETIC"));
+    assert!(
+        static_search.body.contains("unauthenticated") && !static_search.body.contains("SYNTHETIC")
+    );
 }
 
 #[test]
