@@ -41,6 +41,20 @@ pub const MAX_TOTAL_CANDIDATES: u32 = 30;
 /// Max number of Fineco headline index-bar cards returned in one call.
 pub const MAX_INDEX_CARDS: u32 = 50;
 
+/// Cross-call worker-held Fineco market-session reuse window, in seconds (plan
+/// D-22). `Some(n)`: the credentialed worker may reuse a still-valid held session
+/// across separate market reads whose gap is under `n`, and the controller treats
+/// such a read as a reuse (no fresh-login cooldown/budget debit) — so a basket of
+/// back-to-back instrument reads rides one login instead of one login per read.
+/// `None`: stateless per call (a fresh login every read).
+///
+/// `120` is deliberately conservative: well under the few-minutes server-side idle
+/// timeout observed on the live site (the threshold is server-enforced and not
+/// exposed in Fineco's frontend, so this is a fixed safe value, not a derived one).
+/// A reused session that the server has nonetheless expired is repaired by exactly
+/// one fresh-login retry ([`MarketSessionStatus::reused_session_401_recovered`]).
+pub const MARKET_SESSION_REUSE_TTL_SECS: Option<u64> = Some(120);
+
 /// Max candidate summaries embedded in an ambiguity safe error.
 pub const MAX_AMBIGUITY_SUGGESTIONS: usize = 10;
 

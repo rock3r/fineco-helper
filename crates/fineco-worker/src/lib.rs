@@ -24,15 +24,19 @@ pub use credentials::{
 };
 pub use endpoints::FinecoEndpoints;
 
+use std::sync::Mutex;
+
 use fineco_core::{
-    SafeError, normalize_expected_isin, sanitize_text, validate_order_request, validate_tax_range,
+    SafeError, normalize_expected_isin, parse_iso8601_utc, sanitize_text, validate_order_request,
+    validate_tax_range,
 };
 use fineco_ipc::{
-    MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher, MarketAssetDetailsLiveResult,
-    MarketAssetDetailsResult, MarketAssetIdentity, MarketAssetSections, MarketAssetType,
-    MarketDetailsParams, MarketDetailsSection, MarketField, MarketIndicesLiveFetcher,
-    MarketIndicesLiveResult, MarketIndicesParams, MarketSearchCandidate, MarketSearchLiveFetcher,
-    MarketSearchLiveResult, MarketSearchParams, MarketSessionStatus, MarketSource,
+    MARKET_SESSION_REUSE_TTL_SECS, MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher,
+    MarketAssetDetailsLiveResult, MarketAssetDetailsResult, MarketAssetIdentity,
+    MarketAssetSections, MarketAssetType, MarketDetailsParams, MarketDetailsSection, MarketField,
+    MarketIndicesLiveFetcher, MarketIndicesLiveResult, MarketIndicesParams, MarketSearchCandidate,
+    MarketSearchLiveFetcher, MarketSearchLiveResult, MarketSearchParams, MarketSessionStatus,
+    MarketSource,
 };
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder};
@@ -111,11 +115,41 @@ pub struct FinecoWorker {
     agent: Agent,
     endpoints: FinecoEndpoints,
     credentials: Box<dyn CredentialSource>,
+    /// Cross-call market-session reuse window (plan D-22). `Some(ttl)`: hold the
+    /// market session and reuse it for a follow-up read within `ttl` seconds;
+    /// `None`: stateless per call (a fresh login every read). Defaults to
+    /// [`fineco_ipc::MARKET_SESSION_REUSE_TTL_SECS`]; tests override it.
+    reuse_ttl_secs: Option<u64>,
+    /// The single worker-held market session, when reuse is enabled and one is
+    /// live. The cookie is `Zeroizing`, so dropping/replacing it scrubs the
+    /// session material from memory; the gateway never sees it. Behind a `Mutex`
+    /// because the fetch methods take `&self` (the live serve loop is sequential,
+    /// so there is no real contention).
+    market_session: Mutex<Option<HeldMarketSession>>,
 }
 
 struct FinecoSession {
     cookie: Zeroizing<String>,
     expires_in_secs: Option<u64>,
+}
+
+/// A market session the worker is holding for possible cross-call reuse.
+struct HeldMarketSession {
+    cookie: Zeroizing<String>,
+    expires_in_secs: Option<u64>,
+    /// Controller-clock epoch (seconds) after which this held session is treated
+    /// as stale and must not be reused. Refreshed on every successful read (the
+    /// server idle timer resets on activity), so a steady stream of reads keeps
+    /// one login alive.
+    valid_until_epoch: i64,
+}
+
+/// The session a market read runs on: either a reused held session or a fresh
+/// login. Carries the `Cookie` value plus the status the worker reports back.
+struct AcquiredMarketSession {
+    cookie: Zeroizing<String>,
+    expires_in_secs: Option<u64>,
+    reused: bool,
 }
 
 impl FinecoWorker {
@@ -156,7 +190,18 @@ impl FinecoWorker {
             agent: Agent::new_with_config(config),
             endpoints,
             credentials,
+            reuse_ttl_secs: MARKET_SESSION_REUSE_TTL_SECS,
+            market_session: Mutex::new(None),
         }
+    }
+
+    /// Override the cross-call market-session reuse window. `None` disables reuse
+    /// (stateless per call). Used by tests; production keeps the
+    /// [`fineco_ipc::MARKET_SESSION_REUSE_TTL_SECS`] default.
+    #[must_use]
+    pub fn with_market_reuse_ttl(mut self, reuse_ttl_secs: Option<u64>) -> Self {
+        self.reuse_ttl_secs = reuse_ttl_secs;
+        self
     }
 
     /// Best-effort login preflight: fetch the public home page to bootstrap any
@@ -243,6 +288,166 @@ impl FinecoWorker {
             cookie: merge_cookies(&login_cookie, &session_cookie),
             expires_in_secs: session_expires_in_secs,
         })
+    }
+
+    /// Run one authenticated market read under the held-session lifecycle (plan
+    /// D-22): reuse a still-valid held session when reuse is enabled, otherwise
+    /// log in fresh; a reused session the server has expired (a 401) is repaired
+    /// by exactly one fresh-login retry. `read` receives the session `Cookie`
+    /// header value and performs the (idempotent, read-only) Fineco calls; it may
+    /// be invoked twice (once on the reused session, once after recovery), so it
+    /// must not have side effects beyond the bounded Fineco reads. Returns the
+    /// read's value plus the status-only session facts the controller audits.
+    fn run_market_read<T>(
+        &self,
+        now_iso: &str,
+        read: impl Fn(&str) -> Result<T, SafeError>,
+    ) -> Result<(T, MarketSessionStatus), SafeError> {
+        let now_epoch = parse_iso8601_utc(now_iso).ok_or_else(SafeError::internal)?;
+        let acquired = self.acquire_market_session(now_epoch)?;
+        match read(acquired.cookie.as_str()) {
+            Ok(value) => {
+                // A successful read resets the server idle timer, so extend the
+                // reuse window from now.
+                self.touch_market_session_validity(now_epoch);
+                let session = if acquired.reused {
+                    MarketSessionStatus {
+                        login_performed: false,
+                        session_reused: true,
+                        session_evicted: false,
+                        reused_session_401_recovered: false,
+                        session_expires_in_secs: acquired.expires_in_secs,
+                    }
+                } else {
+                    MarketSessionStatus::fresh_login_with_expiry(acquired.expires_in_secs)
+                };
+                Ok((value, session))
+            }
+            // Reused-session 401: evict + zeroize, then exactly one fresh-login
+            // retry (`MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS = 1`). A 429 or any
+            // non-auth error is NOT a session expiry and never triggers re-login.
+            Err(error) if acquired.reused && error.code() == "market_auth_required" => {
+                self.evict_market_session();
+                let fresh = self.login().map_err(market_login_error)?;
+                let cookie = fresh.cookie.clone();
+                let expires = fresh.expires_in_secs;
+                self.store_market_session(fresh, now_epoch);
+                match read(cookie.as_str()) {
+                    Ok(value) => {
+                        self.touch_market_session_validity(now_epoch);
+                        Ok((
+                            value,
+                            MarketSessionStatus {
+                                login_performed: true,
+                                session_reused: false,
+                                session_evicted: true,
+                                reused_session_401_recovered: true,
+                                session_expires_in_secs: expires,
+                            },
+                        ))
+                    }
+                    // The fresh login's own session also failed: a fresh-login 401
+                    // stays `market_auth_required`. Drop the just-stored session so
+                    // a known-bad jar is never reused.
+                    Err(error) => {
+                        self.evict_market_session();
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reuse a still-valid held market session, or log in fresh (holding the new
+    /// session when reuse is enabled). With reuse disabled, always logs in fresh
+    /// and holds nothing (the historic stateless-per-call behavior).
+    fn acquire_market_session(&self, now_epoch: i64) -> Result<AcquiredMarketSession, SafeError> {
+        if self.reuse_ttl_secs.is_some() {
+            {
+                let guard = self
+                    .market_session
+                    .lock()
+                    .map_err(|_| SafeError::internal())?;
+                if let Some(held) = guard.as_ref()
+                    && now_epoch < held.valid_until_epoch
+                {
+                    return Ok(AcquiredMarketSession {
+                        cookie: held.cookie.clone(),
+                        expires_in_secs: held.expires_in_secs,
+                        reused: true,
+                    });
+                }
+            }
+            // No valid held session: drop any stale one, then log in fresh and hold it.
+            self.evict_market_session();
+            let fresh = self.login().map_err(market_login_error)?;
+            let cookie = fresh.cookie.clone();
+            let expires = fresh.expires_in_secs;
+            self.store_market_session(fresh, now_epoch);
+            Ok(AcquiredMarketSession {
+                cookie,
+                expires_in_secs: expires,
+                reused: false,
+            })
+        } else {
+            let fresh = self.login().map_err(market_login_error)?;
+            Ok(AcquiredMarketSession {
+                cookie: fresh.cookie,
+                expires_in_secs: fresh.expires_in_secs,
+                reused: false,
+            })
+        }
+    }
+
+    /// Hold `session` as the reusable market session, valid for `reuse_ttl_secs`
+    /// from `now_epoch`. A no-op when reuse is disabled.
+    fn store_market_session(&self, session: FinecoSession, now_epoch: i64) {
+        let Some(ttl) = self.reuse_ttl_secs else {
+            return;
+        };
+        let valid_until_epoch = now_epoch.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
+        if let Ok(mut guard) = self.market_session.lock() {
+            *guard = Some(HeldMarketSession {
+                cookie: session.cookie,
+                expires_in_secs: session.expires_in_secs,
+                valid_until_epoch,
+            });
+        }
+    }
+
+    /// Extend the held session's reuse window to `now_epoch + reuse_ttl_secs`
+    /// (the server idle timer resets on each successful read). A no-op when reuse
+    /// is disabled or nothing is held.
+    fn touch_market_session_validity(&self, now_epoch: i64) {
+        let Some(ttl) = self.reuse_ttl_secs else {
+            return;
+        };
+        let valid_until_epoch = now_epoch.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
+        if let Ok(mut guard) = self.market_session.lock()
+            && let Some(held) = guard.as_mut()
+        {
+            held.valid_until_epoch = valid_until_epoch;
+        }
+    }
+
+    /// Drop and zeroize any held market session. Called on TTL expiry, a
+    /// reused-session 401, and before any refresh fresh login (D-22 G-2), so a
+    /// later market read never reuses a session a refresh may have invalidated.
+    fn evict_market_session(&self) {
+        if let Ok(mut guard) = self.market_session.lock() {
+            // Dropping the `Zeroizing` cookie scrubs the session material.
+            *guard = None;
+        }
+    }
+
+    /// Log in fresh for a refresh read, first evicting any held market session
+    /// (D-22 G-2): a refresh login may rotate the account's single server
+    /// session, so the worker must not afterwards reuse a market session that
+    /// login could have invalidated.
+    fn refresh_login(&self) -> Result<FinecoSession, SafeError> {
+        self.evict_market_session();
+        self.login()
     }
 
     /// Authenticated GET returning parsed JSON. `cookie` is the session header,
@@ -356,7 +561,7 @@ impl FinecoWorker {
 
 impl PortfolioFetcher for FinecoWorker {
     fn fetch_portfolio(&self, now_iso: &str) -> Result<NewPortfolioSnapshot, SafeError> {
-        let session = self.login()?;
+        let session = self.refresh_login()?;
         let response: parse::PositionsSummaryResponse = self.get_json(
             &self.endpoints.positions_summary,
             &session.cookie,
@@ -384,7 +589,7 @@ impl RawOrdersFetcher for FinecoWorker {
         // worker re-validates with the SAME shared rules before any network call.
         validate_order_request(instrument_kind, days)?;
 
-        let session = self.login()?;
+        let session = self.refresh_login()?;
         let url = format!(
             "{}?type={instrument_kind}&days={days}",
             self.endpoints.transactions
@@ -410,7 +615,7 @@ impl TaxFetcher for FinecoWorker {
         // Defense in depth: same shared validation the controller ran pre-lock.
         validate_tax_range(date_from, date_to)?;
 
-        let session = self.login()?;
+        let session = self.refresh_login()?;
         let url = format!(
             "{}?dateFrom={date_from}&dateTo={date_to}",
             self.endpoints.tax_carry_forward
@@ -425,7 +630,7 @@ impl TaxFetcher for FinecoWorker {
     /// # Errors
     /// Auth/upstream/internal envelopes on login, fetch, or parse failure.
     fn fetch_tax_minus_by_year(&self) -> Result<Vec<NewTaxMinusByYear>, SafeError> {
-        let session = self.login()?;
+        let session = self.refresh_login()?;
         let response: parse::TaxMinusResponse =
             self.get_json(&self.endpoints.tax_minus, &session.cookie, TAX_REFERER)?;
         Ok(parse::to_tax_minus(response))
@@ -445,18 +650,17 @@ impl MarketSearchLiveFetcher for FinecoWorker {
         now_iso: &str,
     ) -> Result<MarketSearchLiveResult, SafeError> {
         params.validate()?;
-        let session = self.login().map_err(market_login_error)?;
         let url = format!(
             "{}?term={}",
             self.endpoints.global_search,
             percent_encode_query_component(&params.query)
         );
-        let response: parse::MarketSearchResponse =
-            self.get_market_json(&url, &session.cookie, MARKET_SEARCH_REFERER)?;
-        Ok(MarketSearchLiveResult {
-            result: parse::to_market_search(response, params, now_iso),
-            session: MarketSessionStatus::fresh_login_with_expiry(session.expires_in_secs),
-        })
+        let (result, session) = self.run_market_read(now_iso, |cookie| {
+            let response: parse::MarketSearchResponse =
+                self.get_market_json(&url, cookie, MARKET_SEARCH_REFERER)?;
+            Ok(parse::to_market_search(response, params, now_iso))
+        })?;
+        Ok(MarketSearchLiveResult { result, session })
     }
 }
 
@@ -473,180 +677,189 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
     ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
         params.validate()?;
         let parsed = ParsedMarketIdentifier::parse(&params.identifier)?;
-        let session = self.login().map_err(market_login_error)?;
-        let session_status = MarketSessionStatus::fresh_login_with_expiry(session.expires_in_secs);
-        let mut candidate = None;
-        for query in details_search_terms(&parsed.symbol) {
-            let search_params = MarketSearchParams {
-                query,
-                asset_type: None,
-                limit: Some(fineco_ipc::MAX_TOTAL_CANDIDATES),
-            };
-            let search_url = format!(
-                "{}?term={}",
-                self.endpoints.global_search,
-                percent_encode_query_component(&search_params.query)
-            );
-            let search_response: parse::MarketSearchResponse =
-                self.get_market_json(&search_url, &session.cookie, MARKET_SEARCH_REFERER)?;
-            let search =
-                parse::to_market_search_for_resolution(search_response, &search_params, now_iso);
-            match resolve_market_candidate(&search, &parsed, params) {
-                Ok(resolved) => {
-                    candidate = Some(resolved);
-                    break;
+        // The whole resolve-and-fetch fan-out runs on one session under
+        // `run_market_read`: it shares a single login across every endpoint, and a
+        // reused session the server has expired (a 401 on any call) re-runs this
+        // idempotent, read-only closure once on a fresh login.
+        let (result, session) = self.run_market_read(now_iso, |cookie| {
+            let mut candidate = None;
+            for query in details_search_terms(&parsed.symbol) {
+                let search_params = MarketSearchParams {
+                    query,
+                    asset_type: None,
+                    limit: Some(fineco_ipc::MAX_TOTAL_CANDIDATES),
+                };
+                let search_url = format!(
+                    "{}?term={}",
+                    self.endpoints.global_search,
+                    percent_encode_query_component(&search_params.query)
+                );
+                let search_response: parse::MarketSearchResponse =
+                    self.get_market_json(&search_url, cookie, MARKET_SEARCH_REFERER)?;
+                let search = parse::to_market_search_for_resolution(
+                    search_response,
+                    &search_params,
+                    now_iso,
+                );
+                match resolve_market_candidate(&search, &parsed, params) {
+                    Ok(resolved) => {
+                        candidate = Some(resolved);
+                        break;
+                    }
+                    Err(error) if error.code() == "market_not_found" => {}
+                    Err(error) => return Err(error),
                 }
-                Err(error) if error.code() == "market_not_found" => {}
-                Err(error) => return Err(error),
             }
-        }
-        let candidate = candidate.ok_or_else(SafeError::market_not_found)?;
-        if !matches!(
-            candidate.asset_type,
-            MarketAssetType::Etf | MarketAssetType::Stock
-        ) {
-            return Err(SafeError::market_unsupported_asset_type_for(
-                candidate.asset_type.as_str(),
-                &candidate.identifier,
-            ));
-        }
-        if wants_only_identity(params) {
-            let result = identity_only_details(params, &candidate, now_iso);
-            result.validate_response_size()?;
-            return Ok(MarketAssetDetailsLiveResult {
-                result,
-                session: session_status,
-            });
-        }
-
-        let static_body = StaticSearchRequest::for_instrument(&candidate.fineco_key);
-        let static_response: parse::StaticSearchResponse = self.post_market_json(
-            &self.endpoints.static_search,
-            &static_body,
-            &session.cookie,
-            MARKET_DETAILS_REFERER,
-        )?;
-        verify_static_identity(
-            &static_response,
-            &candidate,
-            params.expected_isin.as_deref(),
-        )?;
-        let snapshot_response = if wants_default_or_section(params, MarketDetailsSection::Quote) {
-            let snapshot_url = format!(
-                "{}?instruments={}",
-                self.endpoints.instruments_snapshot,
-                percent_encode_query_component(&candidate.fineco_key)
-            );
-            Some(self.get_market_json(&snapshot_url, &session.cookie, MARKET_DETAILS_REFERER)?)
-        } else {
-            None
-        };
-
-        let result = match candidate.asset_type {
-            MarketAssetType::Etf => {
-                let etf_snapshot = if wants_default_or_any_section(
-                    params,
-                    &[
-                        MarketDetailsSection::Profile,
-                        MarketDetailsSection::Etf,
-                        MarketDetailsSection::Risk,
-                    ],
-                ) {
-                    let etf_snapshot_url =
-                        etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "snapshot");
-                    Some(self.get_market_json(
-                        &etf_snapshot_url,
-                        &session.cookie,
-                        MARKET_DETAILS_REFERER,
-                    )?)
-                } else {
-                    None
-                };
-
-                let etf_composition = if wants_any_section(
-                    params,
-                    &[
-                        MarketDetailsSection::Holdings,
-                        MarketDetailsSection::Exposures,
-                    ],
-                ) {
-                    let url = etf_query_url(
-                        &self.endpoints.etf_query,
-                        &candidate.fineco_key,
-                        "composition",
-                    );
-                    Some(self.get_market_json(&url, &session.cookie, MARKET_DETAILS_REFERER)?)
-                } else {
-                    None
-                };
-
-                let etf_returns = if wants_section(params, MarketDetailsSection::Returns) {
-                    let url =
-                        etf_query_url(&self.endpoints.etf_query, &candidate.fineco_key, "returns");
-                    Some(self.get_market_json(&url, &session.cookie, MARKET_DETAILS_REFERER)?)
-                } else {
-                    None
-                };
-
-                parse::to_market_asset_details(
-                    params,
-                    &candidate,
-                    parse::MarketDetailsInputs {
-                        static_response,
-                        snapshot_response,
-                        etf_snapshot,
-                        etf_composition,
-                        etf_returns,
-                    },
-                    now_iso,
-                )?
-            }
-            MarketAssetType::Stock => {
-                let (instr_id, venue) = fineco_key_parts(&candidate.fineco_key)?;
-                let stock_snapshot = if wants_default_or_any_section(
-                    params,
-                    &[MarketDetailsSection::Profile, MarketDetailsSection::Stock],
-                ) {
-                    let stock_snapshot_url =
-                        stock_details_url(&self.endpoints.stock_snapshot, venue, instr_id);
-                    Some(self.get_market_json(
-                        &stock_snapshot_url,
-                        &session.cookie,
-                        MARKET_DETAILS_REFERER,
-                    )?)
-                } else {
-                    None
-                };
-                let stock_reports = if wants_section(params, MarketDetailsSection::Ratios) {
-                    let url = stock_details_url(&self.endpoints.stock_reports, venue, instr_id);
-                    Some(self.get_market_json(&url, &session.cookie, MARKET_DETAILS_REFERER)?)
-                } else {
-                    None
-                };
-                parse::to_stock_asset_details(
-                    params,
-                    &candidate,
-                    parse::StockDetailsInputs {
-                        static_response,
-                        snapshot_response,
-                        stock_snapshot,
-                        stock_reports,
-                    },
-                    now_iso,
-                )?
-            }
-            _ => {
+            let candidate = candidate.ok_or_else(SafeError::market_not_found)?;
+            if !matches!(
+                candidate.asset_type,
+                MarketAssetType::Etf | MarketAssetType::Stock
+            ) {
                 return Err(SafeError::market_unsupported_asset_type_for(
                     candidate.asset_type.as_str(),
                     &candidate.identifier,
                 ));
             }
-        };
-        result.validate_response_size()?;
-        Ok(MarketAssetDetailsLiveResult {
-            result,
-            session: session_status,
-        })
+            if wants_only_identity(params) {
+                let result = identity_only_details(params, &candidate, now_iso);
+                result.validate_response_size()?;
+                return Ok(result);
+            }
+
+            let static_body = StaticSearchRequest::for_instrument(&candidate.fineco_key);
+            let static_response: parse::StaticSearchResponse = self.post_market_json(
+                &self.endpoints.static_search,
+                &static_body,
+                cookie,
+                MARKET_DETAILS_REFERER,
+            )?;
+            verify_static_identity(
+                &static_response,
+                &candidate,
+                params.expected_isin.as_deref(),
+            )?;
+            let snapshot_response = if wants_default_or_section(params, MarketDetailsSection::Quote)
+            {
+                let snapshot_url = format!(
+                    "{}?instruments={}",
+                    self.endpoints.instruments_snapshot,
+                    percent_encode_query_component(&candidate.fineco_key)
+                );
+                Some(self.get_market_json(&snapshot_url, cookie, MARKET_DETAILS_REFERER)?)
+            } else {
+                None
+            };
+
+            let result = match candidate.asset_type {
+                MarketAssetType::Etf => {
+                    let etf_snapshot = if wants_default_or_any_section(
+                        params,
+                        &[
+                            MarketDetailsSection::Profile,
+                            MarketDetailsSection::Etf,
+                            MarketDetailsSection::Risk,
+                        ],
+                    ) {
+                        let etf_snapshot_url = etf_query_url(
+                            &self.endpoints.etf_query,
+                            &candidate.fineco_key,
+                            "snapshot",
+                        );
+                        Some(self.get_market_json(
+                            &etf_snapshot_url,
+                            cookie,
+                            MARKET_DETAILS_REFERER,
+                        )?)
+                    } else {
+                        None
+                    };
+
+                    let etf_composition = if wants_any_section(
+                        params,
+                        &[
+                            MarketDetailsSection::Holdings,
+                            MarketDetailsSection::Exposures,
+                        ],
+                    ) {
+                        let url = etf_query_url(
+                            &self.endpoints.etf_query,
+                            &candidate.fineco_key,
+                            "composition",
+                        );
+                        Some(self.get_market_json(&url, cookie, MARKET_DETAILS_REFERER)?)
+                    } else {
+                        None
+                    };
+
+                    let etf_returns = if wants_section(params, MarketDetailsSection::Returns) {
+                        let url = etf_query_url(
+                            &self.endpoints.etf_query,
+                            &candidate.fineco_key,
+                            "returns",
+                        );
+                        Some(self.get_market_json(&url, cookie, MARKET_DETAILS_REFERER)?)
+                    } else {
+                        None
+                    };
+
+                    parse::to_market_asset_details(
+                        params,
+                        &candidate,
+                        parse::MarketDetailsInputs {
+                            static_response,
+                            snapshot_response,
+                            etf_snapshot,
+                            etf_composition,
+                            etf_returns,
+                        },
+                        now_iso,
+                    )?
+                }
+                MarketAssetType::Stock => {
+                    let (instr_id, venue) = fineco_key_parts(&candidate.fineco_key)?;
+                    let stock_snapshot = if wants_default_or_any_section(
+                        params,
+                        &[MarketDetailsSection::Profile, MarketDetailsSection::Stock],
+                    ) {
+                        let stock_snapshot_url =
+                            stock_details_url(&self.endpoints.stock_snapshot, venue, instr_id);
+                        Some(self.get_market_json(
+                            &stock_snapshot_url,
+                            cookie,
+                            MARKET_DETAILS_REFERER,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let stock_reports = if wants_section(params, MarketDetailsSection::Ratios) {
+                        let url = stock_details_url(&self.endpoints.stock_reports, venue, instr_id);
+                        Some(self.get_market_json(&url, cookie, MARKET_DETAILS_REFERER)?)
+                    } else {
+                        None
+                    };
+                    parse::to_stock_asset_details(
+                        params,
+                        &candidate,
+                        parse::StockDetailsInputs {
+                            static_response,
+                            snapshot_response,
+                            stock_snapshot,
+                            stock_reports,
+                        },
+                        now_iso,
+                    )?
+                }
+                _ => {
+                    return Err(SafeError::market_unsupported_asset_type_for(
+                        candidate.asset_type.as_str(),
+                        &candidate.identifier,
+                    ));
+                }
+            };
+            result.validate_response_size()?;
+            Ok(result)
+        })?;
+        Ok(MarketAssetDetailsLiveResult { result, session })
     }
 }
 
@@ -657,16 +870,12 @@ impl MarketIndicesLiveFetcher for FinecoWorker {
         now_iso: &str,
     ) -> Result<MarketIndicesLiveResult, SafeError> {
         params.validate()?;
-        let session = self.login().map_err(market_login_error)?;
-        let response: parse::MarketIndicesResponse = self.get_market_json(
-            &self.endpoints.indicesbar,
-            &session.cookie,
-            MARKET_SEARCH_REFERER,
-        )?;
-        Ok(MarketIndicesLiveResult {
-            result: parse::to_market_indices(response, params, now_iso),
-            session: MarketSessionStatus::fresh_login_with_expiry(session.expires_in_secs),
-        })
+        let (result, session) = self.run_market_read(now_iso, |cookie| {
+            let response: parse::MarketIndicesResponse =
+                self.get_market_json(&self.endpoints.indicesbar, cookie, MARKET_SEARCH_REFERER)?;
+            Ok(parse::to_market_indices(response, params, now_iso))
+        })?;
+        Ok(MarketIndicesLiveResult { result, session })
     }
 }
 
