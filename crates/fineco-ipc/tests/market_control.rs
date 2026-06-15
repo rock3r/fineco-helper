@@ -181,6 +181,13 @@ fn market_search_request_is_strict_and_authenticated() {
         }
     }
 
+    // At-limit values are accepted: a 64-char query at the maximum limit (30).
+    let at_limit_query = "A".repeat(fineco_ipc::MAX_SEARCH_QUERY_CHARS);
+    MarketControlRequest::from_json(&format!(
+        r#"{{"command":"market_search_asset","params":{{"query":"{at_limit_query}","limit":30}}}}"#
+    ))
+    .expect("a 64-char query at the max limit is accepted");
+
     for bad in [
         r#"{"command":"market_search_asset","params":{"query":"","limit":5}}"#,
         r#"{"command":"market_search_asset","params":{"query":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","limit":5}}"#,
@@ -287,6 +294,12 @@ fn market_details_request_is_strict_and_authenticated() {
             panic!("wrong command")
         }
     }
+
+    // At-limit sections (12, all v0-supported) are accepted.
+    MarketControlRequest::from_json(
+        r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["identity","listing","quote","profile","etf","stock","holdings","exposures","returns","risk","ratios","external_enrichment"]}}"#,
+    )
+    .expect("twelve v0-supported sections at the max count are accepted");
 
     for bad in [
         r#"{"command":"market_get_asset_details","params":{"identifier":"VHYL"}}"#,

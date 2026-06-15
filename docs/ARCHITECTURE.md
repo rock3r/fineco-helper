@@ -235,7 +235,7 @@ Product (`crates/`):
   never cookies or session handles. The gateway has **no** `fineco-live` client —
   it cannot reach the live socket by any path. Depends on `fineco-core` + `fineco-ipc` + `fineco-market` +
   `rmcp` — **never** `fineco-store`/`fineco-worker`/`fineco-live` (enforced
-  structurally; see below). Tool surface: 17 read-only tools (cached reads,
+  structurally; see below). Tool surface: 18 read-only tools (cached reads,
   credential-free market reads, authenticated Fineco market reads, and the 3
   live-refresh tools); `portfolio_get_charts` stays **deferred** (no
   chart/time-series data is captured yet — the store holds

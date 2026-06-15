@@ -9,10 +9,10 @@
 use fineco_core::{SafeError, sanitize_text};
 use fineco_ipc::{
     MAX_CANDIDATES_PER_GROUP, MAX_EXPOSURE_ROWS_PER_GROUP, MAX_HOLDINGS, MAX_RETURNS_ROWS,
-    MAX_SOURCES, MAX_STOCK_RATIOS, MarketAssetDetailsResult, MarketAssetIdentity,
-    MarketAssetSections, MarketAssetType, MarketDetailsParams, MarketDetailsSection,
-    MarketEtfSection, MarketExposure, MarketExposuresSection, MarketField, MarketHolding,
-    MarketIndexCard, MarketIndexRegion, MarketIndicesParams, MarketIndicesResult,
+    MAX_SEARCH_GROUPS, MAX_SOURCES, MAX_STOCK_RATIOS, MarketAssetDetailsResult,
+    MarketAssetIdentity, MarketAssetSections, MarketAssetType, MarketDetailsParams,
+    MarketDetailsSection, MarketEtfSection, MarketExposure, MarketExposuresSection, MarketField,
+    MarketHolding, MarketIndexCard, MarketIndexRegion, MarketIndicesParams, MarketIndicesResult,
     MarketListingSection, MarketProfileSection, MarketQuoteSection, MarketRatio,
     MarketRatiosSection, MarketReturn, MarketReturnsSection, MarketRiskSection,
     MarketSearchCandidate, MarketSearchGroup, MarketSearchParams, MarketSearchResult, MarketSource,
@@ -292,6 +292,10 @@ fn to_market_search_with_caps(
             });
         }
     }
+    // Defensive bound on the number of asset-type groups (plan D-20). The fixed
+    // search-bucket set already yields at most this many populated groups; the
+    // truncate keeps the invariant explicit and stable if a bucket is ever added.
+    groups.truncate(MAX_SEARCH_GROUPS);
 
     MarketSearchResult {
         query: sanitize_text(&params.query),
@@ -2492,6 +2496,126 @@ mod tests {
         assert_eq!(result.groups.len(), 1);
         assert_eq!(result.groups[0].result_count, 1);
         assert_eq!(result.groups[0].candidates[0].identifier, "AFF/VHYL");
+    }
+
+    #[test]
+    fn market_search_caps_candidates_per_group() {
+        // More valid candidates in one bucket than the per-group cap: the
+        // normalizer keeps at most MAX_CANDIDATES_PER_GROUP (plan D-20).
+        let items: Vec<_> = (0..(MAX_CANDIDATES_PER_GROUP + 5))
+            .map(|idx| {
+                format!(
+                    r#"{{"d":"ETF {idx:02}","m":"AFF","s":"E{idx:02}.MI","i":"IE00CAP{idx:05}","c":"EUR"}}"#
+                )
+            })
+            .collect();
+        let json = format!(r#"{{"ETF":[{}]}}"#, items.join(","));
+        let resp: MarketSearchResponse = serde_json::from_str(&json).expect("parse");
+        let result = to_market_search(
+            resp,
+            &MarketSearchParams {
+                query: "ETF".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(fineco_ipc::MAX_TOTAL_CANDIDATES),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].candidates.len(), MAX_CANDIDATES_PER_GROUP);
+        assert_eq!(result.groups[0].result_count, MAX_CANDIDATES_PER_GROUP);
+    }
+
+    #[test]
+    fn market_search_caps_total_candidates_across_groups() {
+        // Four buckets of ten valid candidates each (40 total) — over the
+        // 30-candidate total cap. The normalizer must stop at MAX_TOTAL_CANDIDATES.
+        let bucket = |group: usize| -> String {
+            (0..MAX_CANDIDATES_PER_GROUP)
+                .map(|idx| {
+                    format!(
+                        r#"{{"d":"X {group}-{idx}","m":"AFF","s":"S{group}{idx}.MI","i":"IE00G{group}{idx:04}","c":"EUR"}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let json = format!(
+            r#"{{"Azione":[{}],"ETF":[{}],"Obbligazione":[{}],"CFD":[{}]}}"#,
+            bucket(0),
+            bucket(1),
+            bucket(2),
+            bucket(3)
+        );
+        let resp: MarketSearchResponse = serde_json::from_str(&json).expect("parse");
+        let result = to_market_search(
+            resp,
+            &MarketSearchParams {
+                query: "X".to_string(),
+                asset_type: None,
+                limit: None,
+            },
+            "2026-06-14T09:30:00Z",
+        );
+
+        let total: usize = result.groups.iter().map(|g| g.candidates.len()).sum();
+        assert_eq!(total, fineco_ipc::MAX_TOTAL_CANDIDATES as usize);
+        assert!(
+            result
+                .groups
+                .iter()
+                .all(|g| g.candidates.len() <= MAX_CANDIDATES_PER_GROUP)
+        );
+    }
+
+    #[test]
+    fn market_search_caps_the_number_of_groups() {
+        // One candidate in every searchable Fineco bucket: the normalizer emits
+        // one group per populated type and never more than MAX_SEARCH_GROUPS.
+        let json = r#"{
+            "Azione":[{"d":"A","m":"NASDAQ","s":"A.O","i":"US0000000001"}],
+            "ETF":[{"d":"E","m":"AFF","s":"E.MI","i":"IE0000000001"}],
+            "Obbligazione":[{"d":"B","m":"MOT","s":"B","i":"IT0000000001"}],
+            "CFD":[{"d":"C","m":"CFDC","s":"C","i":"X1"}],
+            "LevaFissa":[{"d":"L","m":"CFDC","s":"L","i":"X2"}],
+            "Turbo":[{"d":"T","m":"CFDC","s":"T","i":"X3"}],
+            "Knockout":[{"d":"K","m":"CFDC","s":"K","i":"X4"}],
+            "FxCfd":[{"d":"F","m":"CFDC","s":"F","i":"X5"}]
+        }"#;
+        let resp: MarketSearchResponse = serde_json::from_str(json).expect("parse");
+        let result = to_market_search(
+            resp,
+            &MarketSearchParams {
+                query: "x".to_string(),
+                asset_type: None,
+                limit: Some(fineco_ipc::MAX_TOTAL_CANDIDATES),
+            },
+            "2026-06-14T09:30:00Z",
+        );
+
+        assert_eq!(MAX_SEARCH_GROUPS, 8);
+        assert_eq!(result.groups.len(), MAX_SEARCH_GROUPS);
+    }
+
+    #[test]
+    fn market_indices_caps_cards_at_the_default_limit() {
+        // More headline cards than the default index cap, with no `limit`: the
+        // normalizer keeps at most MAX_INDEX_CARDS (plan tool contract).
+        let cards: Vec<_> = (0..(fineco_ipc::MAX_INDEX_CARDS as usize + 5))
+            .map(|idx| format!(r#"{{"symbol":"^IDX{idx:03}","label":"Index {idx:03}","var":0.1}}"#))
+            .collect();
+        let json = format!(r#"{{"indices":[{}]}}"#, cards.join(","));
+        let resp: MarketIndicesResponse = serde_json::from_str(&json).expect("parse");
+        let result = to_market_indices(
+            resp,
+            &fineco_ipc::MarketIndicesParams {
+                region: None,
+                limit: None,
+            },
+            "2026-06-14T09:30:00Z",
+        );
+
+        assert_eq!(result.indices.len(), fineco_ipc::MAX_INDEX_CARDS as usize);
     }
 
     #[test]

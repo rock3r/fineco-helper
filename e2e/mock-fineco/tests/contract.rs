@@ -122,22 +122,51 @@ fn login_rejects_non_post() {
 #[test]
 fn private_reads_require_the_session_cookie() {
     // Without the session cookie every private read is 401 — never leaks data.
+    // Covers the cached-data reads AND the authenticated-market reads (search,
+    // instrument snapshot, indices, ETF query, stock snapshot/reports); each GET
+    // carries the fixture-matching query so it reaches the session gate.
     for path in [
         "/v1/private/tol/positions/summary?type=sintesi",
         "/v1/private/tol/transactions?type=equity&days=0",
         "/v1/private/tax-carry-forward/search?dateFrom=2026-01-01&dateTo=2026-01-31",
         "/v1/private/tax-carry-forward/minus",
+        "/v1/private/tol/stocklists/search/global?term=VHYL",
+        "/v1/private/tol/instruments/snapshot?instruments=IE00B8GKDB10.AFF",
+        "/v1/private/tol/indicesbar/indices",
+        "/v1/private/tol/etf/query?type=ETF&ids=IE00B8GKDB10.AFF&view=snapshot",
+        "/v1/private/snapshot/NASDAQ/US0378331005",
+        "/v1/private/snapshot/reports/NASDAQ/US0378331005",
     ] {
         let r = get(path);
         assert_eq!(
             r.status, 401,
             "{path} must be 401 without the session cookie"
         );
+        // The body must be the session-gate rejection, not any fixture. This is
+        // the load-bearing leak guard: every private route's 401 carries the
+        // `unauthenticated` error and no fixture markers do (the market fixtures
+        // would otherwise not trip a `SYNTHETIC`-substring check).
         assert!(
-            !r.body.contains("SYNTHETIC"),
-            "{path} must not serve fixture data when unauthenticated"
+            r.body.contains("unauthenticated") && !r.body.contains("SYNTHETIC"),
+            "{path} must return the session-gate rejection, not fixture data"
         );
     }
+
+    // The static instrument search is POST + body-gated; a cookieless POST whose
+    // body matches a fixture must still be 401 before any data is served.
+    let static_search = route(&Request {
+        method: "POST".to_string(),
+        path: "/v1/private/tol/instruments/static/search".to_string(),
+        headers: Vec::new(),
+        body: r#"{"instruments":["IE00B8GKDB10.AFF"]}"#.to_string(),
+    });
+    assert_eq!(
+        static_search.status, 401,
+        "static instrument search must be 401 without the session cookie"
+    );
+    assert!(
+        static_search.body.contains("unauthenticated") && !static_search.body.contains("SYNTHETIC")
+    );
 }
 
 #[test]
