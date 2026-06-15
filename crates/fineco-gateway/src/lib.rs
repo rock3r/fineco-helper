@@ -1119,7 +1119,7 @@ fn external_enrichment_audit_record(
     audit::AuditRecord {
         ts: fineco_core::now_iso8601_utc(),
         auth_id: OWNER_AUTH_ID,
-        tool: "market_get_asset_details.external_enrichment",
+        tool: "external_enrichment.market_get_asset_details",
         data_class: "external_enrichment",
         outcome,
         error_code,
@@ -1301,8 +1301,18 @@ mod tests {
 
         assert_eq!(
             object.get("tool").and_then(Value::as_str),
-            Some("market_get_asset_details.external_enrichment")
+            Some("external_enrichment.market_get_asset_details")
         );
+        let tool = object
+            .get("tool")
+            .and_then(Value::as_str)
+            .expect("tool string");
+        assert!(!matches!(
+            tool,
+            value if value.starts_with("market_search_asset")
+                || value.starts_with("market_get_asset_details")
+                || value.starts_with("market_get_indices")
+        ));
         assert_eq!(
             object.get("data_class").and_then(Value::as_str),
             Some("external_enrichment")
