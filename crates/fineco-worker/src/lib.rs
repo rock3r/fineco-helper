@@ -1098,16 +1098,17 @@ fn cookie_header_from(headers: &ureq::http::HeaderMap) -> Zeroizing<String> {
 
 /// Extract a conservative status-only session TTL from `Set-Cookie` attributes.
 ///
-/// This intentionally reads only cookie metadata (`Max-Age`) and never exposes
+/// This intentionally reads only cookie lifetime metadata and never exposes
 /// names or values. If several cookies declare a lifetime, report the shortest
 /// one so the controller never assumes a session lives longer than a component
 /// cookie says it does.
 fn session_expires_in_secs_from(headers: &ureq::http::HeaderMap) -> Option<u64> {
+    let now = now_unix_secs();
     headers
         .get_all(ureq::http::header::SET_COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .filter_map(max_age_secs_from_set_cookie)
+        .filter_map(|set_cookie| ttl_secs_from_set_cookie_at(set_cookie, now))
         .min()
 }
 
@@ -1120,6 +1121,148 @@ fn max_age_secs_from_set_cookie(set_cookie: &str) -> Option<u64> {
         let seconds = value.trim().parse::<i64>().ok()?;
         Some(u64::try_from(seconds).unwrap_or(0))
     })
+}
+
+fn ttl_secs_from_set_cookie_at(set_cookie: &str, now_unix_secs: u64) -> Option<u64> {
+    max_age_secs_from_set_cookie(set_cookie)
+        .or_else(|| expires_secs_from_set_cookie_at(set_cookie, now_unix_secs))
+}
+
+fn expires_secs_from_set_cookie_at(set_cookie: &str, now_unix_secs: u64) -> Option<u64> {
+    set_cookie.split(';').skip(1).find_map(|attribute| {
+        let (name, value) = attribute.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("Expires") {
+            return None;
+        }
+        let expires = parse_imf_fixdate_unix_secs(value.trim())?;
+        Some(expires.saturating_sub(now_unix_secs))
+    })
+}
+
+fn parse_imf_fixdate_unix_secs(value: &str) -> Option<u64> {
+    let (_weekday, rest) = value.split_once(',')?;
+    let mut parts = rest.split_whitespace();
+    let date = parts.next()?;
+    let (day, month, year) = if let Some((day, month, year)) = parse_hyphenated_cookie_date(date) {
+        (day, month, year)
+    } else {
+        let day = date.parse::<u32>().ok()?;
+        let month = month_number(parts.next()?)?;
+        let year = parts.next()?.parse::<i32>().ok()?;
+        (day, month, year)
+    };
+    let (hour, minute, second) = parse_hms(parts.next()?)?;
+    if !parts.next()?.eq_ignore_ascii_case("GMT") || parts.next().is_some() {
+        return None;
+    }
+    unix_secs_from_ymdhms(year, month, day, hour, minute, second)
+}
+
+fn parse_hyphenated_cookie_date(date: &str) -> Option<(u32, u32, i32)> {
+    let mut parts = date.split('-');
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let month = month_number(parts.next()?)?;
+    let year = parts.next()?.parse::<i32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((day, month, year))
+}
+
+fn month_number(month: &str) -> Option<u32> {
+    if month.eq_ignore_ascii_case("Jan") {
+        Some(1)
+    } else if month.eq_ignore_ascii_case("Feb") {
+        Some(2)
+    } else if month.eq_ignore_ascii_case("Mar") {
+        Some(3)
+    } else if month.eq_ignore_ascii_case("Apr") {
+        Some(4)
+    } else if month.eq_ignore_ascii_case("May") {
+        Some(5)
+    } else if month.eq_ignore_ascii_case("Jun") {
+        Some(6)
+    } else if month.eq_ignore_ascii_case("Jul") {
+        Some(7)
+    } else if month.eq_ignore_ascii_case("Aug") {
+        Some(8)
+    } else if month.eq_ignore_ascii_case("Sep") {
+        Some(9)
+    } else if month.eq_ignore_ascii_case("Oct") {
+        Some(10)
+    } else if month.eq_ignore_ascii_case("Nov") {
+        Some(11)
+    } else if month.eq_ignore_ascii_case("Dec") {
+        Some(12)
+    } else {
+        None
+    }
+}
+
+fn parse_hms(value: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = value.split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+    let second = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn unix_secs_from_ymdhms(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let max_day = days_in_month(year, month)?;
+    if day == 0 || day > max_day {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
+    u64::try_from(seconds).ok()
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year) => Some(29),
+        2 => Some(28),
+        _ => None,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    let year = i64::from(year) - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 /// Mint the synthetic public cookies the real Fineco home page would otherwise
@@ -1242,7 +1385,7 @@ mod tests {
         FinecoEndpoints, FinecoWorker, MARKET_RETRY_ATTEMPTS, ParsedMarketIdentifier,
         StaticCredentialSource, details_search_terms, market_status_error,
         max_age_secs_from_set_cookie, resolve_market_candidate, session_expires_in_secs_from,
-        with_market_retry,
+        ttl_secs_from_set_cookie_at, with_market_retry,
     };
     use super::{market_login_error, synthetic_public_cookies};
     use fineco_core::SafeError;
@@ -1295,6 +1438,51 @@ mod tests {
         assert_eq!(
             max_age_secs_from_set_cookie("FINECOSESSION=secret; Max-Age=not-a-number"),
             None
+        );
+    }
+
+    #[test]
+    fn expires_metadata_is_parsed_without_cookie_values() {
+        const NOW: u64 = 1_781_524_800; // Mon, 15 Jun 2026 12:00:00 GMT
+
+        assert_eq!(
+            ttl_secs_from_set_cookie_at(
+                "FINECOSESSION=secret; Path=/; HttpOnly; Expires=Mon, 15 Jun 2026 12:30:00 GMT",
+                NOW
+            ),
+            Some(1_800)
+        );
+        assert_eq!(
+            ttl_secs_from_set_cookie_at(
+                "FINECOSESSION=secret; Path=/; HttpOnly; Expires=Mon, 15-Jun-2026 12:30:00 GMT",
+                NOW
+            ),
+            Some(1_800)
+        );
+        assert_eq!(
+            ttl_secs_from_set_cookie_at(
+                "FINECOSESSION=secret; Path=/; HttpOnly; Expires=Mon, 15 jun 2026 12:30:00 gmt",
+                NOW
+            ),
+            Some(1_800)
+        );
+        assert_eq!(
+            ttl_secs_from_set_cookie_at(
+                "FINECOSESSION=secret; Path=/; Expires=Mon, 15 Jun 2026 11:59:59 GMT",
+                NOW
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            ttl_secs_from_set_cookie_at("FINECOSESSION=secret; Expires=not-a-date", NOW),
+            None
+        );
+        assert_eq!(
+            ttl_secs_from_set_cookie_at(
+                "FINECOSESSION=secret; Expires=Mon, 15 Jun 2026 12:30:00 GMT; Max-Age=60",
+                NOW
+            ),
+            Some(60)
         );
     }
 

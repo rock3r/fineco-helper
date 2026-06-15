@@ -792,8 +792,8 @@ impl MarketSessionStatus {
 
     /// Fresh-login status with optional status-only session lifetime metadata.
     ///
-    /// The value is derived from cookie metadata such as `Max-Age`, never from
-    /// cookie values or a reusable session handle.
+    /// The value is derived from cookie lifetime metadata such as `Max-Age` or
+    /// `Expires`, never from cookie values or a reusable session handle.
     #[must_use]
     pub fn fresh_login_with_expiry(session_expires_in_secs: Option<u64>) -> Self {
         Self {
