@@ -1390,17 +1390,17 @@ fn verify_stock_snapshot_identity(
     stock: &StockSnapshotResponse,
     candidate: &MarketSearchCandidate,
 ) -> Result<(), SafeError> {
+    // The ticker is the reliable identity guard. We deliberately do NOT compare
+    // the snapshot's `exchange` against the candidate's venue: Fineco returns
+    // `exchange` as a human-readable NAME (e.g. "Italian SE (Mercato Continuo
+    // Italia)" for venue-system code "AFF", "XETRA" for "EQUIDUCT"), not the
+    // venue code, so an equality check only coincidentally holds for US venues
+    // (NASDAQ==NASDAQ) and wrongly rejects every non-US stock (captured shapes,
+    // 2026-06-16).
     if stock
         .ticker
         .as_ref()
         .is_some_and(|ticker| !stock_ticker_matches_candidate(ticker, candidate))
-    {
-        return Err(SafeError::market_unexpected_response());
-    }
-    if stock
-        .exchange
-        .as_ref()
-        .is_some_and(|exchange| !exchange.eq_ignore_ascii_case(&candidate.venue))
     {
         return Err(SafeError::market_unexpected_response());
     }
@@ -3140,6 +3140,61 @@ mod tests {
         .expect("display-symbol stock snapshot should match");
 
         assert_eq!(result.asset.symbol.value, "AAPL.O");
+    }
+
+    #[test]
+    fn stock_details_accept_non_us_venue_with_descriptive_exchange_name() {
+        // Real Fineco shape (captured 2026-06-16): for non-US venues the stock
+        // snapshot's `exchange` is a human-readable NAME (e.g. "Italian SE
+        // (Mercato Continuo Italia)" for Borsa Italiana, whose venue-system code
+        // is "AFF"), never the venue code. The snapshot identity guard must rely
+        // on the ticker; an `exchange == candidate.venue` equality only
+        // coincidentally holds for US venues (NASDAQ==NASDAQ) and wrongly rejects
+        // every non-US stock. Regression for the live `market_unexpected_response`
+        // on AFF/ENI (and EQUIDUCT-venue German stocks, etc.).
+        let candidate = MarketSearchCandidate {
+            fineco_key: "IT0003132476.AFF".to_string(),
+            identifier: "AFF/ENI".to_string(),
+            name: "ENI".to_string(),
+            venue: "AFF".to_string(),
+            symbol: "ENI".to_string(),
+            display_symbol: "ENI.MI".to_string(),
+            isin: Some("IT0003132476".to_string()),
+            currency: Some("EUR".to_string()),
+            asset_type: MarketAssetType::Stock,
+            preferred: true,
+        };
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "AFF/ENI".to_string(),
+                expected_isin: Some("IT0003132476".to_string()),
+                sections: Some(vec![MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: serde_json::from_str(
+                    r#"{"IT0003132476.AFF":{"instrId":"IT0003132476","venueSystem":"AFF","description":"ENI","symbol":"ENI.MI","currencyCd":"EUR","preferredVenue":"AFF"}}"#,
+                )
+                .expect("static"),
+                snapshot_response: Some(
+                    serde_json::from_str(
+                        r#"{"IT0003132476.AFF":{"last":13.5,"bid":0.0,"ask":0.0,"prevClosePrice":13.4,"percVar":0.75,"volume":1000,"lastTradedDatetime":"2026-06-12T17:30:00Z"}}"#,
+                    )
+                    .expect("snapshot"),
+                ),
+                stock_snapshot: Some(
+                    serde_json::from_str(
+                        r#"{"ticker":"ENI","exchange":"Italian SE (Mercato Continuo Italia)"}"#,
+                    )
+                    .expect("stock snapshot"),
+                ),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("a non-US venue snapshot must not fail on the descriptive exchange name");
+
+        assert_eq!(result.asset.symbol.value, "ENI");
     }
 
     #[test]
