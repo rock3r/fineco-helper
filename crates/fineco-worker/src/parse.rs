@@ -559,8 +559,10 @@ pub(crate) struct StockSnapshotResponse {
     industry: Option<String>,
     #[serde(default)]
     ticker: Option<String>,
-    #[serde(default)]
-    exchange: Option<String>,
+    // Fineco's `exchange` here is a human-readable name (e.g. "Italian SE (Mercato
+    // Continuo Italia)"), not the venue-system code, so it is intentionally not
+    // deserialized/used: identity is pinned by instrId==ISIN + the ticker, and the
+    // venue code comes from static `venueSystem` / the candidate.
     #[serde(rename = "priceCurrency", default)]
     price_currency: Option<String>,
     #[serde(rename = "range52wH", default)]
@@ -1091,22 +1093,24 @@ pub(crate) fn to_stock_asset_details(
             || (candidate.name.clone(), "search.global"),
             |description| (description, "static.search"),
         );
+    // Venue must be the Fineco venue-system CODE (e.g. "AFF"), never the snapshot's
+    // descriptive `exchange` name (e.g. "Italian SE (Mercato Continuo Italia)"), so
+    // fall back from a missing static `venueSystem` to the candidate venue code.
     let (venue, venue_source_ref) =
         if let Some(venue) = static_item.and_then(|item| item.venue_system.clone()) {
             (venue, "static.search")
-        } else if let Some(exchange) = inputs
-            .stock_snapshot
-            .as_ref()
-            .and_then(|stock| stock.exchange.clone())
-        {
-            (exchange, "stock.snapshot")
         } else {
             (candidate.venue.clone(), "search.global")
         };
+    // Use the snapshot `ticker` for the symbol only when it matched EXACTLY. When
+    // it matched only via the numeric share-class relaxation (snapshot "VOW" for
+    // candidate "VOW3"), it has dropped the share-class digit, so prefer the
+    // static/search symbol to keep the discriminator in the response.
     let (symbol, symbol_source_ref) = if let Some(ticker) = inputs
         .stock_snapshot
         .as_ref()
         .and_then(|stock| stock.ticker.clone())
+        .filter(|ticker| snapshot_ticker_exact_match(ticker, candidate))
     {
         (ticker, "stock.snapshot")
     } else if let Some(symbol) = static_item.and_then(|item| item.symbol.clone()) {
@@ -1408,6 +1412,29 @@ fn verify_stock_snapshot_identity(
 }
 
 fn stock_ticker_matches_candidate(ticker: &str, candidate: &MarketSearchCandidate) -> bool {
+    if snapshot_ticker_exact_match(ticker, candidate) {
+        return true;
+    }
+    // Fineco's snapshot `ticker` sometimes drops a NUMERIC share-class suffix
+    // (e.g. "VOW" for the preference share VOW3). The snapshot is fetched by the
+    // verified instrId (== ISIN), so it is the requested instrument's data; accept
+    // the base ticker when the candidate symbol is exactly that ticker plus
+    // trailing digits. A letter share class (BRK.A vs BRK.B) is not a numeric
+    // suffix of the other, so those stay correctly rejected. (This is an identity
+    // guard only — the response still labels the asset with the static/search
+    // symbol so the share-class digit is preserved.)
+    let ticker_full = normalized_stock_symbol(ticker);
+    let ticker_base = normalized_stock_symbol(&display_symbol_base(ticker));
+    let candidate_symbol = normalized_stock_symbol(&candidate.symbol);
+    candidate_symbol_is_numeric_share_class_of(&candidate_symbol, &ticker_base)
+        || candidate_symbol_is_numeric_share_class_of(&candidate_symbol, &ticker_full)
+}
+
+/// The snapshot `ticker` matches the candidate exactly (full or base form, against
+/// the candidate symbol or display symbol) — distinct from the looser numeric
+/// share-class acceptance, so the response only adopts the snapshot ticker as the
+/// asset symbol when it is this precise.
+fn snapshot_ticker_exact_match(ticker: &str, candidate: &MarketSearchCandidate) -> bool {
     let ticker_full = normalized_stock_symbol(ticker);
     let ticker_base = normalized_stock_symbol(&display_symbol_base(ticker));
     let candidate_symbol = normalized_stock_symbol(&candidate.symbol);
@@ -1416,14 +1443,6 @@ fn stock_ticker_matches_candidate(ticker: &str, candidate: &MarketSearchCandidat
         || ticker_full == candidate_display_symbol
         || ticker_base == candidate_symbol
         || ticker_base == candidate_display_symbol
-        // Fineco's snapshot `ticker` sometimes drops a NUMERIC share-class suffix
-        // (e.g. "VOW" for the preference share VOW3). The snapshot is fetched by
-        // the verified instrId (== ISIN), so it is the requested instrument's
-        // data; accept the base ticker when the candidate symbol is exactly that
-        // ticker plus trailing digits. A letter share class (BRK.A vs BRK.B) is
-        // not a numeric suffix of the other, so those stay correctly rejected.
-        || candidate_symbol_is_numeric_share_class_of(&candidate_symbol, &ticker_base)
-        || candidate_symbol_is_numeric_share_class_of(&candidate_symbol, &ticker_full)
 }
 
 /// True when `symbol` is `base` followed by one or more digits (a numeric
@@ -3258,7 +3277,60 @@ mod tests {
         )
         .expect("a snapshot ticker missing the numeric share-class suffix must still match");
 
-        assert_eq!(result.asset.symbol.value, "VOW");
+        // The response keeps the share-class discriminator: it labels the asset
+        // with the static/search symbol "VOW3", NOT the truncated snapshot ticker.
+        assert_eq!(result.asset.symbol.value, "VOW3");
+        // And the venue is the Fineco code, not the descriptive exchange name.
+        assert_eq!(result.asset.venue.value, "EQUIDUCT");
+    }
+
+    #[test]
+    fn stock_details_venue_falls_back_to_candidate_code_not_exchange_name() {
+        // When the static row omits venueSystem, the venue must fall back to the
+        // candidate's venue CODE, never the snapshot's descriptive `exchange` name.
+        let candidate = MarketSearchCandidate {
+            fineco_key: "IT0003132476.AFF".to_string(),
+            identifier: "AFF/ENI".to_string(),
+            name: "ENI".to_string(),
+            venue: "AFF".to_string(),
+            symbol: "ENI".to_string(),
+            display_symbol: "ENI.MI".to_string(),
+            isin: Some("IT0003132476".to_string()),
+            currency: Some("EUR".to_string()),
+            asset_type: MarketAssetType::Stock,
+            preferred: true,
+        };
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "AFF/ENI".to_string(),
+                expected_isin: Some("IT0003132476".to_string()),
+                sections: Some(vec![MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                // instrId present (verify_static_identity passes) but venueSystem absent.
+                static_response: serde_json::from_str(
+                    r#"{"IT0003132476.AFF":{"instrId":"IT0003132476","description":"ENI","symbol":"ENI.MI","currencyCd":"EUR"}}"#,
+                )
+                .expect("static"),
+                snapshot_response: None,
+                stock_snapshot: Some(
+                    serde_json::from_str(
+                        r#"{"ticker":"ENI","exchange":"Italian SE (Mercato Continuo Italia)"}"#,
+                    )
+                    .expect("stock snapshot"),
+                ),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("details succeed");
+
+        assert_eq!(result.asset.venue.value, "AFF");
+        assert_ne!(
+            result.asset.venue.value,
+            "Italian SE (Mercato Continuo Italia)"
+        );
     }
 
     #[test]
