@@ -1416,6 +1416,23 @@ fn stock_ticker_matches_candidate(ticker: &str, candidate: &MarketSearchCandidat
         || ticker_full == candidate_display_symbol
         || ticker_base == candidate_symbol
         || ticker_base == candidate_display_symbol
+        // Fineco's snapshot `ticker` sometimes drops a NUMERIC share-class suffix
+        // (e.g. "VOW" for the preference share VOW3). The snapshot is fetched by
+        // the verified instrId (== ISIN), so it is the requested instrument's
+        // data; accept the base ticker when the candidate symbol is exactly that
+        // ticker plus trailing digits. A letter share class (BRK.A vs BRK.B) is
+        // not a numeric suffix of the other, so those stay correctly rejected.
+        || candidate_symbol_is_numeric_share_class_of(&candidate_symbol, &ticker_base)
+        || candidate_symbol_is_numeric_share_class_of(&candidate_symbol, &ticker_full)
+}
+
+/// True when `symbol` is `base` followed by one or more digits (a numeric
+/// share-class suffix Fineco drops from the snapshot ticker), e.g. `VOW3`/`VOW`.
+fn candidate_symbol_is_numeric_share_class_of(symbol: &str, base: &str) -> bool {
+    !base.is_empty()
+        && symbol.len() > base.len()
+        && symbol.starts_with(base)
+        && symbol[base.len()..].bytes().all(|b| b.is_ascii_digit())
 }
 
 fn normalized_stock_symbol(value: &str) -> String {
@@ -3195,6 +3212,53 @@ mod tests {
         .expect("a non-US venue snapshot must not fail on the descriptive exchange name");
 
         assert_eq!(result.asset.symbol.value, "ENI");
+    }
+
+    #[test]
+    fn stock_details_accept_snapshot_ticker_without_numeric_share_class_suffix() {
+        // Real Fineco shape (captured 2026-06-16): for VOW3 (Volkswagen preference
+        // shares, ISIN DE0007664039 — Fineco's preferred listing), the search/static
+        // symbol is "VOW3" but the stock snapshot's `ticker` drops the share-class
+        // digit and reports "VOW". The snapshot is fetched by the verified instrId
+        // (== ISIN), so it IS VOW3's data; rejecting on the dropped numeric suffix
+        // is a false negative. (The BRK.A vs BRK.B case stays rejected — a letter
+        // share class is not a numeric suffix of the other.)
+        let candidate = MarketSearchCandidate {
+            fineco_key: "DE0007664039.EQUIDUCT".to_string(),
+            identifier: "EQUIDUCT/VOW3".to_string(),
+            name: "VOLKSWAGEN".to_string(),
+            venue: "EQUIDUCT".to_string(),
+            symbol: "VOW3".to_string(),
+            display_symbol: "VOW3.EQ".to_string(),
+            isin: Some("DE0007664039".to_string()),
+            currency: Some("EUR".to_string()),
+            asset_type: MarketAssetType::Stock,
+            preferred: true,
+        };
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "EQUIDUCT/VOW3".to_string(),
+                expected_isin: Some("DE0007664039".to_string()),
+                sections: Some(vec![MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: serde_json::from_str(
+                    r#"{"DE0007664039.EQUIDUCT":{"instrId":"DE0007664039","venueSystem":"EQUIDUCT","description":"VOLKSWAGEN","symbol":"VOW3.EQ","currencyCd":"EUR","preferredVenue":"EQUIDUCT"}}"#,
+                )
+                .expect("static"),
+                snapshot_response: None,
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"VOW","exchange":"XETRA"}"#)
+                        .expect("stock snapshot"),
+                ),
+                stock_reports: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("a snapshot ticker missing the numeric share-class suffix must still match");
+
+        assert_eq!(result.asset.symbol.value, "VOW");
     }
 
     #[test]
