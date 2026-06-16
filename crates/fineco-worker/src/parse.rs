@@ -1064,41 +1064,25 @@ pub(crate) fn to_market_asset_details(
     })
 }
 
-/// Detects a pence/cents-quoted instrument (e.g. an LSE stock) whose real-time
-/// quote endpoint reports prices in the MINOR unit (GBX pence) while the
-/// stock-snapshot reports the same kind of value in the MAJOR unit (GBP pounds) —
-/// Fineco labels both with the major currency ("GBP"). Returns the factor that
-/// brings the quote into the major unit (`0.01`), or `1.0` otherwise.
+/// Returns the factor that brings a pence/cents-quoted instrument's quote into the
+/// MAJOR currency unit (`0.01`), or `1.0` otherwise.
 ///
-/// The minor/major split only exists for currencies whose venues quote in a minor
-/// unit (×100 the major), so we GATE on the currency first ([`quotes_in_minor_unit`]).
-/// That excludes every same-unit instrument in another currency — e.g. a USD stock
-/// breaking out above a wide 52-week range — so they can never be rescaled. Within
-/// a pence-quoting currency we then apply a sound invariant: a same-unit price can
-/// never sit above its own 52-week high (the high tracks recent prices), whereas the
-/// minor-unit quote sits ~100x above the major-unit range — so `last > high` means
-/// the quote is in the minor unit and must be scaled down. This holds for normal,
-/// deep-drawdown, and fresh-high names alike (the only miss is a name below ~1% of
-/// its high, where the inflated quote no longer clears the major-unit high — a
-/// vanishing edge that simply leaves the value unchanged).
-fn quote_to_major_unit_scale(
-    quote: Option<&RawInstrumentSnapshot>,
-    stock: Option<&StockSnapshotResponse>,
-    currency: Option<&str>,
-) -> f64 {
-    if !quotes_in_minor_unit(currency) {
-        return 1.0;
+/// Fineco quotes LSE stocks in GBX pence on the real-time quote endpoint, but
+/// reports the stock-snapshot range, the currency label, and everything else in GBP
+/// pounds — so for a GBP-quoted stock the quote is ALWAYS in the minor unit and must
+/// be divided by 100 to match. The instrument currency is the exact, sufficient
+/// signal ([`quotes_in_minor_unit`]): only pence-quoting currencies are scaled, and
+/// they are scaled UNCONDITIONALLY. We deliberately do NOT add a value comparison
+/// against the 52-week range — that re-derives a fact the currency already
+/// establishes and only introduces edge cases (a deep drawdown below 1% of the high,
+/// a fresh-high breakout, a wide range) where the quote's magnitude is ambiguous.
+/// Same-unit currencies (USD/EUR) are never touched.
+fn quote_to_major_unit_scale(currency: Option<&str>) -> f64 {
+    if quotes_in_minor_unit(currency) {
+        0.01
+    } else {
+        1.0
     }
-    let Some(last) = quote.and_then(|q| q.last).filter(|value| *value > 0.0) else {
-        return 1.0;
-    };
-    let Some(high) = stock
-        .and_then(|s| s.range_52w_high)
-        .filter(|value| *value > 0.0)
-    else {
-        return 1.0;
-    };
-    if last > high { 0.01 } else { 1.0 }
 }
 
 /// Currencies whose venues quote equities in a minor unit (×100 the major) while
@@ -1153,11 +1137,7 @@ pub(crate) fn to_stock_asset_details(
     // minor unit while the rest of the response is in the major unit; bring the
     // quote into the major unit so the response is internally consistent and
     // matches the instrument currency. 1.0 for everything else.
-    let price_scale = quote_to_major_unit_scale(
-        snapshot_item,
-        inputs.stock_snapshot.as_ref(),
-        currency.as_ref().map(|(code, _)| code.as_str()),
-    );
+    let price_scale = quote_to_major_unit_scale(currency.as_ref().map(|(code, _)| code.as_str()));
     let mut warnings = Vec::new();
     let (name, name_source_ref) = static_item
         .and_then(|item| item.description.clone())
@@ -3685,11 +3665,10 @@ mod tests {
 
     #[test]
     fn stock_details_normalize_pence_quote_after_deep_drawdown() {
-        // A GBp stock that has fallen to a small fraction of its 52-week high: the
-        // raw quote (2.0 pence) is far below the pounds high (0.30), so a naive
-        // last/high ratio (6.7) would miss the split. But `last / 100` (0.02) lands
-        // inside the [low, high] pounds range while the raw quote does not, so it is
-        // still detected and normalized.
+        // A GBp stock below 1% of its 52-week high: the raw quote (5.0 pence) is even
+        // BELOW the pounds high (10.0), so a `last > high` style check would miss the
+        // split. Because the gate is purely on the GBP currency (the quote is always
+        // pence), it is still normalized: 5.0 pence -> 0.05 pounds.
         let candidate = lse_pence_candidate();
         let result = to_stock_asset_details(
             &MarketDetailsParams {
@@ -3705,12 +3684,12 @@ mod tests {
                 .expect("static"),
                 snapshot_response: Some(
                     serde_json::from_str(
-                        r#"{"GB00BH4HKS39.LSE":{"last":2.0,"prevClosePrice":2.1,"percVar":-4.5,"volume":1000}}"#,
+                        r#"{"GB00BH4HKS39.LSE":{"last":5.0,"prevClosePrice":5.1,"percVar":-2.0,"volume":1000}}"#,
                     )
                     .expect("snapshot"),
                 ),
                 stock_snapshot: Some(
-                    serde_json::from_str(r#"{"ticker":"VOD","priceCurrency":"GBP","range52wH":0.30,"range52wL":0.018}"#)
+                    serde_json::from_str(r#"{"ticker":"VOD","priceCurrency":"GBP","range52wH":10.0,"range52wL":0.04}"#)
                         .expect("stock snapshot"),
                 ),
                 stock_reports: None,
@@ -3726,7 +3705,7 @@ mod tests {
             .last
             .expect("last")
             .value;
-        assert!((last - 0.02).abs() < 1e-9, "expected 0.02 GBP, got {last}");
+        assert!((last - 0.05).abs() < 1e-9, "expected 0.05 GBP, got {last}");
         assert!(
             result
                 .warnings
