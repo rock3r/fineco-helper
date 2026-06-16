@@ -13,16 +13,25 @@ worktree branches (below).
 
 ## Read first, every session (before any other action)
 
-Two **local, gitignored** documents under `.plans/` govern the work — read **both in
-full** before writing or modifying any code:
+Local, gitignored documents under `.plans/` govern the work. Keep context lean:
+read the current context first, then only the plan/worklog sections relevant to the
+task. Read full plans only when changing architecture, security boundaries, tool
+schemas, auth/session behavior, logging, data classes, deployment boundaries, or
+other cross-cutting invariants.
 
 | Document | Use it for |
 | --- | --- |
-| `.plans/remote-mcp-security-plan.md` | Authoritative spec: architecture, data classes, secret boundaries, tool surface, forbidden fields, logging rules, gates, security invariants. Build to it; never deviate silently. |
-| `.plans/worklog.md` | Running progress: milestones, decisions, open threads, gate status, next action. Session-to-session memory — keep it current, prune stale notes. |
+| `.plans/current-context.md` | Required compact session entrypoint: current task/milestone, active worktree/branch, last green gates, blockers, next action, and relevant plan/worklog sections. Create it if missing. |
+| `.plans/remote-mcp-security-plan.md` | Authoritative spec: architecture, data classes, secret boundaries, tool surface, forbidden fields, logging rules, gates, security invariants. Read relevant sections for normal work; read in full for cross-cutting/security changes. |
+| `.plans/worklog.md` or task-local worklog | Running progress: milestones, decisions, open threads, gate status, next action. Prefer per-task worklogs; keep the active top section compact and current. |
 
 If the plan is wrong or underspecified, **stop, propose the change to the owner, and
 wait** — do not code around it.
+
+Worklogs are working memory, not an ever-growing prompt. Keep them per task where
+possible (for example `.plans/worklogs/<task>.md`). If a worklog grows past roughly
+1,000 lines, rotate/archive older entries into a dated file and keep the active file
+focused on current state, decisions, open blockers, and the next action.
 
 ## As-built docs (the index)
 
@@ -55,10 +64,13 @@ for a new doc) in the **same session**.
   (`git worktree add .worktrees/<slug> -b wt/<slug> main`). Merge back into `main`
   only when green + reviewed + gated, then remove it. **Never commit directly to
   `main`** — land work through a reviewed worktree branch; **keep `main` always green.**
-- **Two review passes before every merge:** `codex:review` (adversarial, on the
-  milestone diff) and the **alignment-review subagent** (diff vs the plan's
-  architecture / data classes / secret boundaries / tool surface / forbidden fields /
-  logging / gates). Fix every confirmed finding; reviewers never write product code.
+- **Review gates are scoped and finite.** Before merge, get one clean pass for each
+  applicable review type: code/adversarial review, security review, and alignment
+  review against the relevant plan sections. Do not repeat a review type after a
+  clean pass unless follow-up changes are significant for that review's scope. After
+  follow-up fixes, run a scoped re-review of the new/changed diff and affected plan
+  sections instead of restarting a wide review from scratch. Fix every confirmed
+  finding; reviewers never write product code.
 - **Scope / regressions.** Changes relate to the session's milestone; unrelated
   changes only with explicit owner consent. Any unrequested behavior change is a
   regression — flag it. Never leave a feature broken (except phased work explicitly
