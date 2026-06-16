@@ -1106,10 +1106,10 @@ fn quote_to_major_unit_scale(
 /// the MAJOR code. GBP (LSE, quoted in GBX pence) is the confirmed case; the list
 /// can be extended with evidence for other minor-unit markets.
 fn quotes_in_minor_unit(currency: Option<&str>) -> bool {
-    currency.is_some_and(|code| {
-        let code = code.trim();
-        code.eq_ignore_ascii_case("GBP") || code.eq_ignore_ascii_case("GBX")
-    })
+    // Match the MAJOR code Fineco actually reports for pence-quoted LSE stocks
+    // ("GBP"); the values are scaled to and labelled in that major unit, so a minor
+    // code like "GBX" is intentionally NOT matched (it would mislabel the result).
+    currency.is_some_and(|code| code.trim().eq_ignore_ascii_case("GBP"))
 }
 
 pub(crate) fn to_stock_asset_details(
@@ -1134,6 +1134,21 @@ pub(crate) fn to_stock_asset_details(
     if let Some(stock) = &inputs.stock_snapshot {
         verify_stock_snapshot_identity(stock, candidate)?;
     }
+    // The instrument currency, resolved from the same fallback chain the response
+    // reports as `asset.currency` (search → static → snapshot). The minor-unit gate
+    // must use THIS resolved value, not just the search candidate's, so a GBP
+    // instrument whose search row omitted the currency is still normalized.
+    let currency = if let Some(currency) = candidate.currency.clone() {
+        Some((currency, "search.global"))
+    } else if let Some(currency) = static_item.and_then(|item| item.currency_cd.clone()) {
+        Some((currency, "static.search"))
+    } else {
+        inputs
+            .stock_snapshot
+            .as_ref()
+            .and_then(|stock| stock.price_currency.clone())
+            .map(|currency| (currency, "stock.snapshot"))
+    };
     // For pence/cents-quoted instruments Fineco's quote endpoint reports in the
     // minor unit while the rest of the response is in the major unit; bring the
     // quote into the major unit so the response is internally consistent and
@@ -1141,7 +1156,7 @@ pub(crate) fn to_stock_asset_details(
     let price_scale = quote_to_major_unit_scale(
         snapshot_item,
         inputs.stock_snapshot.as_ref(),
-        candidate.currency.as_deref(),
+        currency.as_ref().map(|(code, _)| code.as_str()),
     );
     let mut warnings = Vec::new();
     let (name, name_source_ref) = static_item
@@ -1181,17 +1196,6 @@ pub(crate) fn to_stock_asset_details(
             || (candidate.display_symbol.clone(), "search.global"),
             |symbol| (symbol, "static.search"),
         );
-    let currency = if let Some(currency) = candidate.currency.clone() {
-        Some((currency, "search.global"))
-    } else if let Some(currency) = static_item.and_then(|item| item.currency_cd.clone()) {
-        Some((currency, "static.search"))
-    } else {
-        inputs
-            .stock_snapshot
-            .as_ref()
-            .and_then(|stock| stock.price_currency.clone())
-            .map(|currency| (currency, "stock.snapshot"))
-    };
 
     let asset = MarketAssetIdentity {
         identifier: params.identifier.clone(),
@@ -3618,6 +3622,64 @@ mod tests {
                 .iter()
                 .any(|w| w.code == "quote_unit_normalized"),
             "expected a quote_unit_normalized warning"
+        );
+    }
+
+    #[test]
+    fn stock_details_normalize_pence_quote_when_currency_only_from_static() {
+        // The minor-unit gate must use the RESOLVED currency, not only the search
+        // candidate's: here the search row omits the currency, but static-search
+        // reports GBP — so the quote must still be normalized (otherwise last stays
+        // in pence while asset.currency/range are GBP).
+        let candidate = MarketSearchCandidate {
+            currency: None,
+            ..lse_pence_candidate()
+        };
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "LSE/VOD".to_string(),
+                expected_isin: Some("GB00BH4HKS39".to_string()),
+                sections: Some(vec![MarketDetailsSection::Quote, MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: serde_json::from_str(
+                    r#"{"GB00BH4HKS39.LSE":{"instrId":"GB00BH4HKS39","venueSystem":"LSE","description":"VODAFONE","symbol":"VOD.L","currencyCd":"GBP"}}"#,
+                )
+                .expect("static"),
+                snapshot_response: Some(
+                    serde_json::from_str(
+                        r#"{"GB00BH4HKS39.LSE":{"last":112.1,"prevClosePrice":112.5,"percVar":-0.844,"volume":1000}}"#,
+                    )
+                    .expect("snapshot"),
+                ),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"VOD","priceCurrency":"GBP","range52wH":1.311,"range52wL":0.7372}"#)
+                        .expect("stock snapshot"),
+                ),
+                stock_reports: None,
+            },
+            "2026-06-16T12:00:00Z",
+        )
+        .expect("details");
+
+        let last = result
+            .sections
+            .quote
+            .expect("quote")
+            .last
+            .expect("last")
+            .value;
+        assert!(
+            (last - 1.121).abs() < 1e-6,
+            "expected 1.121 GBP, got {last}"
+        );
+        assert_eq!(result.asset.currency.expect("currency").value, "GBP");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "quote_unit_normalized")
         );
     }
 
