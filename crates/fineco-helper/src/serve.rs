@@ -840,6 +840,10 @@ pub fn run_private_worker(config: PrivateWorkerConfig) -> Result<(), ServeError>
         None => FinecoEndpoints::production(),
     };
     let worker = FinecoWorker::new(endpoints, Box::new(EnvCredentialSource));
+    // Zeroize an idle held market session at its reuse-window expiry (AC-22), so a
+    // dead cookie never lingers in the credential process past the TTL. The reaper
+    // uses wall-clock time and exits when the worker is dropped.
+    worker.spawn_session_reaper();
     serve_live(&worker, &config.live_socket_path, config.socket_mode)
 }
 

@@ -4,6 +4,8 @@
 //! before any request is made.
 
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use fineco_ipc::{
@@ -678,4 +680,190 @@ fn unsupported_asset_details_stop_after_resolution() {
 
     assert_eq!(err.code(), "market_unsupported_asset_type");
     assert!(err.safe_message().contains("bond"));
+}
+
+/// A mock that counts login POSTs (so a test can prove how many fresh logins a
+/// sequence of reads triggered), delegating everything else to the real mock.
+fn spawn_login_counting_mock(logins: Arc<AtomicUsize>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, move |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v1/public/authentications/web/login" {
+                logins.fetch_add(1, Ordering::SeqCst);
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
+/// Like [`spawn_login_counting_mock`], but a one-shot `poison` flag makes the NEXT
+/// private read return 401 (modelling a server-side session expiry), then clears.
+fn spawn_poisoning_mock(logins: Arc<AtomicUsize>, poison: Arc<AtomicBool>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, move |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v1/public/authentications/web/login" {
+                logins.fetch_add(1, Ordering::SeqCst);
+                return mock_fineco::route(req);
+            }
+            if path.starts_with("/v1/private/") && poison.swap(false, Ordering::SeqCst) {
+                return httptiny::Response::json(401, "{\"error\":\"session expired\"}");
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
+fn indices_params() -> MarketIndicesParams {
+    MarketIndicesParams {
+        region: None,
+        limit: None,
+    }
+}
+
+#[test]
+fn market_reads_reuse_a_held_session_within_the_ttl() {
+    let logins = Arc::new(AtomicUsize::new(0));
+    let base = spawn_login_counting_mock(Arc::clone(&logins));
+    let worker = worker_for(&base);
+
+    let first = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:00Z")
+        .expect("first read");
+    assert!(first.session.login_performed);
+    assert!(!first.session.session_reused);
+
+    // +30s, then +140s from the first read: each is within the rolling 120s window
+    // (the window resets on every read), so both reuse the held session.
+    let second = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:30Z")
+        .expect("second read reuses");
+    assert!(second.session.session_reused);
+    assert!(!second.session.login_performed);
+
+    let third = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:02:20Z")
+        .expect("third read reuses");
+    assert!(third.session.session_reused);
+
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        1,
+        "one login served three reads"
+    );
+
+    // Past the window (last read 12:02:20 + 120s = 12:04:20): a fresh login.
+    let fourth = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:05:00Z")
+        .expect("fourth read re-logs in");
+    assert!(fourth.session.login_performed);
+    assert!(!fourth.session.session_reused);
+    assert_eq!(logins.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn market_reads_log_in_fresh_when_reuse_ttl_is_disabled() {
+    let logins = Arc::new(AtomicUsize::new(0));
+    let base = spawn_login_counting_mock(Arc::clone(&logins));
+    let worker = worker_for(&base).with_market_reuse_ttl(None);
+
+    for now in ["2026-06-03T12:00:00Z", "2026-06-03T12:00:30Z"] {
+        let read = worker
+            .fetch_market_indices(&indices_params(), now)
+            .expect("read");
+        assert!(read.session.login_performed);
+        assert!(!read.session.session_reused);
+    }
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        2,
+        "reuse disabled: a fresh login per read"
+    );
+}
+
+#[test]
+fn reused_market_session_401_recovers_with_one_fresh_login() {
+    let logins = Arc::new(AtomicUsize::new(0));
+    let poison = Arc::new(AtomicBool::new(false));
+    let base = spawn_poisoning_mock(Arc::clone(&logins), Arc::clone(&poison));
+    let worker = worker_for(&base);
+
+    worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:00Z")
+        .expect("first read");
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+
+    // The server has since killed the session: the next (reused) private read 401s.
+    poison.store(true, Ordering::SeqCst);
+    let recovered = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:30Z")
+        .expect("reused-session 401 is repaired by one fresh login");
+
+    assert!(recovered.session.reused_session_401_recovered);
+    assert!(recovered.session.session_evicted);
+    assert!(recovered.session.login_performed);
+    assert_eq!(
+        logins.load(Ordering::SeqCst),
+        2,
+        "exactly one extra login repaired the stale reused session"
+    );
+}
+
+#[test]
+fn a_refresh_login_evicts_the_held_market_session() {
+    let logins = Arc::new(AtomicUsize::new(0));
+    let base = spawn_login_counting_mock(Arc::clone(&logins));
+    let worker = worker_for(&base);
+
+    worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:00Z")
+        .expect("market read");
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+
+    // A refresh logs in fresh; that must evict the held market session (D-22 G-2)
+    // so the worker can't later reuse a session a refresh login may have poisoned.
+    worker
+        .fetch_portfolio("2026-06-03T12:00:30Z")
+        .expect("refresh login");
+    assert_eq!(logins.load(Ordering::SeqCst), 2);
+
+    // Within the 120s window, but the held session was evicted → fresh login.
+    let after = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:45Z")
+        .expect("market read after refresh");
+    assert!(after.session.login_performed);
+    assert!(!after.session.session_reused);
+    assert_eq!(logins.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn a_fresh_login_401_evicts_the_session_so_the_next_read_relogs_in() {
+    let logins = Arc::new(AtomicUsize::new(0));
+    // Poison the FIRST private read: the freshly-logged-in session 401s on use.
+    let poison = Arc::new(AtomicBool::new(true));
+    let base = spawn_poisoning_mock(Arc::clone(&logins), Arc::clone(&poison));
+    let worker = worker_for(&base);
+
+    // A fresh-login 401 is NOT recovered (stays market_auth_required), and the
+    // known-bad session must be evicted, not held for reuse.
+    let err = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:00Z")
+        .expect_err("a fresh-login 401 surfaces as market_auth_required");
+    assert_eq!(err.code(), "market_auth_required");
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+
+    // The next read within the window must re-login (the bad session was evicted),
+    // not reuse the known-bad cookie.
+    let after = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:30Z")
+        .expect("the next read logs in fresh");
+    assert!(after.session.login_performed);
+    assert!(!after.session.session_reused);
+    assert_eq!(logins.load(Ordering::SeqCst), 2);
 }

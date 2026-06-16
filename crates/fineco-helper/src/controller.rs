@@ -20,9 +20,9 @@ use std::sync::Mutex;
 
 use fineco_core::{SafeError, parse_iso8601_utc};
 use fineco_ipc::{
-    MarketAssetDetailsLiveFetcher, MarketControlOutcome, MarketControlRequest,
-    MarketIndicesLiveFetcher, MarketSearchLiveFetcher, MarketSessionStatus, OWNER_AUTH_ID, Policy,
-    RefreshOutcome, RefreshRequest,
+    MARKET_SESSION_REUSE_TTL_SECS, MarketAssetDetailsLiveFetcher, MarketControlOutcome,
+    MarketControlRequest, MarketIndicesLiveFetcher, MarketSearchLiveFetcher, MarketSessionStatus,
+    OWNER_AUTH_ID, Policy, RefreshOutcome, RefreshRequest,
 };
 use fineco_refresh::{
     OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher, refresh_orders, refresh_portfolio,
@@ -46,10 +46,10 @@ pub const MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT: u32 = 1;
 /// A stale reused session may be repaired with at most one fresh login retry.
 pub const MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS: u32 = 1;
 
-/// Cross-call reuse TTL is evidence-gated. `None` means the worker remains
-/// honest/stateless across calls even if it reports status-only cookie lifetime
-/// metadata for the fresh login.
-pub const MARKET_SESSION_REUSE_TTL_SECS: Option<u64> = None;
+// The cross-call reuse window itself lives in `fineco_ipc` so the credentialed
+// worker (which holds the session) and this controller (which governs the
+// per-login cooldown/budget) agree on one value: see
+// [`fineco_ipc::MARKET_SESSION_REUSE_TTL_SECS`].
 
 /// Open the authenticated-market circuit after this many consecutive
 /// upstream/timeout failures.
@@ -132,6 +132,20 @@ struct LiveLoginState {
     pending_epoch: Option<i64>,
     last_login_epoch: Option<i64>,
     login_attempts: VecDeque<i64>,
+    /// Controller-clock epoch until which the worker is presumed to hold a
+    /// reusable market session (plan D-22). A market read admitted while this is
+    /// in the future is treated as a reuse — no fresh login, so the per-login
+    /// cooldown/budget do not apply. Mirrors the worker's held-session validity
+    /// (same TTL + last-activity), so the two agree except across a worker
+    /// restart, where the worker simply logs in fresh and reports it.
+    market_session_valid_until: Option<i64>,
+}
+
+/// The reuse window ending at `now_epoch + MARKET_SESSION_REUSE_TTL_SECS`, or
+/// `None` when cross-call reuse is disabled.
+fn reuse_window_from(now_epoch: i64) -> Option<i64> {
+    MARKET_SESSION_REUSE_TTL_SECS
+        .map(|ttl| now_epoch.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX)))
 }
 
 impl LiveLoginState {
@@ -140,6 +154,10 @@ impl LiveLoginState {
             return Err(SafeError::already_refreshing());
         }
         self.in_flight = true;
+        // A refresh logs in fresh, which evicts the worker's held market session
+        // (D-22 G-2): drop the reuse window so the next market read is admitted as
+        // a fresh login, not a now-invalid reuse.
+        self.market_session_valid_until = None;
         debug_assert!(self.pending_epoch.is_none());
         Ok(())
     }
@@ -149,7 +167,14 @@ impl LiveLoginState {
         if self.in_flight {
             return Err(SafeError::market_rate_limited());
         }
-        if let Some(last_login) = self.last_login_epoch {
+        // The 60s cooldown spaces FRESH logins, so it is skipped for a reuse (no
+        // login) — otherwise a basket of back-to-back reads would be throttled to
+        // one read per cooldown. The window is only ever set when reuse is enabled,
+        // so this preserves stateless-per-call behavior when the TTL is `None`.
+        let reuse_eligible = self
+            .market_session_valid_until
+            .is_some_and(|until| now_epoch < until);
+        if !reuse_eligible && let Some(last_login) = self.last_login_epoch {
             let age = now_epoch.saturating_sub(last_login);
             if age
                 < i64::try_from(MARKET_LOGIN_MIN_COOLDOWN_SECS)
@@ -158,6 +183,13 @@ impl LiveLoginState {
                 return Err(SafeError::market_rate_limited());
             }
         }
+        // The hourly budget is the HARD cap on fresh Fineco logins and is enforced
+        // for reuses too: a read admitted as a reuse can still perform a login —
+        // a reused-session-401 recovery inside the worker, or a worker that lost
+        // its held session (restart/reaper) — and those logins are debited after
+        // the fact. Without gating the reuse here, a recovery/divergence storm
+        // could drive more than 12 logins/hour past the cap (the cooldown still
+        // can't be enforced on those, but the budget bounds the total).
         while self.login_attempts.front().is_some_and(|attempt| {
             now_epoch.saturating_sub(*attempt) >= MARKET_LOGIN_BUDGET_WINDOW_SECS
         }) {
@@ -179,6 +211,32 @@ impl LiveLoginState {
             self.last_login_epoch = Some(epoch);
             self.login_attempts.push_back(epoch);
         }
+        self.in_flight = false;
+        self.pending_epoch = None;
+        // A non-market finish — a refresh (which evicts the worker's market
+        // session, G-2) or a permit dropped without a market finish (a panic or a
+        // poisoned lock) — leaves the held-session state uncertain, so drop the
+        // reuse window. The next market read then re-checks the cooldown/budget
+        // rather than being admitted as a stale reuse.
+        self.market_session_valid_until = None;
+    }
+
+    /// Finish a market operation, keying budget/audit on the worker's status-only
+    /// facts rather than the admit-time prediction. `performed_login` debits the
+    /// login budget/cooldown (a fresh login or a reused-session-401 recovery);
+    /// `holds_session` opens the reuse window from `now_epoch` (a successful read
+    /// leaves a held session) or clears it (an error leaves the session state
+    /// uncertain, so the next read re-checks the cooldown).
+    fn finish_market(&mut self, performed_login: bool, holds_session: bool, now_epoch: i64) {
+        if performed_login {
+            self.last_login_epoch = Some(now_epoch);
+            self.login_attempts.push_back(now_epoch);
+        }
+        self.market_session_valid_until = if holds_session {
+            reuse_window_from(now_epoch)
+        } else {
+            None
+        };
         self.in_flight = false;
         self.pending_epoch = None;
     }
@@ -238,12 +296,40 @@ struct LiveLoginPermit<'a> {
 }
 
 impl LiveLoginPermit<'_> {
-    fn finish_after_error(self, error: &SafeError) -> Result<(), SafeError> {
-        self.finish_recording(should_record_assumed_fresh_login(error))
+    /// Finish a failed market operation: clear the reuse window (the session
+    /// state is now uncertain) and debit a login unless the failure proves none
+    /// happened (a local transport failure).
+    fn finish_after_error(self, error: &SafeError, now_epoch: i64) -> Result<(), SafeError> {
+        self.finish_market_state(should_record_assumed_fresh_login(error), false, now_epoch)
     }
 
-    fn finish_with_session_status(self, session: MarketSessionStatus) -> Result<(), SafeError> {
-        self.finish_recording(session.login_performed || session.reused_session_401_recovered)
+    /// Finish a successful market operation: open the reuse window from
+    /// `now_epoch` (a session is held) and debit a login only when the worker's
+    /// status says one happened (a fresh login or a reused-session-401 recovery).
+    fn finish_with_session_status(
+        self,
+        session: MarketSessionStatus,
+        now_epoch: i64,
+    ) -> Result<(), SafeError> {
+        self.finish_market_state(
+            session.login_performed || session.reused_session_401_recovered,
+            true,
+            now_epoch,
+        )
+    }
+
+    fn finish_market_state(
+        mut self,
+        performed_login: bool,
+        holds_session: bool,
+        now_epoch: i64,
+    ) -> Result<(), SafeError> {
+        self.state
+            .lock()
+            .map_err(|_| SafeError::internal())?
+            .finish_market(performed_login, holds_session, now_epoch);
+        self.finished = true;
+        Ok(())
     }
 
     fn finish_recording(mut self, should_record_login: bool) -> Result<(), SafeError> {
@@ -432,6 +518,9 @@ where
             ));
         }
         request.validate()?;
+        // The same controller clock the admit/finish accounting and the reuse
+        // window key on.
+        let now_epoch = parse_iso8601_utc(now_iso).ok_or_else(SafeError::internal)?;
         self.market_circuit_state
             .lock()
             .map_err(|_| SafeError::internal())?
@@ -443,7 +532,7 @@ where
                 match live {
                     Ok(live) => {
                         let session = live.session;
-                        permit.finish_with_session_status(session)?;
+                        permit.finish_with_session_status(session, now_epoch)?;
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
@@ -454,7 +543,7 @@ where
                         })
                     }
                     Err(error) => {
-                        permit.finish_after_error(&error)?;
+                        permit.finish_after_error(&error, now_epoch)?;
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
@@ -468,7 +557,7 @@ where
                 match live {
                     Ok(live) => {
                         let session = live.session;
-                        permit.finish_with_session_status(session)?;
+                        permit.finish_with_session_status(session, now_epoch)?;
                         let validation = live.result.validate_response_size();
                         self.market_circuit_state
                             .lock()
@@ -481,7 +570,7 @@ where
                         })
                     }
                     Err(error) => {
-                        permit.finish_after_error(&error)?;
+                        permit.finish_after_error(&error, now_epoch)?;
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
@@ -495,7 +584,7 @@ where
                 match live {
                     Ok(live) => {
                         let session = live.session;
-                        permit.finish_with_session_status(session)?;
+                        permit.finish_with_session_status(session, now_epoch)?;
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
@@ -506,7 +595,7 @@ where
                         })
                     }
                     Err(error) => {
-                        permit.finish_after_error(&error)?;
+                        permit.finish_after_error(&error, now_epoch)?;
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
@@ -526,16 +615,16 @@ mod tests {
         MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR, MARKET_LOGIN_MIN_COOLDOWN_SECS,
         MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT,
         MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS, MARKET_SESSION_REUSE_TTL_SECS,
-        RefreshController, RefreshLimitsByArea,
+        RefreshController, RefreshLimitsByArea, parse_iso8601_utc,
     };
     use fineco_core::SafeError;
     use fineco_ipc::{
         MarketAssetDetailsLiveResult, MarketAssetDetailsResult, MarketAssetIdentity,
-        MarketAssetSections, MarketAssetType, MarketControlRequest, MarketDetailsParams,
-        MarketField, MarketIndexCard, MarketIndexRegion, MarketIndicesLiveResult,
-        MarketIndicesParams, MarketIndicesResult, MarketSearchCandidate, MarketSearchGroup,
-        MarketSearchLiveResult, MarketSearchParams, MarketSearchResult, MarketSessionStatus,
-        OrdersRefreshParams, Policy, RefreshRequest, TaxRefreshParams,
+        MarketAssetSections, MarketAssetType, MarketControlOutcome, MarketControlRequest,
+        MarketDetailsParams, MarketField, MarketIndexCard, MarketIndexRegion,
+        MarketIndicesLiveResult, MarketIndicesParams, MarketIndicesResult, MarketSearchCandidate,
+        MarketSearchGroup, MarketSearchLiveResult, MarketSearchParams, MarketSearchResult,
+        MarketSessionStatus, OrdersRefreshParams, Policy, RefreshRequest, TaxRefreshParams,
     };
     use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher};
     use fineco_store::{
@@ -543,6 +632,7 @@ mod tests {
         RawOrder, Store,
     };
     use std::cell::Cell;
+    use std::rc::Rc;
 
     const NOW: &str = "2026-06-05T10:00:00Z";
 
@@ -554,7 +644,10 @@ mod tests {
         orders: Result<Vec<RawOrder>, SafeError>,
         carry_forward: Result<NewTaxCarryForward, SafeError>,
         minus_by_year: Result<Vec<NewTaxMinusByYear>, SafeError>,
-        market_session: MarketSessionStatus,
+        /// The status-only session facts the fake reports per market call. A
+        /// closure so a test can simulate the real worker (fresh login first,
+        /// reuse afterwards) by capturing a counter.
+        market_session: Box<dyn Fn() -> MarketSessionStatus>,
         market_result: Box<dyn Fn() -> Result<(), SafeError>>,
     }
 
@@ -573,7 +666,7 @@ mod tests {
                     minus_residue: Some(0.0),
                     expiration_date: None,
                 }]),
-                market_session: MarketSessionStatus::fresh_login(),
+                market_session: Box::new(MarketSessionStatus::fresh_login),
                 market_result: Box::new(|| Ok(())),
             }
         }
@@ -648,7 +741,7 @@ mod tests {
                         }],
                     }],
                 },
-                session: self.market_session,
+                session: (self.market_session)(),
             })
         }
     }
@@ -724,7 +817,7 @@ mod tests {
                     sources: vec![],
                     warnings: vec![],
                 },
-                session: self.market_session,
+                session: (self.market_session)(),
             })
         }
     }
@@ -771,7 +864,7 @@ mod tests {
                     }],
                     warnings: vec![],
                 },
-                session: self.market_session,
+                session: (self.market_session)(),
             })
         }
     }
@@ -899,7 +992,7 @@ mod tests {
         assert_eq!(MARKET_LOGIN_MIN_COOLDOWN_SECS, 60);
         assert_eq!(MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT, 1);
         assert_eq!(MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS, 1);
-        assert_eq!(MARKET_SESSION_REUSE_TTL_SECS, None);
+        assert_eq!(MARKET_SESSION_REUSE_TTL_SECS, Some(120));
         assert_eq!(MARKET_CIRCUIT_CONSECUTIVE_FAILURES, 3);
         assert_eq!(MARKET_CIRCUIT_COOLDOWN_SECS, 600);
     }
@@ -925,31 +1018,175 @@ mod tests {
         assert_eq!(err.code(), "already_refreshing");
     }
 
+    /// A fake whose first market call reports a fresh login and every later one
+    /// reports a reuse — modelling the real worker holding a session across reads.
+    fn sequenced_session_worker() -> FakeWorker {
+        let calls = Rc::new(Cell::new(0u32));
+        let mut worker = FakeWorker::ok();
+        worker.market_session = Box::new(move || {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                MarketSessionStatus::fresh_login()
+            } else {
+                MarketSessionStatus {
+                    login_performed: false,
+                    session_reused: true,
+                    session_evicted: false,
+                    reused_session_401_recovered: false,
+                    session_expires_in_secs: Some(300),
+                }
+            }
+        });
+        worker
+    }
+
+    fn market_session_of(outcome: &MarketControlOutcome) -> MarketSessionStatus {
+        match outcome {
+            MarketControlOutcome::Search { session, .. }
+            | MarketControlOutcome::Details { session, .. }
+            | MarketControlOutcome::Indices { session, .. } => *session,
+        }
+    }
+
     #[test]
-    fn market_search_enforces_the_fresh_login_cooldown() {
-        let ctrl = controller(FakeWorker::ok(), market_policy());
-        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
-            .expect("first search admitted");
+    fn market_reads_within_the_reuse_window_skip_the_login_cooldown() {
+        // First read logs in; a follow-up inside the reuse window reuses the held
+        // session, so the 60s fresh-login cooldown does NOT apply — a basket of
+        // back-to-back reads must not be throttled to one read per cooldown.
+        let ctrl = controller(sequenced_session_worker(), market_policy());
+        let first = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("first search logs in");
+        assert!(market_session_of(&first).login_performed);
 
-        let err = ctrl
+        let second = ctrl
             .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
-            .expect_err("second fresh login inside cooldown is denied");
-        assert_eq!(err.code(), "market_rate_limited");
+            .expect("second search reuses within the window, not cooldown-blocked");
+        assert!(market_session_of(&second).session_reused);
+    }
 
-        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:01:00Z")
-            .expect("cooldown boundary is admitted");
+    /// Direct `LiveLoginState` checks for the reuse-window admission model, where
+    /// the held-session lifecycle can be driven deterministically (the fake
+    /// worker reports status independently of the controller's prediction).
+    #[test]
+    fn reuse_window_admission_skips_cooldown_then_re_applies_it() {
+        let ttl = MARKET_SESSION_REUSE_TTL_SECS.expect("reuse enabled");
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        let mut state = LiveLoginState::default();
+        state.admit_market_operation(&iso(0)).expect("first admit");
+        // A successful fresh login opens the reuse window and arms the cooldown.
+        state.finish_market(true, true, t0);
+
+        // 30s later (< 60s cooldown) but within the window → reuse, admitted.
+        state
+            .admit_market_operation(&iso(30))
+            .expect("reuse skips the cooldown");
+        state.finish_market(false, true, t0 + 30);
+
+        // Past the window (last activity t0+30, +ttl): a fresh login is needed, and
+        // it is now well past the cooldown, so it is admitted and re-arms the window.
+        let expired = 30 + i64::try_from(ttl).unwrap() + 1;
+        state
+            .admit_market_operation(&iso(expired))
+            .expect("a fresh login past the window is admitted");
+    }
+
+    #[test]
+    fn a_failed_read_clears_the_reuse_window_so_the_cooldown_applies() {
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        let mut state = LiveLoginState::default();
+        state.admit_market_operation(&iso(0)).expect("admit");
+        // An error debits the login but clears the window (session state unknown).
+        state.finish_market(true, false, t0);
+
+        // 30s later: no window → the fresh-login cooldown applies.
+        let err = state
+            .admit_market_operation(&iso(30))
+            .expect_err("cleared window re-arms the cooldown");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn a_refresh_admission_clears_the_market_reuse_window() {
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        let mut state = LiveLoginState::default();
+        state.admit_market_operation(&iso(0)).expect("market admit");
+        state.finish_market(true, true, t0); // holds a session, window open
+
+        // A refresh logs in fresh and evicts the market session (D-22 G-2): the
+        // window must be dropped so the next market read is not a stale reuse.
+        state.admit_refresh_operation().expect("refresh admit");
+        state.finish(false);
+
+        // 30s after the original login: window gone → cooldown applies.
+        let err = state
+            .admit_market_operation(&iso(30))
+            .expect_err("refresh cleared the reuse window");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn the_hourly_budget_caps_logins_even_for_reuse_admitted_reads() {
+        // A reused-session-401 recovery (or a restarted worker) performs a login
+        // INSIDE a read the controller admitted as a reuse, skipping the cooldown.
+        // The hourly budget must still cap total logins at 12.
+        let mut state = LiveLoginState::default();
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        // 12 reads 5s apart: the first logs in fresh, the rest are admitted as
+        // reuses (the window stays open) but each performs a login.
+        for i in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+            let offset = i64::from(i) * 5;
+            state
+                .admit_market_operation(&iso(offset))
+                .expect("admitted within budget");
+            state.finish_market(true, true, t0 + offset);
+        }
+
+        // The 13th is still inside the reuse window, but the 12/hour cap is hit.
+        let err = state
+            .admit_market_operation(&iso(60))
+            .expect_err("budget caps reuse-admitted logins");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn a_dropped_permit_finish_clears_the_reuse_window() {
+        // A permit dropped without a market finish (a panic / poisoned lock) falls
+        // back to `finish(false)`; it must drop the reuse window so the next read
+        // re-checks the cooldown instead of being admitted as a stale reuse.
+        let mut state = LiveLoginState::default();
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        state.admit_market_operation(&iso(0)).expect("admit");
+        state.finish_market(true, true, t0); // window open, login at t0
+        state.finish(false); // the drop-path fallback
+
+        let err = state
+            .admit_market_operation(&iso(30))
+            .expect_err("dropped permit re-arms the cooldown");
+        assert_eq!(err.code(), "market_rate_limited");
     }
 
     #[test]
     fn market_search_reused_session_status_does_not_burn_fresh_login_cooldown() {
         let mut worker = FakeWorker::ok();
-        worker.market_session = MarketSessionStatus {
+        worker.market_session = Box::new(|| MarketSessionStatus {
             login_performed: false,
             session_reused: true,
             session_evicted: false,
             reused_session_401_recovered: false,
             session_expires_in_secs: Some(300),
-        };
+        });
         let ctrl = controller(worker, market_policy());
         ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
             .expect("reused-session search admitted");
@@ -959,37 +1196,57 @@ mod tests {
     }
 
     #[test]
-    fn market_search_recovered_reused_session_401_burns_fresh_login_cooldown() {
+    fn recovered_reused_session_401_is_reported_and_debits_a_login() {
+        // The worker repaired a stale reused session with one fresh login: the read
+        // succeeds and reports the recovery.
         let mut worker = FakeWorker::ok();
-        worker.market_session = MarketSessionStatus {
+        worker.market_session = Box::new(|| MarketSessionStatus {
+            login_performed: false,
+            session_reused: true,
+            session_evicted: true,
+            reused_session_401_recovered: true,
+            session_expires_in_secs: None,
+        });
+        let ctrl = controller(worker, market_policy());
+        let outcome = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("recovered reused-session search admitted");
+        assert!(market_session_of(&outcome).reused_session_401_recovered);
+
+        // That recovery performed a fresh login, so it must debit the login budget.
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let mut state = LiveLoginState::default();
+        let recovered = MarketSessionStatus {
             login_performed: false,
             session_reused: true,
             session_evicted: true,
             reused_session_401_recovered: true,
             session_expires_in_secs: None,
         };
-        let ctrl = controller(worker, market_policy());
-        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
-            .expect("recovered reused-session search admitted");
-
-        let err = ctrl
-            .handle_market_control(market_search_request(), "2026-06-14T10:00:30Z")
-            .expect_err("recovered reused-session 401 consumes a fresh-login cooldown slot");
-        assert_eq!(err.code(), "market_rate_limited");
+        state.finish_market(
+            recovered.login_performed || recovered.reused_session_401_recovered,
+            true,
+            t0,
+        );
+        assert_eq!(state.last_login_epoch, Some(t0));
+        assert_eq!(state.login_attempts.len(), 1);
     }
 
     #[test]
     fn market_search_enforces_the_hourly_login_budget() {
         let ctrl = controller(FakeWorker::ok(), market_policy());
-        for minute in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+        // Space reads 3 minutes apart — past the 120s reuse window, so each is a
+        // fresh login (a back-to-back basket would instead reuse one login).
+        for i in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+            let minute = i * 3;
             let now = format!("2026-06-14T10:{minute:02}:00Z");
             ctrl.handle_market_control(market_search_request(), &now)
                 .expect("within market login budget");
         }
 
         let err = ctrl
-            .handle_market_control(market_search_request(), "2026-06-14T10:12:00Z")
-            .expect_err("13th login inside the rolling hour is denied");
+            .handle_market_control(market_search_request(), "2026-06-14T10:36:00Z")
+            .expect_err("13th fresh login inside the rolling hour is denied");
         assert_eq!(err.code(), "market_rate_limited");
     }
 
