@@ -167,35 +167,39 @@ impl LiveLoginState {
         if self.in_flight {
             return Err(SafeError::market_rate_limited());
         }
-        // A still-valid held session is reused (no fresh login), so the per-login
-        // cooldown and hourly budget do not apply — otherwise a basket of
-        // back-to-back reads would be throttled to one read per cooldown. The
-        // window is only ever set when reuse is enabled, so this preserves the
-        // stateless-per-call behavior when the TTL is `None`.
+        // The 60s cooldown spaces FRESH logins, so it is skipped for a reuse (no
+        // login) — otherwise a basket of back-to-back reads would be throttled to
+        // one read per cooldown. The window is only ever set when reuse is enabled,
+        // so this preserves stateless-per-call behavior when the TTL is `None`.
         let reuse_eligible = self
             .market_session_valid_until
             .is_some_and(|until| now_epoch < until);
-        if !reuse_eligible {
-            if let Some(last_login) = self.last_login_epoch {
-                let age = now_epoch.saturating_sub(last_login);
-                if age
-                    < i64::try_from(MARKET_LOGIN_MIN_COOLDOWN_SECS)
-                        .map_err(|_| SafeError::internal())?
-                {
-                    return Err(SafeError::market_rate_limited());
-                }
-            }
-            while self.login_attempts.front().is_some_and(|attempt| {
-                now_epoch.saturating_sub(*attempt) >= MARKET_LOGIN_BUDGET_WINDOW_SECS
-            }) {
-                let _ = self.login_attempts.pop_front();
-            }
-            if self.login_attempts.len()
-                >= usize::try_from(MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR)
+        if !reuse_eligible && let Some(last_login) = self.last_login_epoch {
+            let age = now_epoch.saturating_sub(last_login);
+            if age
+                < i64::try_from(MARKET_LOGIN_MIN_COOLDOWN_SECS)
                     .map_err(|_| SafeError::internal())?
             {
                 return Err(SafeError::market_rate_limited());
             }
+        }
+        // The hourly budget is the HARD cap on fresh Fineco logins and is enforced
+        // for reuses too: a read admitted as a reuse can still perform a login —
+        // a reused-session-401 recovery inside the worker, or a worker that lost
+        // its held session (restart/reaper) — and those logins are debited after
+        // the fact. Without gating the reuse here, a recovery/divergence storm
+        // could drive more than 12 logins/hour past the cap (the cooldown still
+        // can't be enforced on those, but the budget bounds the total).
+        while self.login_attempts.front().is_some_and(|attempt| {
+            now_epoch.saturating_sub(*attempt) >= MARKET_LOGIN_BUDGET_WINDOW_SECS
+        }) {
+            let _ = self.login_attempts.pop_front();
+        }
+        if self.login_attempts.len()
+            >= usize::try_from(MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR)
+                .map_err(|_| SafeError::internal())?
+        {
+            return Err(SafeError::market_rate_limited());
         }
         self.in_flight = true;
         self.pending_epoch = Some(now_epoch);
@@ -209,6 +213,12 @@ impl LiveLoginState {
         }
         self.in_flight = false;
         self.pending_epoch = None;
+        // A non-market finish — a refresh (which evicts the worker's market
+        // session, G-2) or a permit dropped without a market finish (a panic or a
+        // poisoned lock) — leaves the held-session state uncertain, so drop the
+        // reuse window. The next market read then re-checks the cooldown/budget
+        // rather than being admitted as a stale reuse.
+        self.market_session_valid_until = None;
     }
 
     /// Finish a market operation, keying budget/audit on the worker's status-only
@@ -1119,6 +1129,51 @@ mod tests {
         let err = state
             .admit_market_operation(&iso(30))
             .expect_err("refresh cleared the reuse window");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn the_hourly_budget_caps_logins_even_for_reuse_admitted_reads() {
+        // A reused-session-401 recovery (or a restarted worker) performs a login
+        // INSIDE a read the controller admitted as a reuse, skipping the cooldown.
+        // The hourly budget must still cap total logins at 12.
+        let mut state = LiveLoginState::default();
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        // 12 reads 5s apart: the first logs in fresh, the rest are admitted as
+        // reuses (the window stays open) but each performs a login.
+        for i in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+            let offset = i64::from(i) * 5;
+            state
+                .admit_market_operation(&iso(offset))
+                .expect("admitted within budget");
+            state.finish_market(true, true, t0 + offset);
+        }
+
+        // The 13th is still inside the reuse window, but the 12/hour cap is hit.
+        let err = state
+            .admit_market_operation(&iso(60))
+            .expect_err("budget caps reuse-admitted logins");
+        assert_eq!(err.code(), "market_rate_limited");
+    }
+
+    #[test]
+    fn a_dropped_permit_finish_clears_the_reuse_window() {
+        // A permit dropped without a market finish (a panic / poisoned lock) falls
+        // back to `finish(false)`; it must drop the reuse window so the next read
+        // re-checks the cooldown instead of being admitted as a stale reuse.
+        let mut state = LiveLoginState::default();
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        state.admit_market_operation(&iso(0)).expect("admit");
+        state.finish_market(true, true, t0); // window open, login at t0
+        state.finish(false); // the drop-path fallback
+
+        let err = state
+            .admit_market_operation(&iso(30))
+            .expect_err("dropped permit re-arms the cooldown");
         assert_eq!(err.code(), "market_rate_limited");
     }
 
