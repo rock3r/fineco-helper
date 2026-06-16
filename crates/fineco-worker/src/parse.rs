@@ -3571,7 +3571,10 @@ mod tests {
         let quote = result.sections.quote.expect("quote");
         let last = quote.last.expect("last").value;
         // Price fields scaled pence -> pounds (÷100); now consistent with the range.
-        assert!((last - 1.121).abs() < 1e-6, "last should be ~1.121 GBP, got {last}");
+        assert!(
+            (last - 1.121).abs() < 1e-6,
+            "last should be ~1.121 GBP, got {last}"
+        );
         assert!((quote.bid.expect("bid").value - 1.1135).abs() < 1e-6);
         assert!((quote.ask.expect("ask").value - 1.1455).abs() < 1e-6);
         assert!((quote.previous_close.expect("prev").value - 1.125).abs() < 1e-6);
