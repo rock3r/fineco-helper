@@ -1068,11 +1068,18 @@ pub(crate) fn to_market_asset_details(
 /// quote endpoint reports prices in the MINOR unit (GBX pence) while the
 /// stock-snapshot reports the same kind of value in the MAJOR unit (GBP pounds) —
 /// Fineco labels BOTH with the major currency ("GBP"), so the only reliable signal
-/// is the values: the quote then sits an order of magnitude above the 52-week high,
-/// which is impossible unless the units differ by 100x. Returns the factor that
-/// brings the quote into the major unit (`0.01`), or `1.0` when there is no split
-/// or it cannot be determined. Currency-label-agnostic, so EUR/USD instruments
-/// (whose quote sits inside their range) are never touched.
+/// is the values relative to the 52-week range. Returns the factor that brings the
+/// quote into the major unit (`0.01`), or `1.0` when there is no split or it cannot
+/// be determined.
+///
+/// A consistent quote sits inside its 52-week [low, high] range (with a generous
+/// margin for fresh highs/lows and intraday moves). A pence quote sits ~100x above
+/// the range, but dividing it by 100 lands it back inside — so scale exactly when
+/// the raw quote is OUT of the range band and `last / 100` is IN it. This is robust
+/// to deep drawdowns (where a simple `last / high` ratio drops below the 100x split
+/// for a name far below its yearly high) and to names that have mooned from their
+/// low (where a `last / low` ratio would false-positive). EUR/USD instruments,
+/// whose quote already sits in the range, are never touched.
 fn quote_to_major_unit_scale(
     quote: Option<&RawInstrumentSnapshot>,
     stock: Option<&StockSnapshotResponse>,
@@ -1080,16 +1087,24 @@ fn quote_to_major_unit_scale(
     let Some(last) = quote.and_then(|q| q.last).filter(|value| *value > 0.0) else {
         return 1.0;
     };
-    let Some(range_high) = stock
+    let Some(low) = stock
+        .and_then(|s| s.range_52w_low)
+        .filter(|value| *value > 0.0)
+    else {
+        return 1.0;
+    };
+    let Some(high) = stock
         .and_then(|s| s.range_52w_high)
         .filter(|value| *value > 0.0)
     else {
         return 1.0;
     };
-    // A real last price can never exceed ~the 52-week high. A real pence/major
-    // split produces a ratio of ~50–100; the `> 10` guard sits well below that yet
-    // far above any legitimate last/high ratio (≤ ~1.1), so it never misfires.
-    if last / range_high > 10.0 { 0.01 } else { 1.0 }
+    let in_range = |value: f64| value >= low * 0.5 && value <= high * 2.0;
+    if !in_range(last) && in_range(last * 0.01) {
+        0.01
+    } else {
+        1.0
+    }
 }
 
 pub(crate) fn to_stock_asset_details(
@@ -3594,6 +3609,58 @@ mod tests {
                 .iter()
                 .any(|w| w.code == "quote_unit_normalized"),
             "expected a quote_unit_normalized warning"
+        );
+    }
+
+    #[test]
+    fn stock_details_normalize_pence_quote_after_deep_drawdown() {
+        // A GBp stock that has fallen to a small fraction of its 52-week high: the
+        // raw quote (2.0 pence) is far below the pounds high (0.30), so a naive
+        // last/high ratio (6.7) would miss the split. But `last / 100` (0.02) lands
+        // inside the [low, high] pounds range while the raw quote does not, so it is
+        // still detected and normalized.
+        let candidate = lse_pence_candidate();
+        let result = to_stock_asset_details(
+            &MarketDetailsParams {
+                identifier: "LSE/VOD".to_string(),
+                expected_isin: Some("GB00BH4HKS39".to_string()),
+                sections: Some(vec![MarketDetailsSection::Quote, MarketDetailsSection::Stock]),
+            },
+            &candidate,
+            StockDetailsInputs {
+                static_response: serde_json::from_str(
+                    r#"{"GB00BH4HKS39.LSE":{"instrId":"GB00BH4HKS39","venueSystem":"LSE","description":"X","symbol":"VOD.L","currencyCd":"GBP"}}"#,
+                )
+                .expect("static"),
+                snapshot_response: Some(
+                    serde_json::from_str(
+                        r#"{"GB00BH4HKS39.LSE":{"last":2.0,"prevClosePrice":2.1,"percVar":-4.5,"volume":1000}}"#,
+                    )
+                    .expect("snapshot"),
+                ),
+                stock_snapshot: Some(
+                    serde_json::from_str(r#"{"ticker":"VOD","priceCurrency":"GBP","range52wH":0.30,"range52wL":0.018}"#)
+                        .expect("stock snapshot"),
+                ),
+                stock_reports: None,
+            },
+            "2026-06-16T12:00:00Z",
+        )
+        .expect("details");
+
+        let last = result
+            .sections
+            .quote
+            .expect("quote")
+            .last
+            .expect("last")
+            .value;
+        assert!((last - 0.02).abs() < 1e-9, "expected 0.02 GBP, got {last}");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "quote_unit_normalized")
         );
     }
 
