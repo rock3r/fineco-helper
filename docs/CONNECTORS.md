@@ -94,14 +94,26 @@ Override it per deployment with `FINECO_CONNECTOR_TOOLS` in `/etc/fineco/access.
 
     # unset                  -> the default allowlist (all tools except the blocked set above)
     # FINECO_CONNECTOR_TOOLS="*"      (or "all")  -> no restriction (connectors get every tool)
+    # FINECO_CONNECTOR_TOOLS="+a,b"              -> the default set PLUS tools a, b (deduplicated)
     # FINECO_CONNECTOR_TOOLS="a,b,c"             -> exactly tools a, b, c
+
+The `+` form is the fail-safe way to **widen** the surface: it starts from the
+default allowlist and adds the listed tools, so you keep every default tool and
+can't accidentally narrow the set by forgetting one. It is exactly how the
+authenticated market tools are exposed once enabled —
+`FINECO_CONNECTOR_TOOLS="+market_search_asset,market_get_asset_details,market_get_indices"`
+(see [DEPLOYMENT.md](DEPLOYMENT.md) "Enabling authenticated market tools"). A `+`
+entry already in the default set is a no-op (no duplicate); an unknown name still
+fails closed at startup.
 
 Notes: the connector channel — and therefore this scoping — exists whenever Access
 has an **email/OAuth pin** (`FINECO_OWNER_EMAIL`), including a single-email-pin
 deployment, not only dual-pin; setting the variable without an email pin is an
 error. The default is an **explicit allowlist**, so a newly-added tool stays hidden
 from connectors until listed (fail-safe), and an unknown tool name fails closed at
-startup.
+startup. Connector exposure is independent of the capability gate: a connector can
+only call a tool the host `policy.json` also grants, so listing the market tools
+here without granting `market.authenticated.read` still refuses the call.
 
 ## Owner-side Cloudflare setup (one-time, on your CF account)
 

@@ -137,7 +137,7 @@ Product (`crates/`):
   and the reads replay that jar plus the session. Refresh and search/details
   fetches are **stateless per call** (login → use on the stack → discard), but
   authenticated **market** reads additionally **hold one session for cross-call
-  reuse** within `MARKET_SESSION_REUSE_TTL_SECS` (a fixed 120 s; plan D-22), so a
+  reuse** within `MARKET_SESSION_REUSE_TTL_SECS` (a fixed 180 s; plan D-22), so a
   basket of back-to-back instrument reads rides one login. Market live responses
   report status-only session facts (`login_performed`, `session_reused`,
   eviction/recovery flags, optional session-cookie expiry TTL from

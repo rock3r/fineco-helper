@@ -215,6 +215,52 @@ controller block as refresh-control.
 > HTTPS JSON fetcher. It is not client-supplied (root-owned `enrichment.env`
 > only), but leave it unset so the pinned default is the sole ETF source.
 
+## Enabling authenticated market tools
+
+On-demand authenticated Fineco market reads (`market_search_asset`,
+`market_get_asset_details`, `market_get_indices`) are **dark by default**: the
+committed `policy.json` does not grant `market.authenticated.read`, the
+market-control socket is left unset, and the three tools are excluded from the
+default connector allowlist. Turn them on deliberately, host-side, only after the
+market live-session gate has been reviewed clean ([LIVE-REFRESH-GATES.md](LIVE-REFRESH-GATES.md)).
+Each step is reversible; the rollback below is the exact inverse.
+
+1. **Grant the capability.** In `/etc/fineco/policy.json`, add
+   `market.authenticated.read` to `owner`'s capabilities. This is the live-host
+   policy, not the committed fail-safe baseline.
+2. **Bind the controller socket.** Uncomment the
+   `FINECO_MARKET_CONTROL_SOCKET=/run/fineco-helper-refresh/market-control.sock`
+   line in **both** `fineco-store-server.service` (the controller binds it) and
+   `fineco-gateway.service` (the gateway connects to it) — same path on both. It
+   lives in the `fineco-ipc-refresh` group the gateway already joins, so no group
+   change is needed; the store-server only accepts it when `FINECO_REFRESH_SOCKET`
+   and `FINECO_LIVE_SOCKET` are already set (it fails closed otherwise).
+3. **Expose to connectors (optional).** To let ChatGPT/Claude connectors call the
+   three tools, set in `/etc/fineco/access.env`:
+
+       FINECO_CONNECTOR_TOOLS=+market_search_asset,market_get_asset_details,market_get_indices
+
+   The leading `+` means "the fail-safe default connector set **plus** these", so
+   every default tool stays exposed and only the three market tools are added — no
+   need to re-list the whole default set, and no risk of accidentally narrowing it.
+   (Leaving `FINECO_CONNECTOR_TOOLS` unset keeps the tools reachable on the CLI /
+   service-token channel but hidden from connectors; granting the capability is
+   still required either way.) See [CONNECTORS.md](CONNECTORS.md).
+4. **Reload and restart.** `systemctl daemon-reload`, then restart both units:
+   `systemctl restart fineco-store-server.service fineco-gateway.service`.
+5. **Smoke-test.** Call `market_get_indices` once and confirm a `200` with index
+   data. Then call `market_search_asset` for a basket of instruments back-to-back
+   and confirm the response session facts show `session_reused: true` after the
+   first read (one login amortized across the basket), with
+   `reused_session_401_recovered` staying at/near zero — a spike there means the
+   reuse TTL (`MARKET_SESSION_REUSE_TTL_SECS`, 180 s) is longer than the live
+   server session and should come down.
+
+**Rollback** (any time): re-comment `FINECO_MARKET_CONTROL_SOCKET` on both units,
+remove `market.authenticated.read` from `policy.json`, unset
+`FINECO_CONNECTOR_TOOLS` (or drop the `+market_*` additions), `daemon-reload`, and
+restart both units. The tools go dark again with no other change.
+
 ## Hardening
 
 Both units apply the plan's hardening (`NoNewPrivileges`, `PrivateTmp`,

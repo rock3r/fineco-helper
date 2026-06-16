@@ -47,6 +47,12 @@ Environment=FINECO_QUERY_SOCKET=/run/fineco-helper/snapshot-query.sock
 # M8 live refresh: the refresh-control socket. Remove this (and leave the gateway
 # out of fineco-ipc-refresh) for a cached-only gateway.
 Environment=FINECO_REFRESH_SOCKET=/run/fineco-helper-refresh/refresh-control.sock
+# Authenticated market reads (D-22): the gateway connects to the controller's
+# market-control socket. Optional and explicit-only — uncomment ONLY when enabling
+# on-demand authenticated Fineco market reads. Use the SAME path the store-server
+# unit binds; it lives in the fineco-ipc-refresh group the gateway already joins
+# (no extra group needed). See docs/DEPLOYMENT.md "Enabling authenticated market tools".
+# Environment=FINECO_MARKET_CONTROL_SOCKET=/run/fineco-helper-refresh/market-control.sock
 Environment=FINECO_POLICY_PATH=/etc/fineco/policy.json
 # Cloudflare Access (M6) — REQUIRED for the remote deployment. The gateway FAILS
 # CLOSED: with none of the three vars set it REFUSES TO START unless the explicit

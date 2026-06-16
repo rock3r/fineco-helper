@@ -48,12 +48,16 @@ pub const MAX_INDEX_CARDS: u32 = 50;
 /// back-to-back instrument reads rides one login instead of one login per read.
 /// `None`: stateless per call (a fresh login every read).
 ///
-/// `120` is deliberately conservative: well under the few-minutes server-side idle
-/// timeout observed on the live site (the threshold is server-enforced and not
-/// exposed in Fineco's frontend, so this is a fixed safe value, not a derived one).
-/// A reused session that the server has nonetheless expired is repaired by exactly
-/// one fresh-login retry ([`MarketSessionStatus::reused_session_401_recovered`]).
-pub const MARKET_SESSION_REUSE_TTL_SECS: Option<u64> = Some(120);
+/// `180` (3 min) is deliberately conservative: it sits under the only hard floor we
+/// have — Fineco's frontend logs an idle browser out at 5 min, and the server session
+/// outlives that — while staying well short of any plausible server-side idle timeout
+/// (the real threshold is server-enforced and not exposed in the frontend, so this is
+/// a fixed safe value, not a derived one). It is tunable from production telemetry:
+/// the [`MarketSessionStatus::reused_session_401_recovered`] counter is the feedback
+/// signal — rare/zero recoveries mean the window is safe to nudge up; a spike means
+/// the server is stricter than assumed and it should come down. A reused session that
+/// the server has nonetheless expired is repaired by exactly one fresh-login retry.
+pub const MARKET_SESSION_REUSE_TTL_SECS: Option<u64> = Some(180);
 
 /// Max candidate summaries embedded in an ambiguity safe error.
 pub const MAX_AMBIGUITY_SUGGESTIONS: usize = 10;

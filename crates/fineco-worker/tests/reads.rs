@@ -739,7 +739,7 @@ fn market_reads_reuse_a_held_session_within_the_ttl() {
     assert!(first.session.login_performed);
     assert!(!first.session.session_reused);
 
-    // +30s, then +140s from the first read: each is within the rolling 120s window
+    // +30s, then +140s from the first read: each is within the rolling 180s window
     // (the window resets on every read), so both reuse the held session.
     let second = worker
         .fetch_market_indices(&indices_params(), "2026-06-03T12:00:30Z")
@@ -758,9 +758,9 @@ fn market_reads_reuse_a_held_session_within_the_ttl() {
         "one login served three reads"
     );
 
-    // Past the window (last read 12:02:20 + 120s = 12:04:20): a fresh login.
+    // Past the window (last read 12:02:20 + 180s = 12:05:20): a fresh login.
     let fourth = worker
-        .fetch_market_indices(&indices_params(), "2026-06-03T12:05:00Z")
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:05:30Z")
         .expect("fourth read re-logs in");
     assert!(fourth.session.login_performed);
     assert!(!fourth.session.session_reused);

@@ -379,6 +379,72 @@ fn connector_allowlist_honors_an_explicit_list() {
 }
 
 #[test]
+fn connector_allowlist_plus_prefix_adds_to_the_default_set() {
+    // A leading `+` means "the default connector set PLUS these" — so a deployer
+    // enabling the authenticated market tools keeps every fail-safe default tool
+    // and just widens the surface, instead of re-listing the whole default set.
+    let mut env = dual_pin_base();
+    env.push((
+        "FINECO_CONNECTOR_TOOLS",
+        "+market_search_asset, market_get_asset_details, market_get_indices",
+    ));
+    let config = GatewayConfig::from_env(env_from(&env)).expect("config");
+    let allow = config.connector_allowlist.expect("allowlist");
+    // Every default tool is still present.
+    for name in fineco_gateway::DEFAULT_CONNECTOR_TOOLS {
+        assert!(
+            allow.contains(&(*name).to_string()),
+            "default tool {name} dropped by additive syntax"
+        );
+    }
+    // The three authenticated market tools were added on top.
+    assert!(allow.contains(&"market_search_asset".to_string()));
+    assert!(allow.contains(&"market_get_asset_details".to_string()));
+    assert!(allow.contains(&"market_get_indices".to_string()));
+    // Exactly the default set plus the three additions (no duplicates).
+    assert_eq!(
+        allow.len(),
+        fineco_gateway::DEFAULT_CONNECTOR_TOOLS.len() + 3
+    );
+}
+
+#[test]
+fn connector_allowlist_plus_prefix_deduplicates_against_the_default() {
+    // A `+` entry that names a tool already in the default set must not duplicate it.
+    let mut env = dual_pin_base();
+    env.push((
+        "FINECO_CONNECTOR_TOOLS",
+        "+portfolio_get_freshness, market_get_indices",
+    ));
+    let config = GatewayConfig::from_env(env_from(&env)).expect("config");
+    let allow = config.connector_allowlist.expect("allowlist");
+    assert_eq!(
+        allow
+            .iter()
+            .filter(|n| *n == "portfolio_get_freshness")
+            .count(),
+        1,
+        "a default tool re-listed via `+` must not be duplicated"
+    );
+    // Only the genuinely-new tool grows the set.
+    assert_eq!(
+        allow.len(),
+        fineco_gateway::DEFAULT_CONNECTOR_TOOLS.len() + 1
+    );
+}
+
+#[test]
+fn connector_allowlist_plus_prefix_rejects_an_unknown_tool() {
+    let mut env = dual_pin_base();
+    env.push(("FINECO_CONNECTOR_TOOLS", "+bogus_tool"));
+    let message = gateway_config_err(&env);
+    assert!(
+        message.contains("unknown tool 'bogus_tool'"),
+        "message: {message}"
+    );
+}
+
+#[test]
 fn connector_allowlist_rejects_an_unknown_tool() {
     let mut env = dual_pin_base();
     env.push((
