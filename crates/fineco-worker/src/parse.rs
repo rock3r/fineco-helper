@@ -1067,27 +1067,28 @@ pub(crate) fn to_market_asset_details(
 /// Detects a pence/cents-quoted instrument (e.g. an LSE stock) whose real-time
 /// quote endpoint reports prices in the MINOR unit (GBX pence) while the
 /// stock-snapshot reports the same kind of value in the MAJOR unit (GBP pounds) —
-/// Fineco labels BOTH with the major currency ("GBP"), so the only reliable signal
-/// is the values relative to the 52-week range. Returns the factor that brings the
-/// quote into the major unit (`0.01`), or `1.0` when there is no split or it cannot
-/// be determined.
+/// Fineco labels both with the major currency ("GBP"). Returns the factor that
+/// brings the quote into the major unit (`0.01`), or `1.0` otherwise.
 ///
-/// Built on a sound invariant rather than tuned margins: a SAME-unit quote can
-/// never sit above its own 52-week high (the high tracks recent prices), whereas a
-/// pence quote sits ~100x above the major-unit range. So we scale only when both
-/// `last > high` (the quote exceeds its own 52-week high, so it cannot be a
-/// same-unit price — this rejects a stock legitimately near the top of a wide
-/// range, even one up many-fold from its low) AND `last >= low * 50` (the quote is
-/// at least ~50x the 52-week low, i.e. the ~100x split magnitude — this rejects a
-/// small stale-high overshoot only marginally above the high, which is not a unit
-/// split). This is robust to deep drawdowns (a pence quote near a distressed low is
-/// still ~100x its low) and to fresh highs, while EUR/USD instruments — whose quote
-/// sits inside their range — are never touched. With only the high available, fall
-/// back to a clear 10x-high gap (an unambiguous split, not an overshoot).
+/// The minor/major split only exists for currencies whose venues quote in a minor
+/// unit (×100 the major), so we GATE on the currency first ([`quotes_in_minor_unit`]).
+/// That excludes every same-unit instrument in another currency — e.g. a USD stock
+/// breaking out above a wide 52-week range — so they can never be rescaled. Within
+/// a pence-quoting currency we then apply a sound invariant: a same-unit price can
+/// never sit above its own 52-week high (the high tracks recent prices), whereas the
+/// minor-unit quote sits ~100x above the major-unit range — so `last > high` means
+/// the quote is in the minor unit and must be scaled down. This holds for normal,
+/// deep-drawdown, and fresh-high names alike (the only miss is a name below ~1% of
+/// its high, where the inflated quote no longer clears the major-unit high — a
+/// vanishing edge that simply leaves the value unchanged).
 fn quote_to_major_unit_scale(
     quote: Option<&RawInstrumentSnapshot>,
     stock: Option<&StockSnapshotResponse>,
+    currency: Option<&str>,
 ) -> f64 {
+    if !quotes_in_minor_unit(currency) {
+        return 1.0;
+    }
     let Some(last) = quote.and_then(|q| q.last).filter(|value| *value > 0.0) else {
         return 1.0;
     };
@@ -1097,14 +1098,18 @@ fn quote_to_major_unit_scale(
     else {
         return 1.0;
     };
-    let low = stock
-        .and_then(|s| s.range_52w_low)
-        .filter(|value| *value > 0.0);
-    let is_minor_unit_split = match low {
-        Some(low) => last > high && last >= low * 50.0,
-        None => last > high * 10.0,
-    };
-    if is_minor_unit_split { 0.01 } else { 1.0 }
+    if last > high { 0.01 } else { 1.0 }
+}
+
+/// Currencies whose venues quote equities in a minor unit (×100 the major) while
+/// Fineco reports the stock-snapshot range in the major unit and labels both with
+/// the MAJOR code. GBP (LSE, quoted in GBX pence) is the confirmed case; the list
+/// can be extended with evidence for other minor-unit markets.
+fn quotes_in_minor_unit(currency: Option<&str>) -> bool {
+    currency.is_some_and(|code| {
+        let code = code.trim();
+        code.eq_ignore_ascii_case("GBP") || code.eq_ignore_ascii_case("GBX")
+    })
 }
 
 pub(crate) fn to_stock_asset_details(
@@ -1133,7 +1138,11 @@ pub(crate) fn to_stock_asset_details(
     // minor unit while the rest of the response is in the major unit; bring the
     // quote into the major unit so the response is internally consistent and
     // matches the instrument currency. 1.0 for everything else.
-    let price_scale = quote_to_major_unit_scale(snapshot_item, inputs.stock_snapshot.as_ref());
+    let price_scale = quote_to_major_unit_scale(
+        snapshot_item,
+        inputs.stock_snapshot.as_ref(),
+        candidate.currency.as_deref(),
+    );
     let mut warnings = Vec::new();
     let (name, name_source_ref) = static_item
         .and_then(|item| item.description.clone())
@@ -3665,11 +3674,11 @@ mod tests {
     }
 
     #[test]
-    fn stock_details_do_not_normalize_a_quote_within_a_wide_range() {
-        // False-positive guard: a stock trading near the top of a very wide 52-week
-        // range (e.g. up many-fold from its low) is NOT a unit split — its quote
-        // does not exceed its own 52-week high, so it must not be rescaled. (A naive
-        // last/low ratio would wrongly flag it.) USD here, last 55 within [1, 60].
+    fn stock_details_do_not_normalize_a_non_pence_currency_above_its_range() {
+        // False-positive guard: a USD stock breaking out ABOVE a very wide 52-week
+        // range (last 60.50 above a [1, 60] range) is a fresh high, NOT a unit split.
+        // The currency gate keeps it untouched — only pence-quoting currencies (GBP)
+        // are ever rescaled, so this never reaches the value logic.
         let candidate = MarketSearchCandidate {
             currency: Some("USD".to_string()),
             ..lse_pence_candidate()
@@ -3688,7 +3697,7 @@ mod tests {
                 .expect("static"),
                 snapshot_response: Some(
                     serde_json::from_str(
-                        r#"{"GB00BH4HKS39.LSE":{"last":55.0,"prevClosePrice":54.0,"percVar":1.9,"volume":1000}}"#,
+                        r#"{"GB00BH4HKS39.LSE":{"last":60.5,"prevClosePrice":59.0,"percVar":2.5,"volume":1000}}"#,
                     )
                     .expect("snapshot"),
                 ),
@@ -3710,7 +3719,7 @@ mod tests {
                 .last
                 .expect("last")
                 .value
-                - 55.0)
+                - 60.5)
                 .abs()
                 < 1e-9
         );
