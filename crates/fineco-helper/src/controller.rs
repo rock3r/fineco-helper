@@ -992,7 +992,7 @@ mod tests {
         assert_eq!(MARKET_LOGIN_MIN_COOLDOWN_SECS, 60);
         assert_eq!(MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT, 1);
         assert_eq!(MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS, 1);
-        assert_eq!(MARKET_SESSION_REUSE_TTL_SECS, Some(120));
+        assert_eq!(MARKET_SESSION_REUSE_TTL_SECS, Some(180));
         assert_eq!(MARKET_CIRCUIT_CONSECUTIVE_FAILURES, 3);
         assert_eq!(MARKET_CIRCUIT_COOLDOWN_SECS, 600);
     }
@@ -1235,17 +1235,17 @@ mod tests {
     #[test]
     fn market_search_enforces_the_hourly_login_budget() {
         let ctrl = controller(FakeWorker::ok(), market_policy());
-        // Space reads 3 minutes apart — past the 120s reuse window, so each is a
+        // Space reads 4 minutes apart — past the 180s reuse window, so each is a
         // fresh login (a back-to-back basket would instead reuse one login).
         for i in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
-            let minute = i * 3;
+            let minute = i * 4;
             let now = format!("2026-06-14T10:{minute:02}:00Z");
             ctrl.handle_market_control(market_search_request(), &now)
                 .expect("within market login budget");
         }
 
         let err = ctrl
-            .handle_market_control(market_search_request(), "2026-06-14T10:36:00Z")
+            .handle_market_control(market_search_request(), "2026-06-14T10:48:00Z")
             .expect_err("13th fresh login inside the rolling hour is denied");
         assert_eq!(err.code(), "market_rate_limited");
     }

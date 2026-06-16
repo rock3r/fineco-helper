@@ -40,10 +40,11 @@ headers, raw `Set-Cookie`, or session handles.
 
 **Cross-call session reuse (D-22).** The worker holds one `Zeroizing` market
 session and reuses it for a follow-up market read within
-`MARKET_SESSION_REUSE_TTL_SECS` (a fixed **120 s**, well under the few-minute
-server-side idle timeout; that timeout is server-enforced and not exposed in
-Fineco's frontend, so the window is a fixed policy value, not a cookie-derived
-one). The window resets on each successful read, so a basket of back-to-back
+`MARKET_SESSION_REUSE_TTL_SECS` (a fixed **180 s**, under the only hard floor — the
+frontend's 5-min idle logout, which the server session outlives — and well short of
+any plausible server-side idle timeout; that timeout is server-enforced and not
+exposed in Fineco's frontend, so the window is a fixed policy value, not a
+cookie-derived one, tunable from the `reused_session_401_recovered` telemetry). The window resets on each successful read, so a basket of back-to-back
 instrument reads rides **one** login instead of a login per read (which would also
 look like a login storm). The held cookie is zeroized on TTL expiry, a
 reused-session 401, replacement, **any refresh login** (which evicts the market

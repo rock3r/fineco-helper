@@ -45,6 +45,13 @@ Environment=FINECO_QUERY_SOCKET_MODE=0660
 Environment=FINECO_REFRESH_SOCKET=/run/fineco-helper-refresh/refresh-control.sock
 Environment=FINECO_REFRESH_SOCKET_MODE=0660
 Environment=FINECO_LIVE_SOCKET=/run/fineco-worker/fineco-live.sock
+# Authenticated market reads (D-22): the controller binds this market-control
+# socket and the gateway connects to it. Optional and explicit-only — uncomment
+# ONLY when enabling on-demand authenticated Fineco market reads (and grant
+# market.authenticated.read in policy.json). Served by the same controller block
+# as refresh-control, so it needs the two sockets above. Set the SAME path on the
+# gateway unit. See docs/DEPLOYMENT.md "Enabling authenticated market tools".
+# Environment=FINECO_MARKET_CONTROL_SOCKET=/run/fineco-helper-refresh/market-control.sock
 Environment=FINECO_POLICY_PATH=/etc/fineco/policy.json
 
 ExecStart=/usr/local/bin/fineco-helper store-server

@@ -212,7 +212,10 @@ impl GatewayConfig {
 /// - unset → the default allowlist (every tool except the default blocked tools
 ///   — see [`fineco_gateway::DEFAULT_CONNECTOR_TOOLS`]);
 /// - `*` / `all` → `None` (connectors get the full tool set — explicit opt-out);
-/// - a comma-separated list → exactly those tools.
+/// - a `+`-prefixed comma-separated list → the default set PLUS those tools
+///   (deduplicated) — the fail-safe way to widen the surface (e.g. enabling the
+///   authenticated market tools) without re-listing every default tool;
+/// - any other comma-separated list → exactly those tools.
 ///
 /// Every listed name must be a real tool (fail closed on a typo).
 fn resolve_connector_allowlist(
@@ -239,6 +242,24 @@ fn resolve_connector_allowlist(
             .collect(),
         // Explicit opt-out: connectors get every tool (the pre-scoping behaviour).
         Some("*" | "all") => return Ok(None),
+        // `+`-prefixed: the default set plus the listed tools (deduplicated), so
+        // widening the surface keeps every fail-safe default.
+        Some(list) if list.starts_with('+') => {
+            let mut names: Vec<String> = fineco_gateway::DEFAULT_CONNECTOR_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+            for name in list[1..]
+                .split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            {
+                if !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_string());
+                }
+            }
+            names
+        }
         Some(list) => list
             .split(',')
             .map(|name| name.trim().to_string())
