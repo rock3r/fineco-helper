@@ -180,7 +180,12 @@ Product (`crates/`):
   from `instruments/static/search` + `instruments/snapshot`, plus `computed`-sourced
   fixed-income analytics (Macaulay/modified duration, convexity, DV01) derived from
   that data with no external source; no new endpoint; other resolved asset types
-  remain search-only), status-only
+  remain search-only. The analytics are an **indicative** portfolio-risk figure, not
+  a settlement-exact pricer: they discount at Fineco's gross YTM, measure maturity
+  ACT/365, place the first coupon from the accrued interest then space the rest on an
+  idealized period grid, and are emitted only for plain fixed-coupon and zero-coupon
+  bonds whose reconstructed price matches Fineco's within 3% (else a
+  `bond_analytics_unavailable` warning, no figure)), status-only
   `MarketSessionStatus` / `MarketSearchLiveResult` /
   `MarketAssetDetailsLiveResult`,
   and `market.authenticated.read` (audit data class `authenticated_market`) cover
