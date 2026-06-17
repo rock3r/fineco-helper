@@ -57,6 +57,13 @@ The LXC carries no toolchain; build locally and ship the binary. From a checkout
 
     deploy/build/build.sh        # → deploy/build/dist/fineco-helper
 
+The build needs Docker/buildx. The crypto backend (aws-lc-rs, used for both TLS
+and JWT verification) compiles a C library with CMake — `deploy/build/Dockerfile`
+installs `cmake`/`perl` into the build stage, so a host running `build.sh` needs
+nothing beyond Docker. For an ad-hoc local `cargo build` (outside the build
+image) you need `cmake` + a C toolchain on the host (e.g. `apt install cmake
+build-essential`, or `brew install cmake` on macOS).
+
 ### 2. Create the LXC
 
 An **unprivileged Debian 12** container with **nesting on** (required so the

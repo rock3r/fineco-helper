@@ -9,6 +9,13 @@
 # selects linux/amd64. Re-pin deliberately (with `docker buildx imagetools
 # inspect rust:1.96-slim-bookworm`) when bumping the Rust toolchain.
 FROM rust:1.96-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS build
+# aws-lc-sys (the aws-lc-rs crypto backend used for TLS + JWT verification)
+# builds its C library with CMake. The Rust base image already ships a C
+# compiler (gcc) — it linked `ring` before — but not `cmake` or `perl`, both of
+# which the aws-lc-sys build needs. Install them before the build.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake perl \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin fineco-helper

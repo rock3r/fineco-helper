@@ -11,10 +11,12 @@ workspace = true
 
 [dependencies]
 fineco-core = { path = "../fineco-core" }
+fineco-tls = { path = "../fineco-tls" }
 # Credential-free outbound HTTP for market reads (same TLS stack as the worker:
-# ureq + rustls). gzip handles compressed enrichment pages; json parses the ETF
-# list. Redirects are disabled at the client.
-ureq = { version = "3.3", default-features = false, features = ["rustls", "gzip", "json"] }
+# ureq + rustls, aws-lc-rs backend via `fineco_tls::tls_config()`). gzip handles
+# compressed enrichment pages; json parses the ETF list. Redirects disabled at
+# the client. `rustls-no-provider`, not `rustls` (which force-pins ring).
+ureq = { version = "3.3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip", "json"] }
 # Parse-not-execute: fetched HTML/JS is parsed as data via serde_json, never run.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

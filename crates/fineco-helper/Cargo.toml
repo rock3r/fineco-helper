@@ -42,7 +42,7 @@ http-body-util = "0.1"
 # The Access-middleware test drives the gateway router over loopback: it signs
 # tokens with the gateway's offline RSA test key + JWKS fixtures (jsonwebtoken,
 # serde_json) and POSTs with httptiny.
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 serde_json = "1"
 httptiny = { path = "../../e2e/httptiny" }
 # The live-refresh e2e drives the REAL FinecoWorker over fineco-live.sock through
