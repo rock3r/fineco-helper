@@ -1633,20 +1633,24 @@ pub(crate) fn to_bond_asset_details(
             &mut warnings,
         ));
     }
-    // The snapshot feeds both the quote section and the bond section's
-    // price/yield, so flag a missing provider timestamp whenever it is consumed by
-    // either — not only when the quote section is returned.
-    let snapshot_consumed = default_or_requested_bond(params, MarketDetailsSection::Quote)
-        || default_or_requested_bond(params, MarketDetailsSection::Bond);
-    if snapshot_consumed
-        && let Some(item) = snapshot_item
+    // Flag a missing provider timestamp only when a RETURNED section actually
+    // carries untimestamped snapshot values: the quote section surfaces price
+    // fields (`quote_has_values`), while the bond section additionally surfaces
+    // yields (`bond_snapshot_has_values`). This avoids warning on, e.g., a
+    // quote-only request whose snapshot has only yield fields (not returned there).
+    if let Some(item) = snapshot_item
         && item.last_traded_datetime.is_none()
-        && bond_snapshot_has_values(item)
     {
-        warnings.push(warning(
-            "missing_provider_timestamp",
-            "Fineco bond price/yield fields did not include a provider timestamp.",
-        ));
+        let quote_untimestamped = default_or_requested_bond(params, MarketDetailsSection::Quote)
+            && quote_has_values(item);
+        let bond_untimestamped = default_or_requested_bond(params, MarketDetailsSection::Bond)
+            && bond_snapshot_has_values(item);
+        if quote_untimestamped || bond_untimestamped {
+            warnings.push(warning(
+                "missing_provider_timestamp",
+                "Fineco bond price/yield fields did not include a provider timestamp.",
+            ));
+        }
     }
 
     for (section, message) in [
@@ -4969,6 +4973,35 @@ mod tests {
         assert!(result.sections.bond.is_some());
         assert!(
             result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "missing_provider_timestamp")
+        );
+    }
+
+    #[test]
+    fn bond_details_quote_only_does_not_warn_for_yield_only_snapshot() {
+        let candidate = bond_candidate();
+        // Quote-only request: the quote section surfaces no yields, so a snapshot
+        // with only yield fields and no timestamp must NOT trigger the missing-
+        // timestamp warning (there are no untimestamped quote values to flag).
+        let snapshot: SnapshotResponse =
+            serde_json::from_str(r#"{"IT0009999991.MOT":{"yeldNet":2.5,"yeldGross":3.0}}"#)
+                .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Quote])),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert!(result.sections.bond.is_none());
+        assert!(
+            !result
                 .warnings
                 .iter()
                 .any(|warning| warning.code == "missing_provider_timestamp")
