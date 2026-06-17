@@ -174,17 +174,52 @@ fn inner_text(mut rest: &str) -> String {
         let tail = &rest[lt..];
         let Some(gt) = tail.find('>') else { break };
         let tag = &tail[..=gt];
+        // Replace the tag with a space so text either side of it (e.g. a `<br>`)
+        // never glues into one token; `sanitize_text` collapses the runs.
+        out.push(' ');
         if tag.starts_with("</") {
             if depth == 0 {
                 break;
             }
             depth -= 1;
-        } else if !tag.ends_with("/>") {
+        } else if !tag.ends_with("/>") && !is_void_tag(tag) {
+            // A non-self-closing, non-void element opens a nested level. Void
+            // elements (`<br>`, `<img>`, …) have no closing tag, so counting them
+            // as nested would consume the cell's own `</td>` as their close and
+            // bleed later rows into the value.
             depth += 1;
         }
         rest = &tail[gt + 1..];
     }
     out
+}
+
+/// Whether `tag` (e.g. `"<br>"`, `"<img src=…>"`) is an HTML void element — one
+/// with no closing tag. Such tags must not open a nesting level in [`inner_text`].
+fn is_void_tag(tag: &str) -> bool {
+    let name = tag
+        .trim_start_matches('<')
+        .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 /// Parse a leading percentage like "0.29% p.a." or "8.22%" into a bare f64.
@@ -334,6 +369,27 @@ mod tests {
         let report = build_etf_report(&html, HOST, "2026-06-17T09:00:00Z", None).expect("parse");
         assert_eq!(report.distribution_policy.as_deref(), Some("Accumulating"));
         assert_eq!(report.distribution_frequency, None);
+    }
+
+    #[test]
+    fn void_tags_in_a_cell_do_not_bleed_into_the_value() {
+        // A `<br>` (void, no closing tag) inside a value cell must not be counted as
+        // a nested level — otherwise the cell's own `</td>` is consumed and the next
+        // row's text bleeds into the value.
+        let html = "<html><body>\
+            <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
+            <td data-testid=\"tl_etf-basics_value_domicile-country\">Ireland<br>(Dublin)</td>\
+            <td data-testid=\"tl_etf-basics_value_fund-provider\">Acme</td>\
+            </body></html>";
+        let report = build_etf_report(html, HOST, "t", None).expect("parse");
+        // The br is stripped; both lines of the SAME cell are kept, collapsed.
+        assert_eq!(report.domicile.as_deref(), Some("Ireland (Dublin)"));
+        // The next cell did NOT bleed into domicile, and parses on its own.
+        assert_eq!(report.fund_provider.as_deref(), Some("Acme"));
+        assert!(
+            !report.domicile.as_deref().unwrap().contains("Acme"),
+            "next cell bled into the value"
+        );
     }
 
     #[test]

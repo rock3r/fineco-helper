@@ -300,7 +300,12 @@ impl MarketClient {
         validate_etf_fetch_target(&url, &config.allowlist)?;
 
         let html = self.get_text(&url)?;
-        build_etf_report(&html, &url, now_iso, normalized_expected_isin.as_deref())
+        // The URL is keyed by `isin`, so the page header MUST echo it. Verify
+        // against the caller's `expected_isin` when given, else against the lookup
+        // ISIN itself — a header mismatch is then a hard error (the section is
+        // dropped) rather than wrong-ETF data published with only a warning.
+        let verify_isin = normalized_expected_isin.as_deref().unwrap_or(isin.as_str());
+        build_etf_report(&html, &url, now_iso, Some(verify_isin))
     }
 
     /// Fetch and parse the public zero-commission ETF list. `now_iso` stamps

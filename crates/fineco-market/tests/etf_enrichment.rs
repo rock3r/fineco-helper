@@ -98,3 +98,28 @@ fn malformed_isin_is_rejected_before_any_fetch() {
         .expect_err("malformed ISIN must error");
     assert_eq!(err.code(), "invalid_request");
 }
+
+#[test]
+fn page_isin_mismatch_is_rejected_even_without_expected_isin() {
+    // The URL is keyed by the lookup ISIN, so a page whose header echoes a DIFFERENT
+    // ISIN must be rejected even when the caller passed no expected_isin — otherwise
+    // wrong-ETF data could be attached. The server returns a profile for a different
+    // ISIN than requested.
+    let profile = spawn(move |req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/en/etf-profile.html" {
+            // A valid-format ISIN, but a DIFFERENT fund than the one requested.
+            httptiny::Response::html(200, synthetic_profile("IE00B5BMR087"))
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let client = MarketClient::list_only(UNUSED_LIST_URL).with_etf_enrichment(
+        &profile,
+        EnrichmentHostAllowlist::from_allowed_hosts(["127.0.0.1"]),
+    );
+    let err = client
+        .fetch_etf_enrichment("IE00B8GKDB10", None, NOW)
+        .expect_err("page ISIN mismatch must be rejected without expected_isin");
+    assert_eq!(err.code(), "invalid_request");
+}
