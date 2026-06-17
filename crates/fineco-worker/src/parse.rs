@@ -1874,8 +1874,14 @@ fn bond_section(
         if let Some(value) = bond_yes_no(item.bond_subordinate.as_deref()) {
             bond.subordinated = Some(bool_field(value, "static.search", captured_at));
         }
-        if let Some(bailin) = item.bailin {
-            bond.bail_in = Some(bool_field(bailin != 0, "static.search", captured_at));
+        // Fail closed: only the known 0/1 bail-in codes map to a boolean; an
+        // unexpected sentinel (e.g. 2) is omitted rather than assumed `true`.
+        if let Some(value) = match item.bailin {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        } {
+            bond.bail_in = Some(bool_field(value, "static.search", captured_at));
         }
         if let Some(value) = bond_yes_no(item.flag_priips.as_deref()) {
             bond.priips = Some(bool_field(value, "static.search", captured_at));
@@ -4899,5 +4905,35 @@ mod tests {
         assert_eq!(bond_yes_no(Some("maybe")), None);
         assert_eq!(bond_yes_no(Some("")), None);
         assert_eq!(bond_yes_no(None), None);
+    }
+
+    #[test]
+    fn bond_bailin_fails_closed_on_unknown_code() {
+        let candidate = bond_candidate();
+        // An unexpected bail-in sentinel (2) must omit the field, not assume `true`.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Bond","currencyCd":"EUR","instrTyp":"BND","bailin":2}}"#,
+        )
+        .expect("static");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert!(
+            result
+                .sections
+                .bond
+                .as_ref()
+                .expect("bond section")
+                .bail_in
+                .is_none()
+        );
     }
 }

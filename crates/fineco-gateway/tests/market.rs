@@ -747,6 +747,7 @@ async fn asset_details_rejects_over_limit_sections_before_stripping_external_enr
                 MarketDetailsSection::ExternalEnrichment,
                 MarketDetailsSection::ExternalEnrichment,
                 MarketDetailsSection::ExternalEnrichment,
+                MarketDetailsSection::ExternalEnrichment,
             ]),
         }))
         .await
@@ -779,6 +780,7 @@ async fn asset_details_authorizes_before_validating_external_enrichment_sections
             identifier: "BIT/TIP".to_string(),
             expected_isin: Some("IT0003153621".to_string()),
             sections: Some(vec![
+                MarketDetailsSection::ExternalEnrichment,
                 MarketDetailsSection::ExternalEnrichment,
                 MarketDetailsSection::ExternalEnrichment,
                 MarketDetailsSection::ExternalEnrichment,

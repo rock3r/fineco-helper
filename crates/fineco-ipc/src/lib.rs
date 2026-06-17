@@ -75,8 +75,10 @@ pub const MAX_SEARCH_GROUPS: usize = 8;
 /// Max characters in a public market-details identifier (`<venue>/<symbol>`).
 pub const MAX_IDENTIFIER_CHARS: usize = 64;
 
-/// Max number of explicit sections a market-details request may ask for.
-pub const MAX_SECTIONS: usize = 12;
+/// Max number of explicit sections a market-details request may ask for. Must be
+/// at least the number of v0-supported sections so a client can request the full
+/// advertised set in one call (13 since the `bond` section was added).
+pub const MAX_SECTIONS: usize = 13;
 
 /// Max ETF holdings returned in a details response.
 pub const MAX_HOLDINGS: usize = 25;
@@ -908,7 +910,7 @@ impl MarketDetailsParams {
             && sections.len() > MAX_SECTIONS
         {
             return Err(SafeError::invalid_request(
-                "sections must contain at most 12 entries.",
+                "sections must contain at most 13 entries.",
             ));
         }
         if let Some(sections) = &self.sections

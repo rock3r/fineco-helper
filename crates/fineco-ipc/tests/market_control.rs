@@ -295,11 +295,20 @@ fn market_details_request_is_strict_and_authenticated() {
         }
     }
 
-    // At-limit sections (12, all v0-supported) are accepted.
+    // At-limit sections (13, the full v0-supported set including `bond`) are accepted.
     MarketControlRequest::from_json(
-        r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["identity","listing","quote","profile","etf","stock","holdings","exposures","returns","risk","ratios","external_enrichment"]}}"#,
+        r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["identity","listing","quote","profile","etf","stock","bond","holdings","exposures","returns","risk","ratios","external_enrichment"]}}"#,
     )
-    .expect("twelve v0-supported sections at the max count are accepted");
+    .expect("thirteen v0-supported sections at the max count are accepted");
+
+    // One over the cap (14 entries, here a duplicate) is rejected on count alone.
+    assert!(
+        MarketControlRequest::from_json(
+            r#"{"command":"market_get_asset_details","params":{"identifier":"AFF/VHYL","sections":["identity","listing","quote","profile","etf","stock","bond","holdings","exposures","returns","risk","ratios","external_enrichment","bond"]}}"#,
+        )
+        .is_err(),
+        "more than 13 sections must be rejected on count"
+    );
 
     for bad in [
         r#"{"command":"market_get_asset_details","params":{"identifier":"VHYL"}}"#,
