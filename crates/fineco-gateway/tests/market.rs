@@ -537,7 +537,8 @@ fn synthetic_etf_profile(isin: &str) -> String {
         "<html><body>\
          <span data-testid=\"etf-profile-header_isin-value\">{isin}</span>\
          <td data-testid=\"tl_etf-basics_value_ter\">0.29% p.a.</td>\
-         <td data-testid=\"tl_etf-basics_value_fund-size_indicator\"> <span>EUR 8,622</span> m</td>\
+         <div data-testid=\"etf-profile-header_fund-size-value-wrapper\"> <span>EUR 8,622</span> m <span data-testid=\"etf-profile-header_fund-size-indicator\"></span></div>\
+         <tr data-testid=\"etf-basics_row_fund-size\"><td class=\"vallabel\">Fund size</td><td><div>EUR 8,622 m <span data-testid=\"tl_etf-basics_value_fund-size_indicator\"></span></div></td></tr>\
          <td data-testid=\"tl_etf-basics_value_domicile-country\">Ireland</td>\
          <td data-testid=\"tl_etf-basics_value_distribution-policy\">Distributing</td>\
          <td data-testid=\"tl_etf-basics_value_replication\">Physical (Optimized sampling)</td>\
