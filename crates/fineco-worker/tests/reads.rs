@@ -722,6 +722,32 @@ fn bond_details_resolve_and_normalize_via_worker() {
     assert!(sources.contains(&"snapshot"));
 }
 
+#[test]
+fn bond_details_resolve_by_venue_and_isin() {
+    // The owner-approved bond identifier is `<venue>/<ISIN>`; the caller will not
+    // know Fineco's opaque short ticker, so resolution must accept the ISIN.
+    let base = spawn_mock_fineco();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "MOT/IT0005560948".to_string(),
+                expected_isin: None,
+                sections: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("a bond must resolve by venue + ISIN");
+    let result = live.result;
+
+    assert_eq!(result.asset.identifier, "MOT/IT0005560948");
+    assert_eq!(
+        result.asset.asset_type.value,
+        fineco_ipc::MarketAssetType::Bond
+    );
+    assert_eq!(result.asset.isin.expect("isin").value, "IT0005560948");
+    assert!(result.sections.bond.is_some());
+}
+
 /// A mock that counts login POSTs (so a test can prove how many fresh logins a
 /// sequence of reads triggered), delegating everything else to the real mock.
 fn spawn_login_counting_mock(logins: Arc<AtomicUsize>) -> String {

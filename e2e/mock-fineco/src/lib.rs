@@ -150,6 +150,11 @@ pub fn route(req: &Request) -> Response {
             if req.path.contains("term=T56094") {
                 return private(req, GLOBAL_SEARCH_T56094);
             }
+            // The same synthetic bond is also discoverable by its ISIN, so a
+            // `<venue>/<ISIN>` identifier resolves it.
+            if req.path.contains("term=IT0005560948") {
+                return private(req, GLOBAL_SEARCH_T56094);
+            }
             if req.path.contains("term=SYNTHCFD") {
                 return private(req, GLOBAL_SEARCH_CFD);
             }
