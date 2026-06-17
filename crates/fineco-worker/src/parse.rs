@@ -1624,15 +1624,6 @@ pub(crate) fn to_bond_asset_details(
     }
     if default_or_requested_bond(params, MarketDetailsSection::Quote) {
         sections.quote = snapshot_item.map(|item| bond_quote_section(item, captured_at));
-        if let Some(item) = snapshot_item
-            && item.last_traded_datetime.is_none()
-            && quote_has_values(item)
-        {
-            warnings.push(warning(
-                "missing_provider_timestamp",
-                "Fineco bond quote fields did not include a provider timestamp.",
-            ));
-        }
     }
     if default_or_requested_bond(params, MarketDetailsSection::Bond) {
         sections.bond = Some(bond_section(
@@ -1640,6 +1631,21 @@ pub(crate) fn to_bond_asset_details(
             snapshot_item,
             captured_at,
             &mut warnings,
+        ));
+    }
+    // The snapshot feeds both the quote section and the bond section's
+    // price/yield, so flag a missing provider timestamp whenever it is consumed by
+    // either — not only when the quote section is returned.
+    let snapshot_consumed = default_or_requested_bond(params, MarketDetailsSection::Quote)
+        || default_or_requested_bond(params, MarketDetailsSection::Bond);
+    if snapshot_consumed
+        && let Some(item) = snapshot_item
+        && item.last_traded_datetime.is_none()
+        && bond_snapshot_has_values(item)
+    {
+        warnings.push(warning(
+            "missing_provider_timestamp",
+            "Fineco bond price/yield fields did not include a provider timestamp.",
         ));
     }
 
@@ -1704,6 +1710,13 @@ pub(crate) fn to_bond_asset_details(
     })
 }
 
+/// Whether a bond snapshot carries any value the bond/quote sections surface —
+/// the shared quote fields plus net/gross yield. Used to decide whether a missing
+/// provider timestamp is worth warning about.
+fn bond_snapshot_has_values(item: &RawInstrumentSnapshot) -> bool {
+    quote_has_values(item) || item.yeld_net.is_some() || item.yeld_gross.is_some()
+}
+
 fn bond_quote_section(item: &RawInstrumentSnapshot, captured_at: &str) -> MarketQuoteSection {
     // Bonds are quoted as a clean percentage of par (e.g. 102.909), so unlike the
     // stock path there is no minor-unit (pence/cents) scaling to apply.
@@ -1736,51 +1749,55 @@ fn bond_section(
         let per_period = item.bond_coupon_rate;
         bond.coupon_rate_per_period =
             number_field(per_period, "percent", "static.search", None, captured_at);
-        match item
+        if let Some((label, payments_per_year)) = item
             .bond_frequency
             .as_deref()
             .and_then(bond_coupon_frequency)
         {
-            Some((label, payments_per_year)) => {
+            bond.coupon_frequency = Some(text_field(
+                label.to_string(),
+                "static.search",
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            ));
+            bond.coupon_payments_per_year = number_field(
+                Some(payments_per_year),
+                "count",
+                "static.search",
+                None,
+                captured_at,
+            );
+            // C-1: Fineco reports the per-PAYMENT rate; annual nominal is rate
+            // times payments per year.
+            bond.coupon_rate = number_field(
+                per_period.map(|rate| rate * payments_per_year),
+                "percent",
+                "static.search",
+                None,
+                captured_at,
+            );
+        } else {
+            // Frequency absent or unrecognized.
+            if let Some(raw) = sanitized_non_empty(item.bond_frequency.clone()) {
                 bond.coupon_frequency = Some(text_field(
-                    label.to_string(),
+                    raw,
                     "static.search",
                     captured_at,
-                    fineco_ipc::MarketConfidence::High,
+                    fineco_ipc::MarketConfidence::Medium,
                 ));
-                bond.coupon_payments_per_year = number_field(
-                    Some(payments_per_year),
-                    "count",
-                    "static.search",
-                    None,
-                    captured_at,
-                );
-                // C-1: Fineco reports the per-PAYMENT rate; annual nominal is rate
-                // times payments per year.
-                bond.coupon_rate = number_field(
-                    per_period.map(|rate| rate * payments_per_year),
-                    "percent",
-                    "static.search",
-                    None,
-                    captured_at,
-                );
             }
-            None => {
-                if let Some(raw) = sanitized_non_empty(item.bond_frequency.clone()) {
-                    bond.coupon_frequency = Some(text_field(
-                        raw,
-                        "static.search",
-                        captured_at,
-                        fineco_ipc::MarketConfidence::Medium,
-                    ));
-                }
-                if per_period.is_some() {
-                    warnings.push(warning(
-                        "bond_coupon_frequency_unknown",
-                        "Fineco reported an unrecognized coupon frequency; the annual \
-                         coupon rate could not be derived from the per-payment rate.",
-                    ));
-                }
+            if per_period.is_some_and(|rate| rate == 0.0) {
+                // A zero coupon is a known annual fact (0%) regardless of payment
+                // frequency (a zero-coupon bond has no coupon schedule), so surface
+                // it directly rather than warning that the annual rate is underivable.
+                bond.coupon_rate =
+                    number_field(Some(0.0), "percent", "static.search", None, captured_at);
+            } else if per_period.is_some() {
+                warnings.push(warning(
+                    "bond_coupon_frequency_unknown",
+                    "Fineco reported an unrecognized coupon frequency; the annual \
+                     coupon rate could not be derived from the per-payment rate.",
+                ));
             }
         }
         if let Some(typ) = sanitized_non_empty(item.bond_coupon_typ.clone()) {
@@ -4891,6 +4908,70 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.code == "bond_coupon_frequency_unknown")
+        );
+    }
+
+    #[test]
+    fn bond_details_zero_coupon_has_known_annual_rate_without_frequency() {
+        let candidate = bond_candidate();
+        // A zero-coupon bond carries no coupon schedule (no/blank frequency); the
+        // annual coupon is still a known 0%, with no "frequency unknown" warning.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Zero","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":0.0,"bondCouponTyp":"ZERO COUPON","bondExpiryDate":"01/04/2035"}}"#,
+        )
+        .expect("static");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        approx(bond.coupon_rate.as_ref().expect("coupon").value, 0.0);
+        assert_eq!(
+            bond.coupon_type.as_ref().expect("type").value,
+            "zero_coupon"
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_coupon_frequency_unknown")
+        );
+    }
+
+    #[test]
+    fn bond_details_warn_missing_timestamp_for_bond_only_request() {
+        let candidate = bond_candidate();
+        // Bond section only (no quote). The snapshot still feeds clean price + YTM;
+        // a snapshot with values but no provider timestamp must still warn.
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":101.0,"yeldNet":2.5,"yeldGross":3.0}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert!(result.sections.quote.is_none());
+        assert!(result.sections.bond.is_some());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "missing_provider_timestamp")
         );
     }
 
