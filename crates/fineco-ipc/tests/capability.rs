@@ -103,11 +103,9 @@ fn unknown_fields_and_zero_version_are_rejected() {
 
 #[test]
 fn every_command_maps_to_its_capability() {
-    use fineco_ipc::{
-        HistoryParams, MarketEnrichmentParams, MarketEtfsParams, PositionHistoryParams,
-    };
+    use fineco_ipc::{HistoryParams, MarketEtfsParams, PositionHistoryParams};
 
-    let cases: [(Request, Capability); 12] = [
+    let cases: [(Request, Capability); 11] = [
         (
             Request::PortfolioGetFreshness,
             Capability::PortfolioShareableRead,
@@ -147,13 +145,6 @@ fn every_command_maps_to_its_capability() {
         (Request::TaxGetLatestMinusByYear, Capability::TaxCachedRead),
         (
             Request::MarketGetZeroCommissionEtfs(MarketEtfsParams { query: None }),
-            Capability::MarketRead,
-        ),
-        (
-            Request::MarketGetStockEnrichment(MarketEnrichmentParams {
-                identifier: "LSE/VHYL".to_string(),
-                expected_isin: None,
-            }),
             Capability::MarketRead,
         ),
     ];

@@ -240,7 +240,7 @@ Product (`crates/`):
   never cookies or session handles. The gateway has **no** `fineco-live` client —
   it cannot reach the live socket by any path. Depends on `fineco-core` + `fineco-ipc` + `fineco-market` +
   `rmcp` — **never** `fineco-store`/`fineco-worker`/`fineco-live` (enforced
-  structurally; see below). Tool surface: 18 read-only tools (cached reads,
+  structurally; see below). Tool surface: 17 read-only tools (cached reads,
   credential-free market reads, authenticated Fineco market reads, and the 3
   live-refresh tools); `portfolio_get_charts` stays **deferred** (no
   chart/time-series data is captured yet — the store holds
@@ -253,15 +253,17 @@ Product (`crates/`):
   `null` outside strings), and parses it with `serde_json` — there is no
   `eval`/`Function`/JS engine. Source URLs are restricted to a **SHA-256-pinned
   host** (`EnrichmentHostAllowlist` — hashes only, no plaintext host in source)
-  with a fixed stock-page route. The MCP tool accepts a venue-qualified ticker
-  (`<venue>/<symbol>` or `<venue>:<symbol>`), normalizes it to
+  with a fixed stock-page route. The enrichment client accepts a venue-qualified
+  ticker (`<venue>/<symbol>` or `<venue>:<symbol>`), normalizes it to
   `/stock/<venue>/<symbol>`, and optionally verifies the parsed page against an
   `expected_isin` (plain ISIN or ISIN plus suffix). The server builds exactly one
   URL from a configured base + the validated identifier (no client `url`, no
   lookup/guessing, no `validateSource`/`userAgent`).
-  The same report shape is also embedded in `market_get_asset_details` when a
-  stock details request includes `external_enrichment`; Fineco identity remains
-  canonical and cross-source identifier disagreements are bounded warnings.
+  There is no standalone enrichment MCP tool: this report is reachable only
+  embedded in `market_get_asset_details` when a stock details request includes
+  `external_enrichment`. The identifier is the Fineco-resolved venue-qualified
+  identifier; Fineco identity remains canonical and cross-source identifier
+  disagreements are bounded warnings.
   Output is bounded/sanitized. `MarketClient` uses `ureq`+rustls (redirects
   disabled). Depends on `fineco-core` (+ `serde`/`serde_json`/`sha2`).
 

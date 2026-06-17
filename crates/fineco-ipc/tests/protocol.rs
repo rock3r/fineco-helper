@@ -30,22 +30,6 @@ fn all_parameterless_cached_commands_parse() {
 }
 
 #[test]
-fn enrichment_command_carries_its_params() {
-    let request = Request::from_json(
-        r#"{"command": "market_get_stock_enrichment",
-            "params": {"identifier": "LSE/VHYL", "expected_isin": "IE00B8GKDB10.AF"}}"#,
-    )
-    .expect("parse");
-    match request {
-        Request::MarketGetStockEnrichment(params) => {
-            assert_eq!(params.identifier, "LSE/VHYL");
-            assert_eq!(params.expected_isin.as_deref(), Some("IE00B8GKDB10.AF"));
-        }
-        other => panic!("unexpected variant: {other:?}"),
-    }
-}
-
-#[test]
 fn etfs_query_is_optional() {
     // The `query` filter is optional within `params` (empty params = no filter).
     assert!(
@@ -96,8 +80,8 @@ fn smuggled_envelope_field_is_rejected() {
 fn unknown_param_field_is_rejected() {
     // deny_unknown_fields on the params struct rejects a forbidden option.
     let err = Request::from_json(
-        r#"{"command": "market_get_stock_enrichment",
-            "params": {"identifier": "x", "userAgent": "bot", "validateSource": false}}"#,
+        r#"{"command": "market_get_zero_commission_etfs",
+            "params": {"query": "x", "userAgent": "bot", "validateSource": false}}"#,
     )
     .expect_err("unknown params");
     assert_eq!(err.code(), "invalid_request");
@@ -112,9 +96,9 @@ fn non_object_request_is_rejected() {
 
 #[test]
 fn overlong_identifier_is_rejected() {
-    let identifier = "a".repeat(257);
+    let instr_id = "a".repeat(257);
     let json = format!(
-        r#"{{"command": "market_get_stock_enrichment", "params": {{"identifier": "{identifier}"}}}}"#
+        r#"{{"command": "portfolio_get_position_history", "params": {{"instr_id": "{instr_id}", "venue_system": "V"}}}}"#
     );
     let err = Request::from_json(&json).expect_err("too long");
     assert_eq!(err.code(), "invalid_request");
@@ -123,7 +107,7 @@ fn overlong_identifier_is_rejected() {
 #[test]
 fn empty_identifier_is_rejected() {
     let err = Request::from_json(
-        r#"{"command": "market_get_stock_enrichment", "params": {"identifier": ""}}"#,
+        r#"{"command": "portfolio_get_position_history", "params": {"instr_id": "", "venue_system": "V"}}"#,
     )
     .expect_err("empty identifier");
     assert_eq!(err.code(), "invalid_request");

@@ -284,6 +284,16 @@ fn default_connector_allowlist_is_valid_and_excludes_default_blocked_tools() {
             "{blocked} must be blocked for connectors by default"
         );
     }
+    // The standalone stock-enrichment tool was removed: enrichment is reachable only
+    // through the authenticated `market_get_asset_details` `external_enrichment` section.
+    assert!(
+        !all.contains("market_get_stock_enrichment"),
+        "the standalone market_get_stock_enrichment tool must no longer be registered"
+    );
+    assert!(
+        !DEFAULT_CONNECTOR_TOOLS.contains(&"market_get_stock_enrichment"),
+        "the standalone market_get_stock_enrichment tool must not be in the connector allowlist"
+    );
     // The default is exactly "every tool minus those blocked tools". This assertion is a
     // forcing function: adding a tool breaks it until you DECIDE — list the new tool
     // in DEFAULT_CONNECTOR_TOOLS, or add it to the blocked set (and update this

@@ -19,13 +19,12 @@ use crate::access::AuthChannel;
 use fineco_ipc::{
     AllocationHistoryDto, Capability, Client, FreshnessReportDto, FullSnapshotDto, HistoryParams,
     MarketAssetDetailsResult, MarketControlClient, MarketControlOutcome, MarketControlRequest,
-    MarketDetailsParams, MarketDetailsSection, MarketEnrichmentParams, MarketEtfsParams,
-    MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketIndicesParams,
-    MarketIndicesResult, MarketSearchParams, MarketSearchResult, MarketSource, MarketWarning,
-    OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams, Policy, PortfolioHistoryDto,
-    PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams, RefreshClient, RefreshOutcome,
-    RefreshRequest, Request, ResponseBody, SafeErrorDto, ShareableReportDto,
-    TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
+    MarketDetailsParams, MarketDetailsSection, MarketEtfsParams, MarketExternalCompanyOverview,
+    MarketExternalEnrichmentSection, MarketIndicesParams, MarketIndicesResult, MarketSearchParams,
+    MarketSearchResult, MarketSource, MarketWarning, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams,
+    Policy, PortfolioHistoryDto, PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams,
+    RefreshClient, RefreshOutcome, RefreshRequest, Request, ResponseBody, SafeErrorDto,
+    ShareableReportDto, TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
 };
 use fineco_market::{EnrichmentReport, MarketClient, ZeroCommissionEtfs};
 use rmcp::handler::server::wrapper::Parameters;
@@ -61,7 +60,6 @@ pub const DEFAULT_CONNECTOR_TOOLS: &[&str] = &[
     "tax_get_latest_carry_forward",
     "tax_get_latest_minus_by_year",
     "market_get_zero_commission_etfs",
-    "market_get_stock_enrichment",
     "private_portfolio_refresh_live_sensitive",
     "private_orders_refresh_live_sensitive",
     "private_tax_refresh_live_sensitive",
@@ -373,50 +371,6 @@ impl Gateway {
                 }
                 let count = etfs.instruments.len();
                 Ok((Json(etfs), Some(count)))
-            },
-        )
-        .await
-    }
-
-    #[tool(
-        name = "market_get_stock_enrichment",
-        description = "Get enrichment for a public market instrument. `identifier` must be a venue-qualified ticker in `<venue>/<symbol>` or `<venue>:<symbol>` form, for example `LSE/VHYL` or `LSE:VHYL`; bare tickers and ISIN-only identifiers are rejected. `expected_isin`, when provided, verifies the parsed page and may be a plain ISIN or an ISIN with a suffix; suffixes are ignored for comparison. The server builds exactly one allowlisted URL and parses the page as data."
-    )]
-    pub async fn market_get_stock_enrichment(
-        &self,
-        Parameters(params): Parameters<MarketEnrichmentParams>,
-    ) -> Result<Json<EnrichmentReport>, ErrorData> {
-        let this = self.clone();
-        self.audited_market(
-            "market_get_stock_enrichment",
-            "external_enrichment",
-            async move {
-                this.authorize(Capability::MarketRead)
-                    .map_err(|err| ("policy_denied".to_string(), err))?;
-                Request::MarketGetStockEnrichment(params.clone())
-                    .validate()
-                    .map_err(audit_market_error)?;
-                let market = this
-                    .market()
-                    .map_err(|err| ("market_unconfigured".to_string(), err))?;
-                let now = fineco_core::now_iso8601_utc();
-                let report = tokio::task::spawn_blocking(move || {
-                    market.fetch_enrichment(
-                        &params.identifier,
-                        params.expected_isin.as_deref(),
-                        &now,
-                    )
-                })
-                .await
-                .map_err(|_| {
-                    (
-                        "worker_unavailable".to_string(),
-                        ErrorData::internal_error("market request failed", None),
-                    )
-                })?
-                .map_err(audit_market_error)?;
-                // One instrument report — count is 1 (never the values).
-                Ok((Json(report), Some(1)))
             },
         )
         .await

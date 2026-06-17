@@ -127,7 +127,6 @@ pub enum Request {
     PortfolioGetAllocationHistory,
     PortfolioGetPositionHistory(PositionHistoryParams),
     MarketGetZeroCommissionEtfs(MarketEtfsParams),
-    MarketGetStockEnrichment(MarketEnrichmentParams),
 }
 
 impl Request {
@@ -151,9 +150,7 @@ impl Request {
             Request::TaxGetLatestCarryForward | Request::TaxGetLatestMinusByYear => {
                 Capability::TaxCachedRead
             }
-            Request::MarketGetZeroCommissionEtfs(_) | Request::MarketGetStockEnrichment(_) => {
-                Capability::MarketRead
-            }
+            Request::MarketGetZeroCommissionEtfs(_) => Capability::MarketRead,
         }
     }
 
@@ -173,7 +170,6 @@ impl Request {
             Request::PortfolioGetAllocationHistory => "portfolio_get_allocation_history",
             Request::PortfolioGetPositionHistory(_) => "portfolio_get_position_history",
             Request::MarketGetZeroCommissionEtfs(_) => "market_get_zero_commission_etfs",
-            Request::MarketGetStockEnrichment(_) => "market_get_stock_enrichment",
         }
     }
 }
@@ -200,16 +196,6 @@ pub struct PositionHistoryParams {
 pub struct MarketEtfsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-}
-
-/// Parameters for `market_get_stock_enrichment`: a venue-qualified ticker (the
-/// server builds the allowlisted URL) and an optional expected ISIN to verify.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MarketEnrichmentParams {
-    pub identifier: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_isin: Option<String>,
 }
 
 /// Fineco asset groups normalized from the authenticated instrument search.
@@ -1076,15 +1062,6 @@ impl Request {
             Request::MarketGetZeroCommissionEtfs(p) => {
                 if let Some(query) = &p.query {
                     check(query)?;
-                }
-            }
-            Request::MarketGetStockEnrichment(p) => {
-                check(&p.identifier)?;
-                if p.identifier.is_empty() {
-                    return Err(SafeError::invalid_request("identifier must not be empty."));
-                }
-                if let Some(expected_isin) = &p.expected_isin {
-                    check(expected_isin)?;
                 }
             }
             Request::PortfolioGetHistory(p) => {

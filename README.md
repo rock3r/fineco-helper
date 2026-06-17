@@ -45,8 +45,10 @@ Cached reads (instant, from the local store):
 
 Public/credential-free market reads (not from the store):
 
-- `market_get_zero_commission_etfs` (the public ETF list),
-  `market_get_stock_enrichment` (third-party stock enrichment, parse-not-execute)
+- `market_get_zero_commission_etfs` (the public ETF list). Third-party stock
+  enrichment (parse-not-execute) is no longer a standalone tool; it is reachable
+  only through the authenticated `market_get_asset_details` `external_enrichment`
+  section described below.
 
 Authenticated Fineco market reads (controller-mediated live Fineco login):
 
