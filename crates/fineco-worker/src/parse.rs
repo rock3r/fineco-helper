@@ -2157,11 +2157,16 @@ fn apply_bond_analytics(
         return;
     };
     let annual_yield = ytm / 100.0;
+    // A bond is treated as zero-coupon only when Fineco explicitly says so, or when
+    // no coupon type is reported at all and the rate is 0. A present, non-zero-coupon
+    // type with a momentary 0 rate (e.g. a step-up/deferred coupon) must NOT be
+    // inferred as a zero — it falls through to the fail-closed branch below.
     let is_zero_coupon = coupon_type == Some("zero_coupon")
-        || bond
-            .coupon_rate
-            .as_ref()
-            .is_some_and(|field| field.value == 0.0);
+        || (coupon_type.is_none()
+            && bond
+                .coupon_rate
+                .as_ref()
+                .is_some_and(|field| field.value == 0.0));
 
     let result = if is_zero_coupon {
         // Single redemption at maturity, annual compounding (n = 1).
@@ -5471,6 +5476,40 @@ mod tests {
         .expect("static");
         let snapshot: SnapshotResponse = serde_json::from_str(
             r#"{"IT0009999991.MOT":{"last":100.0,"yeldGross":3.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.modified_duration.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_analytics_unavailable")
+        );
+    }
+
+    #[test]
+    fn bond_details_skip_analytics_for_zero_rate_with_nonzero_coupon_type() {
+        let candidate = bond_candidate();
+        // A deferred/step-up coupon whose CURRENT rate is 0 but whose type is not
+        // "zero coupon": it must NOT be mistaken for a zero-coupon bond.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Deferred","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":0.0,"bondCouponTyp":"STEP-UP","bondFrequency":"SEM.","bondExpiryDate":"17/06/2031","bondAccruedInterestRate":0.0}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":90.0,"yeldGross":2.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
         )
         .expect("snapshot");
         let result = to_bond_asset_details(
