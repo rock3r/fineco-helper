@@ -2117,25 +2117,32 @@ fn apply_bond_analytics(
 ) {
     let coupon_type = bond.coupon_type.as_ref().map(|field| field.value.as_str());
 
-    let (Some(ytm), Some(maturity), Some(dirty)) = (
+    let (Some(ytm), Some(maturity)) = (
         bond.yield_to_maturity_gross
             .as_ref()
             .map(|field| field.value),
         bond.maturity_date.as_ref().map(|field| field.value.clone()),
-        bond.dirty_price
-            .as_ref()
-            .or(bond.clean_price.as_ref())
-            .map(|field| field.value)
-            // A non-positive price is nonsensical and would invert the consistency
-            // guard / produce a negative DV01, so treat it as missing.
-            .filter(|&price| price.is_finite() && price > 0.0),
     ) else {
         warnings.push(warning(
             "bond_analytics_unavailable",
-            "Bond duration analytics need a gross yield, a maturity date, and a positive price.",
+            "Bond duration analytics need a gross yield and a maturity date.",
         ));
         return;
     };
+    // A non-positive price is nonsensical (it would invert the consistency guard and
+    // produce a negative DV01), so treat it as missing. The full (dirty) price is the
+    // one the DCF reproduces; the clean price is a fallback only for zero coupons,
+    // where accrued interest is ~0 so clean ≈ dirty.
+    let dirty_price = bond
+        .dirty_price
+        .as_ref()
+        .map(|field| field.value)
+        .filter(|&price| price.is_finite() && price > 0.0);
+    let clean_price = bond
+        .clean_price
+        .as_ref()
+        .map(|field| field.value)
+        .filter(|&price| price.is_finite() && price > 0.0);
     // Anchor the time-to-maturity and discounting on the SAME date as the price and
     // yield (the quote's provider `as_of`), so a stale quote does not mix a current
     // valuation date with stale price/yield inputs; fall back to the fetch time.
@@ -2168,10 +2175,31 @@ fn apply_bond_analytics(
                 .as_ref()
                 .is_some_and(|field| field.value == 0.0));
 
-    let result = if is_zero_coupon {
+    let (result, dirty) = if is_zero_coupon {
+        // Zero coupon: accrued ≈ 0, so the clean price is an acceptable dirty proxy.
+        let Some(dirty) = dirty_price.or(clean_price) else {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Zero-coupon analytics need a positive price.",
+            ));
+            return;
+        };
         // Single redemption at maturity, annual compounding (n = 1).
-        coupon_bond_analytics(0.0, annual_yield, 1.0, years_to_maturity, 1, dirty)
+        (
+            coupon_bond_analytics(0.0, annual_yield, 1.0, years_to_maturity, 1, dirty),
+            dirty,
+        )
     } else if coupon_type == Some("fixed") {
+        // A coupon-bearing bond between coupon dates is priced dirty by the DCF, so
+        // require the true dirty price (accrued present); the clean price alone would
+        // make the consistency guard and DV01 inconsistent.
+        let Some(dirty) = dirty_price else {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Fixed-coupon analytics need the dirty price (accrued interest); skipped until available.",
+            ));
+            return;
+        };
         let (Some(coupon_annual), Some(payments_per_year)) = (
             bond.coupon_rate.as_ref().map(|field| field.value),
             bond.coupon_payments_per_year
@@ -2223,12 +2251,15 @@ fn apply_bond_analytics(
             ));
             return;
         }
-        coupon_bond_analytics(
-            coupon_per_period,
-            periodic_yield,
-            payments_per_year,
-            periods_to_first,
-            remaining as u32 + 1,
+        (
+            coupon_bond_analytics(
+                coupon_per_period,
+                periodic_yield,
+                payments_per_year,
+                periods_to_first,
+                remaining as u32 + 1,
+                dirty,
+            ),
             dirty,
         )
     } else {
@@ -5490,6 +5521,44 @@ mod tests {
         .expect("bond details");
 
         let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.modified_duration.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_analytics_unavailable")
+        );
+    }
+
+    #[test]
+    fn bond_details_skip_fixed_analytics_without_dirty_price() {
+        let candidate = bond_candidate();
+        // A fixed-coupon bond with NO accrued interest reported: the dirty price can't
+        // be formed, so the coupon-bearing analytics (priced dirty by the DCF) must be
+        // skipped rather than fall back to the clean price.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Fixed","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":1.5,"bondCouponTyp":"FISSO","bondFrequency":"SEM.","bondExpiryDate":"17/06/2031","bondMaturityDate":"17/12/2026"}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":100.0,"yeldGross":3.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        // No accrued → no dirty price → no analytics, but the rest of the bond section
+        // is still populated.
+        assert!(bond.dirty_price.is_none());
         assert!(bond.modified_duration.is_none());
         assert!(
             result
