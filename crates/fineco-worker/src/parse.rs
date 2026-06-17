@@ -2011,7 +2011,8 @@ fn bool_field(value: bool, source_ref: &str, captured_at: &str) -> MarketField<b
 }
 
 /// Normalize a Fineco `DD/MM/YYYY` date string to ISO `YYYY-MM-DD`. Returns `None`
-/// for absent, empty, or unexpectedly shaped values rather than guessing.
+/// for absent, empty, mis-shaped, or impossible-calendar values (e.g. `00/00/0000`
+/// or `31/02/2026`) rather than emitting an invalid ISO-looking string.
 fn iso_date_from_european(value: Option<&str>) -> Option<String> {
     let value = value?.trim();
     let mut parts = value.split('/');
@@ -2021,13 +2022,29 @@ fn iso_date_from_european(value: Option<&str>) -> Option<String> {
     if parts.next().is_some() {
         return None;
     }
-    let well_formed = day.len() == 2
-        && month.len() == 2
-        && year.len() == 4
-        && [day, month, year]
-            .iter()
-            .all(|part| part.chars().all(|c| c.is_ascii_digit()));
-    well_formed.then(|| format!("{year}-{month}-{day}"))
+    if day.len() != 2 || month.len() != 2 || year.len() != 4 {
+        return None;
+    }
+    // Two-digit day/month and four-digit year, so these parse without overflow.
+    let day_num: u32 = day.parse().ok()?;
+    let month_num: u32 = month.parse().ok()?;
+    let year_num: u32 = year.parse().ok()?;
+    if year_num == 0 || !(1..=12).contains(&month_num) {
+        return None;
+    }
+    let leap = year_num.is_multiple_of(4)
+        && (!year_num.is_multiple_of(100) || year_num.is_multiple_of(400));
+    let days_in_month = match month_num {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day_num) {
+        return None;
+    }
+    Some(format!("{year}-{month}-{day}"))
 }
 
 /// Map a Fineco coupon-frequency code to a normalized label and the number of
@@ -5037,6 +5054,30 @@ mod tests {
         assert!(bond.bail_in.as_ref().expect("bail-in").value);
         // C-6: a malformed `DD/MM/YYYY` is dropped, not guessed.
         assert!(bond.maturity_date.is_none());
+    }
+
+    #[test]
+    fn iso_date_from_european_rejects_impossible_calendar_dates() {
+        // Valid dates normalize.
+        assert_eq!(
+            iso_date_from_european(Some("01/07/2034")).as_deref(),
+            Some("2034-07-01")
+        );
+        assert_eq!(
+            iso_date_from_european(Some("29/02/2024")).as_deref(),
+            Some("2024-02-29")
+        );
+        // Impossible / placeholder dates are omitted, not formatted into ISO.
+        assert_eq!(iso_date_from_european(Some("00/00/0000")), None);
+        assert_eq!(iso_date_from_european(Some("31/02/2026")), None); // Feb 31
+        assert_eq!(iso_date_from_european(Some("29/02/2025")), None); // not a leap year
+        assert_eq!(iso_date_from_european(Some("31/04/2030")), None); // Apr has 30
+        assert_eq!(iso_date_from_european(Some("00/07/2034")), None); // day 0
+        assert_eq!(iso_date_from_european(Some("01/13/2034")), None); // month 13
+        // Mis-shaped values remain rejected.
+        assert_eq!(iso_date_from_european(Some("1/7/2034")), None);
+        assert_eq!(iso_date_from_european(Some("01/07/34")), None);
+        assert_eq!(iso_date_from_european(None), None);
     }
 
     #[test]
