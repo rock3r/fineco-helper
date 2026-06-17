@@ -153,7 +153,11 @@ fn field(html: &str, testid: &str) -> Option<String> {
     let pos = html.find(&needle)?;
     let after = &html[pos + needle.len()..];
     let gt = after.find('>')?;
-    let cleaned = sanitize_text(&inner_text(&after[gt + 1..]));
+    // Decode HTML entities BEFORE sanitizing: `&amp;`/`&reg;` become their real
+    // characters and `&nbsp;` becomes a plain space (so numeric parsing works). The
+    // sanitize pass runs after, so anything an entity decodes to — including a
+    // control char from a hostile numeric entity — is still control-stripped.
+    let cleaned = sanitize_text(&decode_entities(&inner_text(&after[gt + 1..])));
     let trimmed = cleaned.trim();
     if trimmed.is_empty() || trimmed == "-" {
         None
@@ -192,6 +196,69 @@ fn inner_text(mut rest: &str) -> String {
         rest = &tail[gt + 1..];
     }
     out
+}
+
+/// Decode the HTML entities that appear in provider cells into their characters.
+/// Covers the standard five (`&amp; &lt; &gt; &quot; &apos;`), `&nbsp;` (→ a plain
+/// space, so numeric parsing works), a few common symbol entities, and numeric
+/// references (`&#NNN;` / `&#xHHH;`). Unrecognized entities are left literal rather
+/// than dropped, to avoid losing data. No external dependency — the set is bounded.
+fn decode_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        // Entities are short; only look for the ';' within a small window so a lone
+        // '&' in free text doesn't scan the whole string.
+        let window = after.len().min(12);
+        if let Some(semi) = after[..window].find(';')
+            && let Some(decoded) = decode_one_entity(&after[1..semi])
+        {
+            out.push_str(&decoded);
+            rest = &after[semi + 1..];
+            continue;
+        }
+        // Not a recognized entity: keep the '&' literal and move past it.
+        out.push('&');
+        rest = &after[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode the text between `&` and `;` (e.g. `"amp"`, `"#39"`, `"#x2014"`) into its
+/// string, or `None` if it is not a recognized entity.
+fn decode_one_entity(entity: &str) -> Option<String> {
+    let named = match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "reg" => Some('®'),
+        "trade" => Some('™'),
+        "copy" => Some('©'),
+        "deg" => Some('°'),
+        "mdash" => Some('—'),
+        "ndash" => Some('–'),
+        "hellip" => Some('…'),
+        _ => None,
+    };
+    if let Some(ch) = named {
+        return Some(ch.to_string());
+    }
+    // Numeric character reference: &#NNN; (decimal) or &#xHHH; (hex).
+    let num = entity.strip_prefix('#')?;
+    let code = match num.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => num.parse::<u32>().ok()?,
+    };
+    char::from_u32(code).map(|ch| ch.to_string())
 }
 
 /// Whether `tag` (e.g. `"<br>"`, `"<img src=…>"`) is an HTML void element — one
@@ -369,6 +436,42 @@ mod tests {
         let report = build_etf_report(&html, HOST, "2026-06-17T09:00:00Z", None).expect("parse");
         assert_eq!(report.distribution_policy.as_deref(), Some("Accumulating"));
         assert_eq!(report.distribution_frequency, None);
+    }
+
+    #[test]
+    fn html_entities_in_cells_are_decoded() {
+        // Provider cells use HTML entities: `&amp;`/`&reg;` in names, and `&nbsp;`
+        // around numbers. Without decoding, the index name keeps the literal markup
+        // and the `&nbsp;` breaks numeric parsing (silently dropping TER/fund size).
+        let html = "<html><body>\
+            <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
+            <td data-testid=\"tl_etf-basics_value_index-name\">S&amp;P 500&reg;</td>\
+            <td data-testid=\"tl_etf-basics_value_ter\">0.29&nbsp;% p.a.</td>\
+            <td data-testid=\"tl_etf-basics_value_fund-size_indicator\">EUR&nbsp;8,622 m</td>\
+            <td data-testid=\"tl_etf-basics_value_fund-provider\">Acme &#39;Funds&#39;</td>\
+            </body></html>";
+        let report = build_etf_report(html, HOST, "t", None).expect("parse");
+        assert_eq!(report.index_name.as_deref(), Some("S&P 500®"));
+        assert_eq!(report.ter_percent, Some(0.29));
+        assert_eq!(report.fund_provider.as_deref(), Some("Acme 'Funds'"));
+        let size = report.fund_size.expect("fund size");
+        assert_eq!(size.value, 8622.0);
+    }
+
+    #[test]
+    fn numeric_entity_decoding_to_a_control_char_is_then_stripped() {
+        // A hostile numeric entity that decodes to a control byte (e.g. ESC) must
+        // not survive: decode happens before sanitize, which strips control chars.
+        let html = "<html><body>\
+            <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
+            <td data-testid=\"tl_etf-basics_value_domicile-country\">Ire&#27;land</td>\
+            </body></html>";
+        let report = build_etf_report(html, HOST, "t", None).expect("parse");
+        let domicile = report.domicile.expect("domicile");
+        assert!(
+            !domicile.chars().any(char::is_control),
+            "decoded control char survived: {domicile:?}"
+        );
     }
 
     #[test]
