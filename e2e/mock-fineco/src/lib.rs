@@ -29,16 +29,22 @@ const ZERO_COMMISSION_ETFS: &str = include_str!("../../fixtures/fineco/zero-comm
 const GLOBAL_SEARCH_VHYL: &str = include_str!("../../fixtures/fineco/global-search-vhyl.json");
 /// Canned synthetic stock global-search fixture.
 const GLOBAL_SEARCH_AAPL: &str = include_str!("../../fixtures/fineco/global-search-aapl.json");
-/// Canned synthetic unsupported bond global-search fixture.
+/// Canned synthetic bond global-search fixture (now a supported details type).
 const GLOBAL_SEARCH_T56094: &str = include_str!("../../fixtures/fineco/global-search-t56094.json");
+/// Canned synthetic CFD global-search fixture (an unsupported details type).
+const GLOBAL_SEARCH_CFD: &str = include_str!("../../fixtures/fineco/global-search-cfd.json");
 /// Canned synthetic static instrument fixture.
 const STATIC_SEARCH_VHYL: &str = include_str!("../../fixtures/fineco/static-search-vhyl.json");
 /// Canned synthetic stock static instrument fixture.
 const STATIC_SEARCH_AAPL: &str = include_str!("../../fixtures/fineco/static-search-aapl.json");
+/// Canned synthetic bond static instrument fixture.
+const STATIC_SEARCH_BOND: &str = include_str!("../../fixtures/fineco/static-search-bond.json");
 /// Canned synthetic instrument snapshot fixture.
 const SNAPSHOT_VHYL: &str = include_str!("../../fixtures/fineco/snapshot-vhyl.json");
 /// Canned synthetic stock instrument quote fixture.
 const SNAPSHOT_AAPL: &str = include_str!("../../fixtures/fineco/snapshot-aapl.json");
+/// Canned synthetic bond instrument quote/yield fixture.
+const SNAPSHOT_BOND: &str = include_str!("../../fixtures/fineco/snapshot-bond.json");
 /// Canned synthetic ETF snapshot fixture.
 const ETF_SNAPSHOT_VHYL: &str = include_str!("../../fixtures/fineco/etf-snapshot-vhyl.json");
 /// Canned synthetic ETF composition fixture.
@@ -144,6 +150,9 @@ pub fn route(req: &Request) -> Response {
             if req.path.contains("term=T56094") {
                 return private(req, GLOBAL_SEARCH_T56094);
             }
+            if req.path.contains("term=SYNTHCFD") {
+                return private(req, GLOBAL_SEARCH_CFD);
+            }
             Response::json(400, "{\"error\":\"unexpected search term\"}")
         }
         ("POST", "/v1/private/tol/instruments/static/search") => {
@@ -153,6 +162,9 @@ pub fn route(req: &Request) -> Response {
             if req.body.contains("US0378331005.NASDAQ") {
                 return private(req, STATIC_SEARCH_AAPL);
             }
+            if req.body.contains("IT0005560948.MOT") {
+                return private(req, STATIC_SEARCH_BOND);
+            }
             Response::json(400, "{\"error\":\"unexpected static search body\"}")
         }
         ("GET", "/v1/private/tol/instruments/snapshot") => {
@@ -161,6 +173,9 @@ pub fn route(req: &Request) -> Response {
             }
             if req.path.contains("instruments=US0378331005.NASDAQ") {
                 return private(req, SNAPSHOT_AAPL);
+            }
+            if req.path.contains("instruments=IT0005560948.MOT") {
+                return private(req, SNAPSHOT_BOND);
             }
             Response::json(400, "{\"error\":\"unexpected snapshot instrument\"}")
         }

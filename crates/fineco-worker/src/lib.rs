@@ -764,7 +764,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
             let candidate = candidate.ok_or_else(SafeError::market_not_found)?;
             if !matches!(
                 candidate.asset_type,
-                MarketAssetType::Etf | MarketAssetType::Stock
+                MarketAssetType::Etf | MarketAssetType::Stock | MarketAssetType::Bond
             ) {
                 return Err(SafeError::market_unsupported_asset_type_for(
                     candidate.asset_type.as_str(),
@@ -789,7 +789,12 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                 &candidate,
                 params.expected_isin.as_deref(),
             )?;
+            // The bond section's yield-to-maturity comes from the quote snapshot, so
+            // fetch the snapshot when the bond section is wanted even if `quote` was
+            // not explicitly requested.
             let snapshot_response = if wants_default_or_section(params, MarketDetailsSection::Quote)
+                || (matches!(candidate.asset_type, MarketAssetType::Bond)
+                    && wants_default_or_section(params, MarketDetailsSection::Bond))
             {
                 let snapshot_url = format!(
                     "{}?instruments={}",
@@ -900,6 +905,15 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                         now_iso,
                     )?
                 }
+                MarketAssetType::Bond => parse::to_bond_asset_details(
+                    params,
+                    &candidate,
+                    parse::BondDetailsInputs {
+                        static_response,
+                        snapshot_response,
+                    },
+                    now_iso,
+                )?,
                 _ => {
                     return Err(SafeError::market_unsupported_asset_type_for(
                         candidate.asset_type.as_str(),
@@ -1089,6 +1103,23 @@ impl<'a> StaticSearchRequest<'a> {
                 "esgTaxonomy",
                 "topQuality",
                 "categoryId",
+                // Bond-only static fields; harmless (returned null) for stocks/ETFs.
+                "bondCouponRate",
+                "bondCouponTyp",
+                "bondFrequency",
+                "bondExpiryDate",
+                "bondMaturityDate",
+                "bondAccruedInterestRate",
+                "bondSubordinate",
+                "bondParValue",
+                "bondIssueDate",
+                "bondIssuePrice",
+                "minQty",
+                "rating",
+                "issuerRating",
+                "bailin",
+                "flagPriips",
+                "valueAtRisk",
             ],
             with_warnings: true,
         }

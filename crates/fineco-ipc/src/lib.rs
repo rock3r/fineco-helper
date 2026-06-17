@@ -362,6 +362,7 @@ pub enum MarketDetailsSection {
     Profile,
     Etf,
     Stock,
+    Bond,
     Holdings,
     Exposures,
     Returns,
@@ -641,6 +642,64 @@ pub struct MarketStockSection {
     pub recommendation_count: Option<MarketField<f64>>,
 }
 
+/// Normalized fixed-income facts for a bond, sourced from Fineco's static
+/// instrument record (`static.search`) plus its live quote/yield snapshot.
+///
+/// Coupon is reported three ways to make Fineco's per-payment semantics explicit:
+/// `coupon_rate` is the annual nominal rate, `coupon_rate_per_period` is the raw
+/// per-payment rate Fineco reports, and `coupon_payments_per_year` is the
+/// multiplier. `maturity_date` is the real redemption date; `next_coupon_date` is
+/// the upcoming coupon. `dirty_price` is computed (clean + accrued), not provider
+/// reported. Rating fields are Fineco-reported point-in-time labels with no agency,
+/// date, or outlook; an accompanying warning flags that.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketBondSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupon_rate: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupon_rate_per_period: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupon_payments_per_year: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupon_type: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupon_frequency: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maturity_date: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_coupon_date: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_date: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_price: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accrued_interest: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean_price: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_price: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_to_maturity_gross: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yield_to_maturity_net: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_rating: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subordinated: Option<MarketField<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_lot: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub par_value: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bail_in: Option<MarketField<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priips: Option<MarketField<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_at_risk: Option<MarketField<f64>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MarketRatio {
     pub group: MarketField<String>,
@@ -743,6 +802,8 @@ pub struct MarketAssetSections {
     pub etf: Option<MarketEtfSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stock: Option<MarketStockSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond: Option<MarketBondSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratios: Option<MarketRatiosSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1011,6 +1072,7 @@ fn market_details_section_supported_in_v0(section: MarketDetailsSection) -> bool
             | MarketDetailsSection::Profile
             | MarketDetailsSection::Etf
             | MarketDetailsSection::Stock
+            | MarketDetailsSection::Bond
             | MarketDetailsSection::Holdings
             | MarketDetailsSection::Exposures
             | MarketDetailsSection::Returns

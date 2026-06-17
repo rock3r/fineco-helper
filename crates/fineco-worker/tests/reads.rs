@@ -666,12 +666,14 @@ fn stock_details_skip_quote_snapshot_when_quote_section_is_not_requested() {
 
 #[test]
 fn unsupported_asset_details_stop_after_resolution() {
+    // A CFD resolves in search but has no details path; it must fail closed AFTER
+    // resolution (not be silently passed to a parser).
     let base = spawn_mock_fineco();
     let err = worker_for(&base)
         .fetch_market_asset_details(
             &MarketDetailsParams {
-                identifier: "MOT/T56094".to_string(),
-                expected_isin: Some("IT0005560948.MOT".to_string()),
+                identifier: "CFDC/SYNTHCFD".to_string(),
+                expected_isin: None,
                 sections: None,
             },
             "2026-06-14T09:30:00Z",
@@ -679,7 +681,45 @@ fn unsupported_asset_details_stop_after_resolution() {
         .expect_err("unsupported details should fail closed after search resolution");
 
     assert_eq!(err.code(), "market_unsupported_asset_type");
-    assert!(err.safe_message().contains("bond"));
+    assert!(err.safe_message().contains("cfd"));
+}
+
+#[test]
+fn bond_details_resolve_and_normalize_via_worker() {
+    let base = spawn_mock_fineco();
+    let live = worker_for(&base)
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "MOT/T56094".to_string(),
+                expected_isin: Some("IT0005560948".to_string()),
+                sections: None,
+            },
+            "2026-06-14T09:30:00Z",
+        )
+        .expect("bond details should resolve and normalize");
+    let result = live.result;
+
+    assert_eq!(result.asset.identifier, "MOT/T56094");
+    assert_eq!(
+        result.asset.asset_type.value,
+        fineco_ipc::MarketAssetType::Bond
+    );
+    let bond = result.sections.bond.expect("bond section");
+    // SEM. → 2 payments/year, so annual nominal = 2.0 × 2 = 4.0.
+    assert!((bond.coupon_rate.expect("coupon").value - 4.0).abs() < 1e-9);
+    assert_eq!(bond.maturity_date.expect("maturity").value, "2034-07-01");
+    assert!((bond.yield_to_maturity_gross.expect("ytm").value - 3.0).abs() < 1e-9);
+    // Dirty = clean (101.5) + accrued (1.5).
+    assert!((bond.dirty_price.expect("dirty").value - 103.0).abs() < 1e-9);
+    assert_eq!(bond.issuer_rating.expect("issuer rating").value, "BBB");
+
+    let sources: Vec<_> = result
+        .sources
+        .iter()
+        .map(|source| source.source_ref.as_str())
+        .collect();
+    assert!(sources.contains(&"static.search"));
+    assert!(sources.contains(&"snapshot"));
 }
 
 /// A mock that counts login POSTs (so a test can prove how many fresh logins a
