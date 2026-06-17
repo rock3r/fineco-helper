@@ -97,12 +97,17 @@ add_gateway_host FINECO_ACCESS_JWKS_URL "$ACCESS_ENV"
 # Optional leading whitespace after `=` is tolerated so this matches GatewayConfig's
 # trim (a `VAR= value` line is "present" in both; an all-whitespace value is unset).
 env_present() { grep -qE "^$1=[[:space:]]*[\"']?[^[:space:]\"']" "$ENRICHMENT_ENV" 2>/dev/null; }
+# A host-hash list counts as present only with at least one USABLE hash, matching
+# GatewayConfig::enrichment_pair, which splits on ',' and rejects an all-separator
+# list (e.g. `= , `) as having no host pin. Host hashes are hex, so require an
+# alphanumeric char somewhere in the value.
+env_has_hash() { grep -qE "^$1=.*[[:alnum:]]" "$ENRICHMENT_ENV" 2>/dev/null; }
 market_enabled=0
-if env_present FINECO_ENRICHMENT_BASE && env_present FINECO_ENRICHMENT_HOST_HASHES; then
+if env_present FINECO_ENRICHMENT_BASE && env_has_hash FINECO_ENRICHMENT_HOST_HASHES; then
     add_gateway_host FINECO_ENRICHMENT_BASE "$ENRICHMENT_ENV"
     market_enabled=1
 fi
-if env_present FINECO_ETF_ENRICHMENT_BASE && env_present FINECO_ETF_ENRICHMENT_HOST_HASHES; then
+if env_present FINECO_ETF_ENRICHMENT_BASE && env_has_hash FINECO_ETF_ENRICHMENT_HOST_HASHES; then
     add_gateway_host FINECO_ETF_ENRICHMENT_BASE "$ENRICHMENT_ENV"
     market_enabled=1
 fi
