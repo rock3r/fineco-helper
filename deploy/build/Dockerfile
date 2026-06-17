@@ -11,10 +11,12 @@
 FROM rust:1.96-slim-bookworm@sha256:b5f842fac1e3b4ff718a652a8e0173b62d9403ec826ef4998880b9347db30684 AS build
 # aws-lc-sys (the aws-lc-rs crypto backend used for TLS + JWT verification)
 # builds its C library with CMake. The Rust base image already ships a C
-# compiler (gcc) — it linked `ring` before — but not `cmake` or `perl`, both of
-# which the aws-lc-sys build needs. Install them before the build.
+# compiler (gcc) — it linked `ring` before — but not `cmake`, `perl`, or `g++`.
+# `cmake`/`perl` the aws-lc-sys build needs; `g++` is belt-and-suspenders for its
+# documented C/C++ toolchain requirement (the current non-FIPS build links with
+# gcc alone, but this future-proofs the canonical release build). Install before.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake perl \
+    && apt-get install -y --no-install-recommends cmake g++ perl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
