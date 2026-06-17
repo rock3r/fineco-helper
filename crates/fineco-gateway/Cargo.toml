@@ -17,6 +17,7 @@ workspace = true
 fineco-core = { path = "../fineco-core" }
 fineco-ipc = { path = "../fineco-ipc" }
 fineco-market = { path = "../fineco-market" }
+fineco-tls = { path = "../fineco-tls" }
 rmcp = { version = "1", default-features = false, features = [
     "server",
     "macros",
@@ -36,13 +37,15 @@ serde_json = "1"
 # gateway holds NO credentials, so this is not the credentialed path.
 http = "1"
 # Cloudflare Access JWT verification (issuer/audience/expiry/signature via the
-# team JWKS). Owner-approved 2026-06-04. Pinned to 9.x: it verifies via `ring`
-# (already in the tree via rustls/ureq) — no new crypto backend, audit-clean.
-# (jsonwebtoken 10 has no default crypto backend; `rust_crypto` pulls the `rsa`
-# crate with an open RUSTSEC advisory, and `aws_lc_rs` adds a second C crypto
-# library.) JWKS is fetched over the in-tree ureq (same rustls stack).
-jsonwebtoken = "9"
-ureq = { version = "3.3", default-features = false, features = ["rustls", "json"] }
+# team JWKS). 10.x for CVE-2026-25537 (GHSA-h395-gr6q-cpjc, claim type-confusion):
+# < 10.3.0 is vulnerable. 10.x has no default crypto backend — `rust_crypto`
+# pulls `rsa` (open RUSTSEC-2023-0071 Marvin advisory, no fix), so we use the
+# `aws_lc_rs` backend, the same one the workspace TLS stack now uses (see
+# fineco-tls). Build needs a C toolchain + cmake.
+jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+# JWKS fetch over ureq. `rustls-no-provider` (not `rustls`, which force-pins
+# ring); the aws-lc-rs provider comes from `fineco_tls::tls_config()`.
+ureq = { version = "3.3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "json"] }
 
 [dev-dependencies]
 # Integration tests stand up a real store-query worker behind the socket.

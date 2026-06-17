@@ -37,7 +37,11 @@ Cargo workspace (`Cargo.toml`, `resolver = "3"`, edition 2024, toolchain pinned
 to 1.96 via `rust-toolchain.toml`). The workspace is **zero-external-dependency** at its core;
 crates are added only as needed — `rusqlite` (bundled) +
 `hmac`/`sha2` in the store (M1/M3), and `ureq` (rustls) + `serde`/`serde_json`
-in the Fineco/market fetch paths (M3).
+in the Fineco/market fetch paths (M3). The workspace links **one** crypto
+backend — **aws-lc-rs** — for both TLS (rustls, via `fineco-tls`) and JWT
+verification (`jsonwebtoken`); `ring` is not compiled or linked (it lingers only
+as an inactive optional edge of `rustls-webpki` in `Cargo.lock`). Building
+therefore requires a C toolchain + `cmake` (aws-lc-sys).
 
 Product (`crates/`):
 
@@ -96,6 +100,15 @@ Product (`crates/`):
   ISO-8601-UTC→epoch parse), plus the shared provider-text sanitizer used by
   both external enrichment and authenticated Fineco market parsing. Everything
   depends *down* onto this; it depends on nothing.
+- **`crates/fineco-tls`** (M9) — a **leaf** crate owning the workspace's single
+  rustls crypto backend (**aws-lc-rs**). Exposes `crypto_provider()` and
+  `tls_config()`; every ureq agent that does HTTPS (the credentialed worker, the
+  market/enrichment fetcher, the gateway JWKS fetch) builds its agent with
+  `fineco_tls::tls_config()`. ureq is compiled `rustls-no-provider` (its `rustls`
+  feature force-pins `ring`), so an agent that omits this would *panic* on its
+  first HTTPS request — the helper makes the one backend unmissable. Depends only
+  on `ureq` + `rustls`. See [CONVENTIONS.md](CONVENTIONS.md) for the why
+  (jsonwebtoken 10.x dropped ring → unify on aws-lc-rs rather than ship two).
 - **`crates/fineco-store`** (M1) — the local SQLite history store
   (`rusqlite`, `bundled`). Owns the schema + migrations, typed snapshot capture,
   history queries, full/shareable report generation, `job_runs` recording + the
@@ -151,9 +164,10 @@ Product (`crates/`):
   session cookies are zeroized on drop** (`zeroize::Zeroizing`, owner-approved
   credentialed dep), and the agent **ignores proxy env vars** (`.proxy(None)`)
   so an env-injected proxy can't reroute the credentialed login. Uses
-  `ureq`+rustls. Depends on
+  `ureq`+rustls with the **aws-lc-rs** backend pinned via `fineco_tls::tls_config()`
+  (the credentialed TLS path). Depends on
   `fineco-core`, `fineco-ipc` (market-search types/trait), `fineco-store` (the
-  `New*`/`RawOrder` types), `fineco-refresh` (the fetcher traits). No
+  `New*`/`RawOrder` types), `fineco-refresh` (the fetcher traits), `fineco-tls`. No
   payloads/secrets logged; failures map to `SafeError`. Behind the live socket it
   is the server half of `fineco-live` (the binary's `private-worker` role).
 - **`crates/fineco-ipc`** (M4) — the **internal command protocol** + Unix-socket
@@ -179,8 +193,15 @@ Product (`crates/`):
   `MarketControlClient`, normalized `MarketSearchResult` /
   `MarketAssetDetailsResult` (typed detail sections for **stocks, ETFs, and
   bonds** — the bond section carries coupon/maturity/yield/accrued/rating/min-lot
-  from `instruments/static/search` + `instruments/snapshot`, no new endpoint; other
-  resolved asset types remain search-only), status-only
+  from `instruments/static/search` + `instruments/snapshot`, plus `computed`-sourced
+  fixed-income analytics (Macaulay/modified duration, convexity, DV01) derived from
+  that data with no external source; no new endpoint; other resolved asset types
+  remain search-only. The analytics are an **indicative** portfolio-risk figure, not
+  a settlement-exact pricer: they discount at Fineco's gross YTM, measure maturity
+  ACT/365, place the first coupon from the accrued interest then space the rest on an
+  idealized period grid, and are emitted only for plain fixed-coupon and zero-coupon
+  bonds whose reconstructed price matches Fineco's within 3% (else a
+  `bond_analytics_unavailable` warning, no figure)), status-only
   `MarketSessionStatus` / `MarketSearchLiveResult` /
   `MarketAssetDetailsLiveResult`,
   and `market.authenticated.read` (audit data class `authenticated_market`) cover
@@ -246,7 +267,10 @@ Product (`crates/`):
   never calls either enrichment host.
   Market-control audit logs include only status metadata (login/session booleans),
   never cookies or session handles. The gateway has **no** `fineco-live` client —
-  it cannot reach the live socket by any path. Depends on `fineco-core` + `fineco-ipc` + `fineco-market` +
+  it cannot reach the live socket by any path. Verifies Cloudflare Access JWTs
+  with `jsonwebtoken` (10.x, **aws-lc-rs** backend) and fetches the team JWKS over
+  `ureq` pinned to the same backend (`fineco_tls::tls_config()`). Depends on
+  `fineco-core` + `fineco-ipc` + `fineco-market` + `fineco-tls` +
   `rmcp` — **never** `fineco-store`/`fineco-worker`/`fineco-live` (enforced
   structurally; see below). Tool surface: 17 read-only tools (cached reads,
   credential-free market reads, authenticated Fineco market reads, and the 3
@@ -268,17 +292,18 @@ Product (`crates/`):
   the other. The stock enrichment client accepts a venue-qualified ticker
   (`<venue>/<symbol>` or `<venue>:<symbol>`), normalizes it to
   `/stock/<venue>/<symbol>`; ETF enrichment is **ISIN-keyed** (the server builds
-  `…/en/etf-profile.html?isin=<ISIN>` from a configured base + the validated ISIN).
-  Both optionally verify the parsed page against an `expected_isin`. The server
-  builds exactly one URL per fetch (no client `url`, no lookup/guessing, no
-  `validateSource`/`userAgent`).
+  `…/en/etf-profile.html?isin=<ISIN>` from a configured base + the validated ISIN,
+  always verifying the page header against that ISIN).
+  The server builds exactly one URL per fetch (no client `url`, no lookup/guessing,
+  no `validateSource`/`userAgent`).
   There is no standalone enrichment MCP tool: these reports are reachable only
   embedded in `market_get_asset_details` when a details request includes
   `external_enrichment` (stocks → `external_enrichment`; ETFs → the typed
   `etf_external_enrichment` section, numerics carrying units). Fineco identity
   remains canonical and cross-source identifier disagreements are bounded warnings.
-  Output is bounded/sanitized. `MarketClient` uses `ureq`+rustls (redirects
-  disabled). Depends on `fineco-core` (+ `serde`/`serde_json`/`sha2`).
+  Output is bounded/sanitized. `MarketClient` uses `ureq`+rustls with the
+  **aws-lc-rs** backend pinned via `fineco_tls::tls_config()` (redirects
+  disabled). Depends on `fineco-core` + `fineco-tls` (+ `serde`/`serde_json`/`sha2`).
 
 E2E harness (`e2e/`, test infrastructure only — never shipped, all `publish =
 false`):

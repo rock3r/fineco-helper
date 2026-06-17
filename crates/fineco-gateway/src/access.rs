@@ -238,6 +238,9 @@ pub fn fetch_jwks(jwks_url: &str) -> Result<JwkSet, AccessError> {
         return Err(AccessError::Invalid);
     }
     let config = ureq::Agent::config_builder()
+        // Pin the crypto backend to aws-lc-rs (workspace-wide single backend;
+        // ureq is built `rustls-no-provider` so this MUST be set or HTTPS panics).
+        .tls_config(fineco_tls::tls_config())
         .http_status_as_error(false)
         .max_redirects(0)
         .max_redirects_will_error(false)

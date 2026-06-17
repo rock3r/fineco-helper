@@ -166,6 +166,9 @@ impl MarketClient {
         // fetch so a CDN/upstream that accepts the connection but stalls cannot pin
         // a gateway worker thread forever (mirrors the JWKS posture).
         let config = Agent::config_builder()
+            // Pin the crypto backend to aws-lc-rs (workspace-wide single backend;
+            // ureq is built `rustls-no-provider` so this MUST be set or HTTPS panics).
+            .tls_config(fineco_tls::tls_config())
             .http_status_as_error(false)
             .max_redirects(0)
             .max_redirects_will_error(false)

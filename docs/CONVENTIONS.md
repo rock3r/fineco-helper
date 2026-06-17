@@ -55,6 +55,24 @@ live in the plan and `AGENTS.md`; this doc covers *how we code to them*.
   the change that uses it, and prefer keeping the credentialed path's dependency
   set minimal.
 
+## Crypto backend (one, not two)
+
+- The workspace links **exactly one** rustls/JWT crypto backend: **aws-lc-rs**.
+  `ring` must not be compiled or linked. It survives only as an inactive optional
+  edge of `rustls-webpki` in `Cargo.lock` (cargo records optional deps even when
+  their feature is off) — `cargo tree -i ring` is empty.
+- Why aws-lc-rs and not ring: `jsonwebtoken` 10.x (required for CVE-2026-25537 /
+  GHSA-h395-gr6q-cpjc) dropped ring support; its `rust_crypto` backend pulls
+  `rsa` (unpatched RUSTSEC-2023-0071). Rather than ship ring (TLS) + aws-lc-rs
+  (JWT) side by side, the workspace unified on aws-lc-rs (owner decision,
+  2026-06-17, superseding the 2026-06-04 9.x/ring pin).
+- **Every ureq agent that does HTTPS builds with `fineco_tls::tls_config()`.**
+  ureq is compiled `rustls-no-provider` (its `rustls` feature force-pins ring),
+  so an agent that omits the provider **panics** on its first HTTPS request.
+  Never add an HTTPS-capable ureq agent without it; never enable ureq's `rustls`
+  feature (it would drag ring back in). `fineco-tls` is the single home for the
+  provider choice and its handshake test.
+
 ## Git
 
 - **No conventional-commit prefixes** (`feat:`/`fix:`/`docs:` …). Plain,

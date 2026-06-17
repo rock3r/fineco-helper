@@ -1692,10 +1692,12 @@ pub(crate) fn to_bond_asset_details(
         }
     }
 
-    let computed_dirty_price = sections
+    // Any `computed`-sourced bond field (dirty price or the derived analytics) means
+    // the `computed` source_ref must appear in the sources array.
+    let has_computed_bond_field = sections
         .bond
         .as_ref()
-        .is_some_and(|bond| bond.dirty_price.is_some());
+        .is_some_and(|bond| bond.dirty_price.is_some() || bond.modified_duration.is_some());
     Ok(MarketAssetDetailsResult {
         schema_version: 1,
         data_class: "authenticated_market".to_string(),
@@ -1705,7 +1707,7 @@ pub(crate) fn to_bond_asset_details(
         sources: bond_sources(
             captured_at,
             inputs.snapshot_response.is_some(),
-            computed_dirty_price,
+            has_computed_bond_field,
         ),
         warnings: warnings
             .into_iter()
@@ -1956,7 +1958,350 @@ fn bond_section(
         ));
     }
 
+    // Computed fixed-income analytics derived from the fields normalized above.
+    apply_bond_analytics(&mut bond, captured_at, warnings);
+
     bond
+}
+
+/// The result of the bond cashflow analytics, all in years / years² except the
+/// present value (per 100 face) and DV01 (price change per basis point). The
+/// reported years-to-maturity is the date difference, computed by the caller, not
+/// the idealized schedule grid, so it is not returned here.
+struct BondAnalyticsResult {
+    macaulay_duration: f64,
+    modified_duration: f64,
+    convexity: f64,
+    dv01: f64,
+    present_value: f64,
+}
+
+/// Upper bound on the modeled coupon count, guarding against a malformed schedule
+/// producing a pathological loop (e.g. a 50-year monthly bond is 600 coupons).
+const MAX_BOND_COUPONS: u32 = 1200;
+
+/// Discounted-cashflow analytics for a fixed-coupon bond, expressed with a
+/// periodic yield. `coupon_per_period` and the redemption (100 face) are discounted
+/// at `(1 + periodic_yield)` per period; the first coupon is `periods_to_first`
+/// periods away (a fractional stub), then every period. A zero-coupon bond is the
+/// `coupon_per_period == 0`, `num_coupons == 1`, `payments_per_year == 1` case.
+///
+/// Returns `None` for degenerate inputs (no coupons, non-positive frequency,
+/// yield ≤ −100%, non-finite/negative stub, or a non-positive present value).
+fn coupon_bond_analytics(
+    coupon_per_period: f64,
+    periodic_yield: f64,
+    payments_per_year: f64,
+    periods_to_first: f64,
+    num_coupons: u32,
+    dirty_price: f64,
+) -> Option<BondAnalyticsResult> {
+    if num_coupons == 0
+        || num_coupons > MAX_BOND_COUPONS
+        || payments_per_year <= 0.0
+        || periodic_yield <= -1.0
+        || !periods_to_first.is_finite()
+        || periods_to_first < 0.0
+        || !dirty_price.is_finite()
+    {
+        return None;
+    }
+    let growth = 1.0 + periodic_yield;
+    let mut present_value = 0.0;
+    let mut macaulay_numerator = 0.0;
+    let mut convexity_numerator = 0.0;
+    for k in 0..num_coupons {
+        // Period index = payments_per_year × time-in-years of this cashflow.
+        let period_index = periods_to_first + f64::from(k);
+        let discount_factor = growth.powf(-period_index);
+        let mut cashflow = coupon_per_period;
+        if k == num_coupons - 1 {
+            cashflow += 100.0;
+        }
+        let discounted = cashflow * discount_factor;
+        present_value += discounted;
+        macaulay_numerator += (period_index / payments_per_year) * discounted;
+        convexity_numerator += discounted * period_index * (period_index + 1.0);
+    }
+    if !present_value.is_finite() || present_value <= 0.0 {
+        return None;
+    }
+    let macaulay_duration = macaulay_numerator / present_value;
+    let modified_duration = macaulay_duration / growth;
+    let convexity = convexity_numerator
+        / (present_value * growth * growth * payments_per_year * payments_per_year);
+    let dv01 = modified_duration * dirty_price / 10_000.0;
+    Some(BondAnalyticsResult {
+        macaulay_duration,
+        modified_duration,
+        convexity,
+        dv01,
+        present_value,
+    })
+}
+
+/// Days since the civil epoch 1970-01-01 (Howard Hinnant's algorithm), valid for
+/// any proleptic-Gregorian date. Pure integer math, no calendar dependency.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Parse the leading `YYYY-MM-DD` of an ISO date or datetime into `(y, m, d)`.
+fn iso_ymd(value: &str) -> Option<(i64, i64, i64)> {
+    let date = value.get(0..10)?;
+    let mut parts = date.split('-');
+    let year = parts.next()?.parse().ok()?;
+    let month = parts.next()?.parse().ok()?;
+    let day = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+/// ACT/365 year fraction between two ISO date(time) strings (`to - from`).
+fn year_fraction(from: &str, to: &str) -> Option<f64> {
+    let (fy, fm, fd) = iso_ymd(from)?;
+    let (ty, tm, td) = iso_ymd(to)?;
+    let days = days_from_civil(ty, tm, td) - days_from_civil(fy, fm, fd);
+    Some(days as f64 / 365.0)
+}
+
+/// Periods until the next coupon, implied by Fineco's accrued interest: the elapsed
+/// fraction of the current coupon period is `accrued / coupon_per_period`, so the
+/// stub to the next coupon is `1 − elapsed` periods. `None` if the accrued value is
+/// absent or out of the `[0, 1)` range (then the caller falls back to dates).
+fn accrued_periods_to_first(accrued: Option<f64>, coupon_per_period: f64) -> Option<f64> {
+    let accrued = accrued?;
+    if coupon_per_period <= 0.0 {
+        return None;
+    }
+    let elapsed = accrued / coupon_per_period;
+    (0.0..1.0).contains(&elapsed).then_some(1.0 - elapsed)
+}
+
+/// A `computed`-sourced numeric field, Medium confidence; `None` for non-finite
+/// values so a NaN/inf never reaches the response.
+fn computed_number_field(
+    value: f64,
+    unit: &str,
+    as_of: Option<&str>,
+    captured_at: &str,
+) -> Option<MarketField<f64>> {
+    value.is_finite().then(|| {
+        MarketField::medium(
+            value,
+            Some(unit),
+            SOURCE,
+            "authenticated_market",
+            "computed",
+            as_of,
+            captured_at,
+        )
+    })
+}
+
+/// Compute and attach fixed-income analytics (duration/convexity/DV01) to the bond
+/// section from its already-normalized coupon/yield/price/date fields. Emits a
+/// `bond_analytics_unavailable` warning (and attaches nothing) when the instrument
+/// type or data does not support a meaningful figure.
+fn apply_bond_analytics(
+    bond: &mut MarketBondSection,
+    captured_at: &str,
+    warnings: &mut Vec<MarketWarning>,
+) {
+    let coupon_type = bond.coupon_type.as_ref().map(|field| field.value.as_str());
+
+    let (Some(ytm), Some(maturity)) = (
+        bond.yield_to_maturity_gross
+            .as_ref()
+            .map(|field| field.value),
+        bond.maturity_date.as_ref().map(|field| field.value.clone()),
+    ) else {
+        warnings.push(warning(
+            "bond_analytics_unavailable",
+            "Bond duration analytics need a gross yield and a maturity date.",
+        ));
+        return;
+    };
+    // A non-positive price is nonsensical (it would invert the consistency guard and
+    // produce a negative DV01), so treat it as missing. The full (dirty) price is the
+    // one the DCF reproduces; the clean price is a fallback only for zero coupons,
+    // where accrued interest is ~0 so clean ≈ dirty.
+    let dirty_price = bond
+        .dirty_price
+        .as_ref()
+        .map(|field| field.value)
+        .filter(|&price| price.is_finite() && price > 0.0);
+    let clean_price = bond
+        .clean_price
+        .as_ref()
+        .map(|field| field.value)
+        .filter(|&price| price.is_finite() && price > 0.0);
+    // Anchor the time-to-maturity and discounting on the SAME date as the price and
+    // yield (the quote's provider `as_of`), so a stale quote does not mix a current
+    // valuation date with stale price/yield inputs; fall back to the fetch time.
+    // Owned so it doesn't hold an immutable borrow of `bond` across the writes below.
+    let provider_as_of: Option<String> = bond
+        .yield_to_maturity_gross
+        .as_ref()
+        .or(bond.dirty_price.as_ref())
+        .or(bond.clean_price.as_ref())
+        .and_then(|field| field.as_of.clone());
+    let valuation = provider_as_of.as_deref().unwrap_or(captured_at);
+
+    let Some(years_to_maturity) = year_fraction(valuation, &maturity).filter(|&years| years > 0.0)
+    else {
+        warnings.push(warning(
+            "bond_analytics_unavailable",
+            "Bond maturity is not in the future or could not be parsed; duration analytics skipped.",
+        ));
+        return;
+    };
+    let annual_yield = ytm / 100.0;
+    // A bond is treated as zero-coupon only when Fineco explicitly says so, or when
+    // no coupon type is reported at all and the rate is 0. A present, non-zero-coupon
+    // type with a momentary 0 rate (e.g. a step-up/deferred coupon) must NOT be
+    // inferred as a zero — it falls through to the fail-closed branch below.
+    let is_zero_coupon = coupon_type == Some("zero_coupon")
+        || (coupon_type.is_none()
+            && bond
+                .coupon_rate
+                .as_ref()
+                .is_some_and(|field| field.value == 0.0));
+
+    let (result, dirty) = if is_zero_coupon {
+        // Zero coupon: accrued ≈ 0, so the clean price is an acceptable dirty proxy.
+        let Some(dirty) = dirty_price.or(clean_price) else {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Zero-coupon analytics need a positive price.",
+            ));
+            return;
+        };
+        // Single redemption at maturity, annual compounding (n = 1).
+        (
+            coupon_bond_analytics(0.0, annual_yield, 1.0, years_to_maturity, 1, dirty),
+            dirty,
+        )
+    } else if coupon_type == Some("fixed") {
+        // A coupon-bearing bond between coupon dates is priced dirty by the DCF, so
+        // require the true dirty price (accrued present); the clean price alone would
+        // make the consistency guard and DV01 inconsistent.
+        let Some(dirty) = dirty_price else {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Fixed-coupon analytics need the dirty price (accrued interest); skipped until available.",
+            ));
+            return;
+        };
+        let (Some(coupon_annual), Some(payments_per_year)) = (
+            bond.coupon_rate.as_ref().map(|field| field.value),
+            bond.coupon_payments_per_year
+                .as_ref()
+                .map(|field| field.value),
+        ) else {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Fixed-coupon bond analytics need the coupon rate and payment frequency.",
+            ));
+            return;
+        };
+        if payments_per_year <= 0.0 || coupon_annual < 0.0 {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Bond coupon/frequency values are out of range for duration analytics.",
+            ));
+            return;
+        }
+        let coupon_per_period = coupon_annual / payments_per_year;
+        let periodic_yield = annual_yield / payments_per_year;
+        // Stub to the next coupon (in periods): prefer Fineco's accrued (self-
+        // consistent), else fall back to the next-coupon date.
+        let Some(periods_to_first) = accrued_periods_to_first(
+            bond.accrued_interest.as_ref().map(|field| field.value),
+            coupon_per_period,
+        )
+        .or_else(|| {
+            bond.next_coupon_date
+                .as_ref()
+                .and_then(|field| year_fraction(valuation, &field.value))
+                .filter(|&stub| stub >= 0.0)
+                .map(|stub| stub * payments_per_year)
+        }) else {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Could not place the next coupon date for duration analytics.",
+            ));
+            return;
+        };
+        let remaining = (years_to_maturity * payments_per_year - periods_to_first).round();
+        // Bound before the cast: a non-finite, negative, or absurdly large schedule
+        // is rejected here (so the `as u32` can never wrap or the `+ 1` overflow), and
+        // `coupon_bond_analytics` re-checks the same ceiling.
+        if !remaining.is_finite() || remaining < 0.0 || remaining >= f64::from(MAX_BOND_COUPONS) {
+            warnings.push(warning(
+                "bond_analytics_unavailable",
+                "Bond coupon schedule could not be reconstructed for duration analytics.",
+            ));
+            return;
+        }
+        (
+            coupon_bond_analytics(
+                coupon_per_period,
+                periodic_yield,
+                payments_per_year,
+                periods_to_first,
+                remaining as u32 + 1,
+                dirty,
+            ),
+            dirty,
+        )
+    } else {
+        // Fail closed: only plain fixed-coupon and zero-coupon structures are
+        // supported. Floating-rate, step-up, index-linked, and any other (or
+        // unrecognized) coupon type would get a misleading constant-cashflow figure.
+        warnings.push(warning(
+            "bond_analytics_unavailable",
+            "Duration analytics are computed only for plain fixed-coupon and zero-coupon bonds.",
+        ));
+        return;
+    };
+
+    let Some(result) = result else {
+        warnings.push(warning(
+            "bond_analytics_unavailable",
+            "Bond duration analytics could not be computed from the available data.",
+        ));
+        return;
+    };
+    // Consistency guard: the model price must be close to Fineco's dirty price, or
+    // the yield/price inputs disagree and any duration figure would mislead.
+    if (result.present_value - dirty).abs() / dirty > 0.03 {
+        warnings.push(warning(
+            "bond_analytics_unavailable",
+            "Computed price disagrees with Fineco's price/yield by more than 3%; \
+             duration analytics skipped to avoid a misleading figure.",
+        ));
+        return;
+    }
+    // Report the actual ACT/365 time to maturity from the valuation date (the date
+    // difference), not the idealized coupon-grid maturity used internally. The
+    // computed fields carry the quote's provider `as_of` (the data's effective date),
+    // with `captured_at` still the fetch time.
+    let as_of = provider_as_of.as_deref();
+    bond.years_to_maturity = computed_number_field(years_to_maturity, "years", as_of, captured_at);
+    bond.macaulay_duration =
+        computed_number_field(result.macaulay_duration, "years", as_of, captured_at);
+    bond.modified_duration =
+        computed_number_field(result.modified_duration, "years", as_of, captured_at);
+    bond.convexity = computed_number_field(result.convexity, "years_squared", as_of, captured_at);
+    bond.dv01 = computed_number_field(result.dv01, "price_per_basis_point", as_of, captured_at);
 }
 
 fn bond_sources(
@@ -5054,6 +5399,310 @@ mod tests {
         assert!(bond.bail_in.as_ref().expect("bail-in").value);
         // C-6: a malformed `DD/MM/YYYY` is dropped, not guessed.
         assert!(bond.maturity_date.is_none());
+    }
+
+    #[test]
+    fn bond_details_compute_duration_for_consistent_fixed_bond() {
+        let candidate = bond_candidate();
+        // A consistent ~5y, 3% semi-annual bond priced at par (coupon == yield,
+        // accrued 0 just after a coupon), so the PV-vs-price guard passes.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Par Bond","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":1.5,"bondCouponTyp":"FISSO","bondFrequency":"SEM.","bondExpiryDate":"17/06/2031","bondMaturityDate":"17/12/2026","bondAccruedInterestRate":0.0,"bondParValue":1.0}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":100.0,"yeldNet":2.6,"yeldGross":3.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        // years_to_maturity is the ACT/365 date difference (~5.003y over a span that
+        // includes the 2028 leap day), not the idealized 5.0 coupon grid.
+        let yrs = bond.years_to_maturity.as_ref().expect("ytm yrs").value;
+        assert!((yrs - 5.003).abs() < 0.01, "years_to_maturity {yrs}");
+        let macaulay = bond.macaulay_duration.as_ref().expect("macaulay").value;
+        let modified = bond.modified_duration.as_ref().expect("modified").value;
+        // This is the 5y 3% semi par bond: modified duration ≈ 4.611y (textbook).
+        assert!((modified - 4.611).abs() < 0.02, "modified {modified}");
+        assert!(
+            macaulay > modified,
+            "macaulay {macaulay} vs modified {modified}"
+        );
+        assert!(bond.convexity.as_ref().expect("convexity").value > 0.0);
+        assert!(bond.dv01.as_ref().expect("dv01").value > 0.0);
+        // DV01 = modified × dirty(=100) / 10_000.
+        approx(
+            bond.dv01.as_ref().expect("dv01").value,
+            modified * 100.0 / 10_000.0,
+        );
+        let modified_field = bond.modified_duration.as_ref().expect("modified");
+        assert_eq!(modified_field.source_ref, "computed");
+        // The analytics are anchored on the quote's provider as_of, not the fetch time.
+        assert_eq!(
+            modified_field.as_of.as_deref(),
+            Some("2026-06-17T08:00:00Z")
+        );
+        // The `computed` ref is enumerated in the sources array.
+        assert!(
+            result
+                .sources
+                .iter()
+                .any(|source| source.source_ref == "computed")
+        );
+    }
+
+    #[test]
+    fn bond_details_compute_duration_for_zero_coupon() {
+        let candidate = bond_candidate();
+        // A zero-coupon bond: price = 100/(1+y)^T must be consistent. With y=3% and
+        // ~5y to maturity, the consistent clean price is ~86.18; Macaulay == T.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Zero","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":0.0,"bondCouponTyp":"ZERO COUPON","bondExpiryDate":"17/06/2031","bondAccruedInterestRate":0.0}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":86.18,"yeldGross":3.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        let yrs = bond.years_to_maturity.as_ref().expect("yrs").value;
+        let macaulay = bond.macaulay_duration.as_ref().expect("macaulay").value;
+        // A zero's Macaulay duration equals its years to maturity.
+        approx(macaulay, yrs);
+        approx(
+            bond.modified_duration.as_ref().expect("modified").value,
+            yrs / 1.03,
+        );
+    }
+
+    #[test]
+    fn bond_details_skip_analytics_for_unmapped_coupon_type() {
+        let candidate = bond_candidate();
+        // A step-up coupon: not plain fixed, so it must fail closed (no constant-
+        // cashflow duration) even though coupon/frequency/price are all present.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Step-Up","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":1.5,"bondCouponTyp":"STEP-UP","bondFrequency":"SEM.","bondExpiryDate":"17/06/2031","bondMaturityDate":"17/12/2026","bondAccruedInterestRate":0.0,"bondParValue":1.0}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":100.0,"yeldGross":3.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.modified_duration.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_analytics_unavailable")
+        );
+    }
+
+    #[test]
+    fn bond_details_skip_fixed_analytics_without_dirty_price() {
+        let candidate = bond_candidate();
+        // A fixed-coupon bond with NO accrued interest reported: the dirty price can't
+        // be formed, so the coupon-bearing analytics (priced dirty by the DCF) must be
+        // skipped rather than fall back to the clean price.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Fixed","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":1.5,"bondCouponTyp":"FISSO","bondFrequency":"SEM.","bondExpiryDate":"17/06/2031","bondMaturityDate":"17/12/2026"}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":100.0,"yeldGross":3.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        // No accrued → no dirty price → no analytics, but the rest of the bond section
+        // is still populated.
+        assert!(bond.dirty_price.is_none());
+        assert!(bond.modified_duration.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_analytics_unavailable")
+        );
+    }
+
+    #[test]
+    fn bond_details_skip_analytics_for_zero_rate_with_nonzero_coupon_type() {
+        let candidate = bond_candidate();
+        // A deferred/step-up coupon whose CURRENT rate is 0 but whose type is not
+        // "zero coupon": it must NOT be mistaken for a zero-coupon bond.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Deferred","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":0.0,"bondCouponTyp":"STEP-UP","bondFrequency":"SEM.","bondExpiryDate":"17/06/2031","bondAccruedInterestRate":0.0}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":90.0,"yeldGross":2.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.modified_duration.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_analytics_unavailable")
+        );
+    }
+
+    #[test]
+    fn bond_details_skip_analytics_for_floating_rate() {
+        let candidate = bond_candidate();
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic FRN","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":1.0,"bondCouponTyp":"VARIABILE","bondFrequency":"TRIM.","bondExpiryDate":"17/06/2031","bondMaturityDate":"17/09/2026","bondAccruedInterestRate":0.5}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":100.0,"yeldGross":2.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.modified_duration.is_none());
+        assert!(bond.macaulay_duration.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_analytics_unavailable")
+        );
+    }
+
+    #[test]
+    fn bond_details_skip_analytics_when_price_and_yield_disagree() {
+        // The shared synthetic fixture is a 4% coupon yielding 3% over ~9y priced at
+        // ~101 — internally inconsistent, so the PV guard must skip analytics.
+        let candidate = bond_candidate();
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.modified_duration.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_analytics_unavailable")
+        );
+    }
+
+    #[test]
+    fn coupon_bond_analytics_matches_analytic_truths() {
+        // A single cashflow N=1 (c, n, p0, i): Macaulay duration equals the time to
+        // that cashflow in years = p0/n. Here p0=0.5 period at n=2 → 0.25y.
+        let single = coupon_bond_analytics(2.0, 0.015, 2.0, 0.5, 1, 102.0).expect("single");
+        approx(single.macaulay_duration, 0.25);
+        // Modified = Macaulay / (1 + periodic_yield), always.
+        approx(single.modified_duration, 0.25 / 1.015);
+        // DV01 = modified × dirty / 10_000.
+        approx(single.dv01, single.modified_duration * 102.0 / 10_000.0);
+
+        // A "zero coupon" modeled as n=1, c=0, single 100 at T years: Macaulay == T.
+        let zero = coupon_bond_analytics(0.0, 0.05, 1.0, 10.0, 1, 61.39).expect("zero");
+        approx(zero.macaulay_duration, 10.0);
+        approx(zero.modified_duration, 10.0 / 1.05);
+        // Convexity of a zero (annual comp.) = T(T+1)/(1+y)^2 = 110/1.05^2.
+        approx(zero.convexity, 110.0 / (1.05 * 1.05));
+        // PV of the zero = 100 / 1.05^10.
+        approx(zero.present_value, 100.0 / 1.05_f64.powi(10));
+
+        // A par bond: per-period coupon equals the periodic yield (2% on n=2 with
+        // first coupon a full period out, 2 coupons) prices exactly at 100.
+        let par = coupon_bond_analytics(2.0, 0.02, 2.0, 1.0, 2, 100.0).expect("par");
+        approx(par.present_value, 100.0);
+        approx(par.modified_duration, par.macaulay_duration / 1.02);
+
+        // Independent reference: a 5y 3% semi-annual bond at par (yield 3%) has a
+        // textbook modified duration of ~4.611y (full first stub, 10 coupons).
+        let ref5y = coupon_bond_analytics(1.5, 0.015, 2.0, 1.0, 10, 100.0).expect("ref");
+        approx(ref5y.present_value, 100.0);
+        assert!(
+            (ref5y.modified_duration - 4.611).abs() < 0.01,
+            "modified {}",
+            ref5y.modified_duration
+        );
+    }
+
+    #[test]
+    fn coupon_bond_analytics_rejects_degenerate_inputs() {
+        assert!(coupon_bond_analytics(2.0, 0.02, 2.0, 1.0, 0, 100.0).is_none()); // no coupons
+        assert!(coupon_bond_analytics(2.0, 0.02, 0.0, 1.0, 2, 100.0).is_none()); // n=0
+        assert!(coupon_bond_analytics(2.0, -1.0, 2.0, 1.0, 2, 100.0).is_none()); // i=-100%
     }
 
     #[test]
