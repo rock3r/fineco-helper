@@ -686,6 +686,19 @@ pub struct MarketBondSection {
     pub priips: Option<MarketField<bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_at_risk: Option<MarketField<f64>>,
+    // Computed (not provider-reported) fixed-income analytics, derived from the
+    // coupon schedule, gross YTM, and dirty price. `computed` source_ref; present
+    // only for plain fixed-coupon and zero-coupon bonds with consistent inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub years_to_maturity: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macaulay_duration: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_duration: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convexity: Option<MarketField<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dv01: Option<MarketField<f64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
