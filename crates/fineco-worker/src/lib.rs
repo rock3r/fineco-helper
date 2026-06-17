@@ -764,7 +764,7 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
             let candidate = candidate.ok_or_else(SafeError::market_not_found)?;
             if !matches!(
                 candidate.asset_type,
-                MarketAssetType::Etf | MarketAssetType::Stock
+                MarketAssetType::Etf | MarketAssetType::Stock | MarketAssetType::Bond
             ) {
                 return Err(SafeError::market_unsupported_asset_type_for(
                     candidate.asset_type.as_str(),
@@ -789,7 +789,12 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                 &candidate,
                 params.expected_isin.as_deref(),
             )?;
+            // The bond section's yield-to-maturity comes from the quote snapshot, so
+            // fetch the snapshot when the bond section is wanted even if `quote` was
+            // not explicitly requested.
             let snapshot_response = if wants_default_or_section(params, MarketDetailsSection::Quote)
+                || (matches!(candidate.asset_type, MarketAssetType::Bond)
+                    && wants_default_or_section(params, MarketDetailsSection::Bond))
             {
                 let snapshot_url = format!(
                     "{}?instruments={}",
@@ -900,6 +905,15 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
                         now_iso,
                     )?
                 }
+                MarketAssetType::Bond => parse::to_bond_asset_details(
+                    params,
+                    &candidate,
+                    parse::BondDetailsInputs {
+                        static_response,
+                        snapshot_response,
+                    },
+                    now_iso,
+                )?,
                 _ => {
                     return Err(SafeError::market_unsupported_asset_type_for(
                         candidate.asset_type.as_str(),
@@ -963,7 +977,7 @@ fn resolve_market_candidate(
     for group in &search.groups {
         for candidate in &group.candidates {
             if candidate.venue.eq_ignore_ascii_case(&parsed.venue)
-                && symbols_equivalent(&candidate.symbol, &parsed.symbol)
+                && identifier_symbol_matches(candidate, &parsed.symbol)
                 && expected_isin.as_ref().is_none_or(|expected| {
                     candidate
                         .isin
@@ -1021,6 +1035,23 @@ fn verify_static_identity(
 
 fn symbols_equivalent(candidate: &str, requested: &str) -> bool {
     normalize_symbol(candidate) == normalize_symbol(requested)
+}
+
+/// Whether the requested symbol portion of a `<venue>/<symbol>` identifier matches
+/// this candidate. Stocks/ETFs match on their (share-class-normalized) symbol per
+/// D-1. Bonds additionally match on their ISIN, because the owner-approved bond
+/// input is `<venue>/<ISIN>` (the Fineco search symbol for a bond is an opaque
+/// short ticker the caller would not know). The venue filter plus the
+/// exactly-one-survivor rule keep this unambiguous.
+fn identifier_symbol_matches(candidate: &MarketSearchCandidate, requested_symbol: &str) -> bool {
+    if symbols_equivalent(&candidate.symbol, requested_symbol) {
+        return true;
+    }
+    candidate.asset_type == MarketAssetType::Bond
+        && candidate
+            .isin
+            .as_deref()
+            .is_some_and(|isin| isin.eq_ignore_ascii_case(requested_symbol))
 }
 
 fn details_search_terms(symbol: &str) -> Vec<String> {
@@ -1089,6 +1120,23 @@ impl<'a> StaticSearchRequest<'a> {
                 "esgTaxonomy",
                 "topQuality",
                 "categoryId",
+                // Bond-only static fields; harmless (returned null) for stocks/ETFs.
+                "bondCouponRate",
+                "bondCouponTyp",
+                "bondFrequency",
+                "bondExpiryDate",
+                "bondMaturityDate",
+                "bondAccruedInterestRate",
+                "bondSubordinate",
+                "bondParValue",
+                "bondIssueDate",
+                "bondIssuePrice",
+                "minQty",
+                "rating",
+                "issuerRating",
+                "bailin",
+                "flagPriips",
+                "valueAtRisk",
             ],
             with_warnings: true,
         }
@@ -1984,6 +2032,57 @@ mod tests {
             assert_eq!(resolved.identifier, identifier);
             assert_eq!(resolved.isin.as_deref(), Some(isin));
         }
+    }
+
+    #[test]
+    fn resolver_accepts_venue_plus_isin_for_bonds_only() {
+        // A bond resolves by venue + ISIN even though its Fineco search symbol is
+        // an opaque short ticker the caller would not know.
+        let bond_search = search_result(vec![candidate(
+            "MOT/T56094",
+            "T56094",
+            "IT0005560948",
+            MarketAssetType::Bond,
+        )]);
+        let parsed = ParsedMarketIdentifier {
+            venue: "MOT".to_string(),
+            symbol: "IT0005560948".to_string(),
+        };
+        let resolved = resolve_market_candidate(
+            &bond_search,
+            &parsed,
+            &MarketDetailsParams {
+                identifier: "MOT/IT0005560948".to_string(),
+                expected_isin: None,
+                sections: None,
+            },
+        )
+        .expect("bond resolves by venue + ISIN");
+        assert_eq!(resolved.isin.as_deref(), Some("IT0005560948"));
+
+        // The ISIN-as-symbol path is bond-only: a stock keeps the venue/ticker
+        // contract and is not resolvable by its ISIN.
+        let stock_search = search_result(vec![candidate(
+            "NASDAQ/AAPL",
+            "AAPL",
+            "US0378331005",
+            MarketAssetType::Stock,
+        )]);
+        let parsed_stock = ParsedMarketIdentifier {
+            venue: "NASDAQ".to_string(),
+            symbol: "US0378331005".to_string(),
+        };
+        let err = resolve_market_candidate(
+            &stock_search,
+            &parsed_stock,
+            &MarketDetailsParams {
+                identifier: "NASDAQ/US0378331005".to_string(),
+                expected_isin: None,
+                sections: None,
+            },
+        )
+        .expect_err("a stock must not resolve by ISIN-as-symbol");
+        assert_eq!(err.code(), "market_not_found");
     }
 
     #[test]

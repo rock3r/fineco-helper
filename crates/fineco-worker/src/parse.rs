@@ -10,13 +10,13 @@ use fineco_core::{SafeError, sanitize_text};
 use fineco_ipc::{
     MAX_CANDIDATES_PER_GROUP, MAX_EXPOSURE_ROWS_PER_GROUP, MAX_HOLDINGS, MAX_RETURNS_ROWS,
     MAX_SEARCH_GROUPS, MAX_SOURCES, MAX_STOCK_RATIOS, MarketAssetDetailsResult,
-    MarketAssetIdentity, MarketAssetSections, MarketAssetType, MarketDetailsParams,
-    MarketDetailsSection, MarketEtfSection, MarketExposure, MarketExposuresSection, MarketField,
-    MarketHolding, MarketIndexCard, MarketIndexRegion, MarketIndicesParams, MarketIndicesResult,
-    MarketListingSection, MarketProfileSection, MarketQuoteSection, MarketRatio,
-    MarketRatiosSection, MarketReturn, MarketReturnsSection, MarketRiskSection,
-    MarketSearchCandidate, MarketSearchGroup, MarketSearchParams, MarketSearchResult, MarketSource,
-    MarketStockSection, MarketWarning,
+    MarketAssetIdentity, MarketAssetSections, MarketAssetType, MarketBondSection,
+    MarketDetailsParams, MarketDetailsSection, MarketEtfSection, MarketExposure,
+    MarketExposuresSection, MarketField, MarketHolding, MarketIndexCard, MarketIndexRegion,
+    MarketIndicesParams, MarketIndicesResult, MarketListingSection, MarketProfileSection,
+    MarketQuoteSection, MarketRatio, MarketRatiosSection, MarketReturn, MarketReturnsSection,
+    MarketRiskSection, MarketSearchCandidate, MarketSearchGroup, MarketSearchParams,
+    MarketSearchResult, MarketSource, MarketStockSection, MarketWarning,
 };
 use fineco_store::{
     NewAsset, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward, NewTaxMinusByYear, RawOrder,
@@ -380,6 +380,41 @@ pub(crate) struct RawStaticInstrument {
     kid_en: Option<String>,
     #[serde(rename = "esgTaxonomy", default)]
     esg_taxonomy: Option<String>,
+    // Bond-only static fields. Fineco returns these alongside the shared identity
+    // fields for `instrTyp == "BND"` instruments; they are absent (null) for
+    // stocks/ETFs and ignored there.
+    #[serde(rename = "bondCouponRate", default)]
+    bond_coupon_rate: Option<f64>,
+    #[serde(rename = "bondCouponTyp", default)]
+    bond_coupon_typ: Option<String>,
+    #[serde(rename = "bondFrequency", default)]
+    bond_frequency: Option<String>,
+    #[serde(rename = "bondExpiryDate", default)]
+    bond_expiry_date: Option<String>,
+    #[serde(rename = "bondMaturityDate", default)]
+    bond_maturity_date: Option<String>,
+    #[serde(rename = "bondAccruedInterestRate", default)]
+    bond_accrued_interest_rate: Option<f64>,
+    #[serde(rename = "bondSubordinate", default)]
+    bond_subordinate: Option<String>,
+    #[serde(rename = "bondParValue", default)]
+    bond_par_value: Option<f64>,
+    #[serde(rename = "bondIssueDate", default)]
+    bond_issue_date: Option<String>,
+    #[serde(rename = "bondIssuePrice", default)]
+    bond_issue_price: Option<f64>,
+    #[serde(rename = "minQty", default)]
+    min_qty: Option<f64>,
+    #[serde(default)]
+    rating: Option<String>,
+    #[serde(rename = "issuerRating", default)]
+    issuer_rating: Option<String>,
+    #[serde(default)]
+    bailin: Option<i64>,
+    #[serde(rename = "flagPriips", default)]
+    flag_priips: Option<String>,
+    #[serde(rename = "valueAtRisk", default)]
+    value_at_risk: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -398,6 +433,11 @@ pub(crate) struct RawInstrumentSnapshot {
     volume: Option<f64>,
     #[serde(rename = "lastTradedDatetime", default)]
     last_traded_datetime: Option<String>,
+    // Bond-only quote fields: net/gross yield-to-maturity. Absent for stocks/ETFs.
+    #[serde(rename = "yeldNet", default)]
+    yeld_net: Option<f64>,
+    #[serde(rename = "yeldGross", default)]
+    yeld_gross: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -547,6 +587,11 @@ pub(crate) struct StockDetailsInputs {
     pub(crate) snapshot_response: Option<SnapshotResponse>,
     pub(crate) stock_snapshot: Option<StockSnapshotResponse>,
     pub(crate) stock_reports: Option<StockReportsResponse>,
+}
+
+pub(crate) struct BondDetailsInputs {
+    pub(crate) static_response: StaticSearchResponse,
+    pub(crate) snapshot_response: Option<SnapshotResponse>,
 }
 
 #[derive(Deserialize)]
@@ -1043,6 +1088,12 @@ pub(crate) fn to_market_asset_details(
             "Requested stock ratios are not applicable to an ETF.",
         ));
     }
+    if requested(params, MarketDetailsSection::Bond) {
+        warnings.push(warning(
+            "section_missing",
+            "Requested bond data is not applicable to an ETF.",
+        ));
+    }
 
     Ok(MarketAssetDetailsResult {
         schema_version: 1,
@@ -1417,6 +1468,10 @@ pub(crate) fn to_stock_asset_details(
             MarketDetailsSection::Risk,
             "Requested ETF risk data is not applicable to a stock.",
         ),
+        (
+            MarketDetailsSection::Bond,
+            "Requested bond data is not applicable to a stock.",
+        ),
     ] {
         if requested(params, section) {
             warnings.push(warning("section_missing", message));
@@ -1440,6 +1495,597 @@ pub(crate) fn to_stock_asset_details(
             .take(fineco_ipc::MAX_WARNINGS)
             .collect(),
     })
+}
+
+pub(crate) fn to_bond_asset_details(
+    params: &MarketDetailsParams,
+    candidate: &MarketSearchCandidate,
+    inputs: BondDetailsInputs,
+    captured_at: &str,
+) -> Result<MarketAssetDetailsResult, SafeError> {
+    let static_item = inputs.static_response.get(&candidate.fineco_key);
+    let snapshot_item = inputs
+        .snapshot_response
+        .as_ref()
+        .and_then(|response| response.get(&candidate.fineco_key));
+    let mut warnings = Vec::new();
+
+    let (name, name_source_ref) = static_item
+        .and_then(|item| item.description.clone())
+        .map_or_else(
+            || (candidate.name.clone(), "search.global"),
+            |description| (description, "static.search"),
+        );
+    let (venue, venue_source_ref) =
+        if let Some(venue) = static_item.and_then(|item| item.venue_system.clone()) {
+            (venue, "static.search")
+        } else {
+            (candidate.venue.clone(), "search.global")
+        };
+    let (symbol, symbol_source_ref) =
+        if let Some(symbol) = static_item.and_then(|item| item.symbol.clone()) {
+            (display_symbol_base(&symbol), "static.search")
+        } else {
+            (candidate.symbol.clone(), "search.global")
+        };
+    let (display_symbol, display_symbol_source_ref) = static_item
+        .and_then(|item| item.symbol.clone())
+        .map_or_else(
+            || (candidate.display_symbol.clone(), "search.global"),
+            |symbol| (symbol, "static.search"),
+        );
+    let currency = candidate
+        .currency
+        .clone()
+        .map(|currency| (currency, "search.global"))
+        .or_else(|| {
+            static_item
+                .and_then(|item| item.currency_cd.clone())
+                .map(|currency| (currency, "static.search"))
+        });
+
+    let asset = MarketAssetIdentity {
+        identifier: params.identifier.clone(),
+        fineco_key: text_field(
+            candidate.fineco_key.clone(),
+            "search.global",
+            captured_at,
+            fineco_ipc::MarketConfidence::High,
+        ),
+        asset_type: MarketField::high(
+            candidate.asset_type,
+            None,
+            SOURCE,
+            "authenticated_market",
+            "search.global",
+            None,
+            captured_at,
+        ),
+        name: Some(text_field(
+            name,
+            name_source_ref,
+            captured_at,
+            fineco_ipc::MarketConfidence::High,
+        )),
+        isin: candidate.isin.clone().map(|isin| {
+            text_field(
+                isin,
+                "search.global",
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            )
+        }),
+        venue: text_field(
+            venue,
+            venue_source_ref,
+            captured_at,
+            fineco_ipc::MarketConfidence::High,
+        ),
+        symbol: text_field(
+            symbol,
+            symbol_source_ref,
+            captured_at,
+            fineco_ipc::MarketConfidence::High,
+        ),
+        display_symbol: Some(text_field(
+            display_symbol,
+            display_symbol_source_ref,
+            captured_at,
+            fineco_ipc::MarketConfidence::Medium,
+        )),
+        currency: currency.map(|(currency, source_ref)| {
+            text_field(
+                currency,
+                source_ref,
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            )
+        }),
+    };
+
+    let mut sections = MarketAssetSections::default();
+    // Bonds reuse the shared listing shape but omit the generic `issueDate` field:
+    // for bonds that date is a Fineco listing/accrual marker, NOT the issuance date,
+    // which is reported separately as `bondIssueDate` in the bond section.
+    if default_or_requested_bond(params, MarketDetailsSection::Listing) {
+        sections.listing = static_item.map(|item| MarketListingSection {
+            issue_date: None,
+            preferred_venue: item.preferred_venue.clone().map(|value| {
+                text_field(
+                    value,
+                    "static.search",
+                    captured_at,
+                    fineco_ipc::MarketConfidence::High,
+                )
+            }),
+            kid_url: None,
+            esg_taxonomy: None,
+        });
+    }
+    if default_or_requested_bond(params, MarketDetailsSection::Quote) {
+        sections.quote = snapshot_item.map(|item| bond_quote_section(item, captured_at));
+    }
+    if default_or_requested_bond(params, MarketDetailsSection::Bond) {
+        sections.bond = Some(bond_section(
+            static_item,
+            snapshot_item,
+            captured_at,
+            &mut warnings,
+        ));
+    }
+    // Flag a missing provider timestamp only when a RETURNED section actually
+    // carries untimestamped snapshot values: the quote section surfaces price
+    // fields (`quote_has_values`), while the bond section additionally surfaces
+    // yields (`bond_snapshot_has_values`). This avoids warning on, e.g., a
+    // quote-only request whose snapshot has only yield fields (not returned there).
+    if let Some(item) = snapshot_item
+        && item.last_traded_datetime.is_none()
+    {
+        let quote_untimestamped = default_or_requested_bond(params, MarketDetailsSection::Quote)
+            && quote_has_values(item);
+        let bond_untimestamped = default_or_requested_bond(params, MarketDetailsSection::Bond)
+            && bond_snapshot_has_values(item);
+        if quote_untimestamped || bond_untimestamped {
+            warnings.push(warning(
+                "missing_provider_timestamp",
+                "Fineco bond price/yield fields did not include a provider timestamp.",
+            ));
+        }
+    }
+
+    for (section, message) in [
+        (
+            MarketDetailsSection::Profile,
+            "Requested profile data is not applicable to a bond.",
+        ),
+        (
+            MarketDetailsSection::Etf,
+            "Requested ETF data is not applicable to a bond.",
+        ),
+        (
+            MarketDetailsSection::Stock,
+            "Requested stock data is not applicable to a bond.",
+        ),
+        (
+            MarketDetailsSection::Holdings,
+            "Requested ETF holdings are not applicable to a bond.",
+        ),
+        (
+            MarketDetailsSection::Exposures,
+            "Requested ETF exposures are not applicable to a bond.",
+        ),
+        (
+            MarketDetailsSection::Returns,
+            "Requested ETF returns are not applicable to a bond.",
+        ),
+        (
+            MarketDetailsSection::Risk,
+            "Requested ETF risk data is not applicable to a bond.",
+        ),
+        (
+            MarketDetailsSection::Ratios,
+            "Requested stock ratios are not applicable to a bond.",
+        ),
+    ] {
+        if requested(params, section) {
+            warnings.push(warning("section_missing", message));
+        }
+    }
+
+    let computed_dirty_price = sections
+        .bond
+        .as_ref()
+        .is_some_and(|bond| bond.dirty_price.is_some());
+    Ok(MarketAssetDetailsResult {
+        schema_version: 1,
+        data_class: "authenticated_market".to_string(),
+        captured_at: captured_at.to_string(),
+        asset,
+        sections,
+        sources: bond_sources(
+            captured_at,
+            inputs.snapshot_response.is_some(),
+            computed_dirty_price,
+        ),
+        warnings: warnings
+            .into_iter()
+            .take(fineco_ipc::MAX_WARNINGS)
+            .collect(),
+    })
+}
+
+/// Whether a bond snapshot carries any value the bond/quote sections surface —
+/// the shared quote fields plus net/gross yield. Used to decide whether a missing
+/// provider timestamp is worth warning about.
+fn bond_snapshot_has_values(item: &RawInstrumentSnapshot) -> bool {
+    quote_has_values(item) || item.yeld_net.is_some() || item.yeld_gross.is_some()
+}
+
+fn bond_quote_section(item: &RawInstrumentSnapshot, captured_at: &str) -> MarketQuoteSection {
+    // Bonds are quoted as a clean percentage of par (e.g. 102.909), so unlike the
+    // stock path there is no minor-unit (pence/cents) scaling to apply.
+    let as_of = item.last_traded_datetime.as_deref();
+    MarketQuoteSection {
+        last: number_field(item.last, "price", "snapshot", as_of, captured_at),
+        bid: number_field(item.bid, "price", "snapshot", as_of, captured_at),
+        ask: number_field(item.ask, "price", "snapshot", as_of, captured_at),
+        previous_close: number_field(
+            item.prev_close_price,
+            "price",
+            "snapshot",
+            as_of,
+            captured_at,
+        ),
+        change_percent: number_field(item.perc_var, "percent", "snapshot", as_of, captured_at),
+        volume: number_field(item.volume, "nominal", "snapshot", as_of, captured_at),
+    }
+}
+
+fn bond_section(
+    static_item: Option<&RawStaticInstrument>,
+    snapshot_item: Option<&RawInstrumentSnapshot>,
+    captured_at: &str,
+    warnings: &mut Vec<MarketWarning>,
+) -> MarketBondSection {
+    let mut bond = MarketBondSection::default();
+
+    if let Some(item) = static_item {
+        let per_period = item.bond_coupon_rate;
+        bond.coupon_rate_per_period =
+            number_field(per_period, "percent", "static.search", None, captured_at);
+        if let Some((label, payments_per_year)) = item
+            .bond_frequency
+            .as_deref()
+            .and_then(bond_coupon_frequency)
+        {
+            bond.coupon_frequency = Some(text_field(
+                label.to_string(),
+                "static.search",
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            ));
+            bond.coupon_payments_per_year = number_field(
+                Some(payments_per_year),
+                "count",
+                "static.search",
+                None,
+                captured_at,
+            );
+            // C-1: Fineco reports the per-PAYMENT rate; annual nominal is rate
+            // times payments per year.
+            bond.coupon_rate = number_field(
+                per_period.map(|rate| rate * payments_per_year),
+                "percent",
+                "static.search",
+                None,
+                captured_at,
+            );
+        } else {
+            // Frequency absent or unrecognized.
+            if let Some(raw) = sanitized_non_empty(item.bond_frequency.clone()) {
+                bond.coupon_frequency = Some(text_field(
+                    raw,
+                    "static.search",
+                    captured_at,
+                    fineco_ipc::MarketConfidence::Medium,
+                ));
+            }
+            if per_period.is_some_and(|rate| rate == 0.0) {
+                // A zero coupon is a known annual fact (0%) regardless of payment
+                // frequency (a zero-coupon bond has no coupon schedule), so surface
+                // it directly rather than warning that the annual rate is underivable.
+                bond.coupon_rate =
+                    number_field(Some(0.0), "percent", "static.search", None, captured_at);
+            } else if per_period.is_some() {
+                warnings.push(warning(
+                    "bond_coupon_frequency_unknown",
+                    "Fineco reported an unrecognized coupon frequency; the annual \
+                     coupon rate could not be derived from the per-payment rate.",
+                ));
+            }
+        }
+        if let Some(typ) = sanitized_non_empty(item.bond_coupon_typ.clone()) {
+            bond.coupon_type = Some(text_field(
+                bond_coupon_type(&typ),
+                "static.search",
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            ));
+        }
+        // C-2: maturity is `bondExpiryDate`; `bondMaturityDate` is the next coupon.
+        bond.maturity_date = iso_date_from_european(item.bond_expiry_date.as_deref()).map(|date| {
+            text_field(
+                date,
+                "static.search",
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            )
+        });
+        bond.next_coupon_date =
+            iso_date_from_european(item.bond_maturity_date.as_deref()).map(|date| {
+                text_field(
+                    date,
+                    "static.search",
+                    captured_at,
+                    fineco_ipc::MarketConfidence::High,
+                )
+            });
+        bond.issue_date = iso_date_from_european(item.bond_issue_date.as_deref()).map(|date| {
+            text_field(
+                date,
+                "static.search",
+                captured_at,
+                fineco_ipc::MarketConfidence::High,
+            )
+        });
+        bond.issue_price = number_field(
+            item.bond_issue_price,
+            "price",
+            "static.search",
+            None,
+            captured_at,
+        );
+        // Accrued interest is in points of par (same dimension as the clean price,
+        // not a yield), so it shares the "price" unit and is summable into the
+        // computed dirty price below.
+        bond.accrued_interest = number_field(
+            item.bond_accrued_interest_rate,
+            "price",
+            "static.search",
+            None,
+            captured_at,
+        );
+        bond.min_lot = number_field(item.min_qty, "nominal", "static.search", None, captured_at);
+        bond.par_value = number_field(
+            item.bond_par_value,
+            "nominal",
+            "static.search",
+            None,
+            captured_at,
+        );
+        bond.value_at_risk = number_field(
+            item.value_at_risk,
+            "percent",
+            "static.search",
+            None,
+            captured_at,
+        );
+
+        // C-3: ratings are Fineco-reported point-in-time labels with no agency,
+        // date, or outlook, so they are Low confidence and carry a caveat warning.
+        let mut has_rating = false;
+        if let Some(rating) = sanitized_non_empty(item.rating.clone()) {
+            bond.rating = Some(text_field(
+                rating,
+                "static.search",
+                captured_at,
+                fineco_ipc::MarketConfidence::Low,
+            ));
+            has_rating = true;
+        }
+        if let Some(rating) = sanitized_non_empty(item.issuer_rating.clone()) {
+            bond.issuer_rating = Some(text_field(
+                rating,
+                "static.search",
+                captured_at,
+                fineco_ipc::MarketConfidence::Low,
+            ));
+            has_rating = true;
+        }
+        if has_rating {
+            warnings.push(warning(
+                "bond_rating_unverified",
+                "Bond rating is a Fineco-reported label without rating agency, rating \
+                 date, or outlook; treat it as indicative only.",
+            ));
+        }
+
+        // Fail closed on unrecognized yes/no codes (return None) rather than
+        // assuming the riskier `true`.
+        if let Some(value) = bond_yes_no(item.bond_subordinate.as_deref()) {
+            bond.subordinated = Some(bool_field(value, "static.search", captured_at));
+        }
+        // Fail closed: only the known 0/1 bail-in codes map to a boolean; an
+        // unexpected sentinel (e.g. 2) is omitted rather than assumed `true`.
+        if let Some(value) = match item.bailin {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        } {
+            bond.bail_in = Some(bool_field(value, "static.search", captured_at));
+        }
+        if let Some(value) = bond_yes_no(item.flag_priips.as_deref()) {
+            bond.priips = Some(bool_field(value, "static.search", captured_at));
+        }
+    }
+
+    if let Some(snapshot) = snapshot_item {
+        let as_of = snapshot.last_traded_datetime.as_deref();
+        bond.clean_price = number_field(snapshot.last, "price", "snapshot", as_of, captured_at);
+        bond.yield_to_maturity_gross = number_field(
+            snapshot.yeld_gross,
+            "percent",
+            "snapshot",
+            as_of,
+            captured_at,
+        );
+        bond.yield_to_maturity_net =
+            number_field(snapshot.yeld_net, "percent", "snapshot", as_of, captured_at);
+        // Dirty price is computed (clean + accrued), not provider-reported, so it is
+        // source-attributed to `computed` rather than `snapshot`.
+        if let (Some(clean), Some(accrued)) = (
+            snapshot.last,
+            static_item.and_then(|item| item.bond_accrued_interest_rate),
+        ) {
+            bond.dirty_price = Some(MarketField::medium(
+                clean + accrued,
+                Some("price"),
+                SOURCE,
+                "authenticated_market",
+                "computed",
+                as_of,
+                captured_at,
+            ));
+        }
+    }
+
+    if bond.yield_to_maturity_gross.is_none() && bond.yield_to_maturity_net.is_none() {
+        warnings.push(warning(
+            "bond_yield_unavailable",
+            "Fineco did not report a yield-to-maturity for this bond at the resolved venue.",
+        ));
+    }
+
+    bond
+}
+
+fn bond_sources(
+    captured_at: &str,
+    fetched_snapshot: bool,
+    computed_dirty_price: bool,
+) -> Vec<MarketSource> {
+    let mut source_refs = vec!["search.global", "static.search"];
+    if fetched_snapshot {
+        source_refs.push("snapshot");
+    }
+    // `computed` is a synthetic, non-fetched provenance for derived fields (the
+    // dirty price = clean + accrued); listing it keeps every field's `source_ref`
+    // resolvable against the `sources` array, matching the stock/ETF convention.
+    if computed_dirty_price {
+        source_refs.push("computed");
+    }
+    source_refs
+        .into_iter()
+        .take(MAX_SOURCES)
+        .map(|source_ref| MarketSource {
+            source: SOURCE.to_string(),
+            data_class: "authenticated_market".to_string(),
+            source_ref: source_ref.to_string(),
+            captured_at: captured_at.to_string(),
+        })
+        .collect()
+}
+
+fn default_or_requested_bond(params: &MarketDetailsParams, section: MarketDetailsSection) -> bool {
+    params.sections.as_ref().map_or(
+        matches!(
+            section,
+            MarketDetailsSection::Listing
+                | MarketDetailsSection::Quote
+                | MarketDetailsSection::Bond
+        ),
+        |sections| sections.contains(&section),
+    )
+}
+
+fn bool_field(value: bool, source_ref: &str, captured_at: &str) -> MarketField<bool> {
+    MarketField::high(
+        value,
+        None,
+        SOURCE,
+        "authenticated_market",
+        source_ref,
+        None,
+        captured_at,
+    )
+}
+
+/// Normalize a Fineco `DD/MM/YYYY` date string to ISO `YYYY-MM-DD`. Returns `None`
+/// for absent, empty, mis-shaped, or impossible-calendar values (e.g. `00/00/0000`
+/// or `31/02/2026`) rather than emitting an invalid ISO-looking string.
+fn iso_date_from_european(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    let mut parts = value.split('/');
+    let day = parts.next()?;
+    let month = parts.next()?;
+    let year = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if day.len() != 2 || month.len() != 2 || year.len() != 4 {
+        return None;
+    }
+    // Two-digit day/month and four-digit year, so these parse without overflow.
+    let day_num: u32 = day.parse().ok()?;
+    let month_num: u32 = month.parse().ok()?;
+    let year_num: u32 = year.parse().ok()?;
+    if year_num == 0 || !(1..=12).contains(&month_num) {
+        return None;
+    }
+    let leap = year_num.is_multiple_of(4)
+        && (!year_num.is_multiple_of(100) || year_num.is_multiple_of(400));
+    let days_in_month = match month_num {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day_num) {
+        return None;
+    }
+    Some(format!("{year}-{month}-{day}"))
+}
+
+/// Map a Fineco coupon-frequency code to a normalized label and the number of
+/// coupon payments per year. Returns `None` for unrecognized codes so the caller
+/// can avoid deriving a wrong annual rate.
+fn bond_coupon_frequency(raw: &str) -> Option<(&'static str, f64)> {
+    match raw
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "ANN" => Some(("annual", 1.0)),
+        "SEM" => Some(("semi_annual", 2.0)),
+        "TRIM" => Some(("quarterly", 4.0)),
+        "MENS" => Some(("monthly", 12.0)),
+        _ => None,
+    }
+}
+
+/// Interpret a Fineco yes/no flag (`bondSubordinate`, `flagPriips`). Returns
+/// `None` for absent, empty, or unrecognized codes so the field is omitted rather
+/// than guessing the riskier `true`.
+fn bond_yes_no(raw: Option<&str>) -> Option<bool> {
+    match raw?.trim().to_ascii_uppercase().as_str() {
+        "" => None,
+        "N" | "NO" => Some(false),
+        "S" | "SI" | "Y" | "YES" => Some(true),
+        _ => None,
+    }
+}
+
+/// Map a Fineco coupon-type code to a normalized label, falling back to a
+/// sanitized lowercase passthrough for unrecognized values.
+fn bond_coupon_type(raw: &str) -> String {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "FISSO" => "fixed".to_string(),
+        "VARIABILE" | "VAR" => "floating".to_string(),
+        "ZERO COUPON" | "ZERO" | "ZC" => "zero_coupon".to_string(),
+        other => sanitize_text(&other.to_ascii_lowercase()),
+    }
 }
 
 fn verify_stock_snapshot_identity(
@@ -2910,6 +3556,7 @@ mod tests {
                 MarketDetailsSection::Etf,
                 MarketDetailsSection::Stock,
                 MarketDetailsSection::Ratios,
+                MarketDetailsSection::Bond,
             ]),
             &candidate,
             MarketDetailsInputs {
@@ -2925,11 +3572,18 @@ mod tests {
 
         assert!(result.sections.stock.is_none());
         assert!(result.sections.ratios.is_none());
+        assert!(result.sections.bond.is_none());
         assert!(
             result
                 .warnings
                 .iter()
                 .any(|warning| warning.message.contains("not applicable to an ETF"))
+        );
+        // A bond section requested on an ETF is reported as inapplicable, not silent.
+        assert!(
+            result.warnings.iter().any(
+                |warning| warning.message == "Requested bond data is not applicable to an ETF."
+            )
         );
     }
 
@@ -3832,6 +4486,7 @@ mod tests {
                     MarketDetailsSection::Exposures,
                     MarketDetailsSection::Returns,
                     MarketDetailsSection::Risk,
+                    MarketDetailsSection::Bond,
                 ]),
             },
             &candidate,
@@ -3850,13 +4505,22 @@ mod tests {
 
         assert!(result.sections.etf.is_none());
         assert!(result.sections.holdings.is_none());
+        assert!(result.sections.bond.is_none());
         assert!(
             result
                 .warnings
                 .iter()
                 .filter(|warning| warning.message.contains("not applicable to a stock"))
                 .count()
-                >= 5
+                >= 6
+        );
+        // A bond section requested on a stock is reported as inapplicable, not silent.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.message
+                    == "Requested bond data is not applicable to a stock.")
         );
     }
 
@@ -3934,5 +4598,525 @@ mod tests {
             r#"{"US0378331005.NASDAQ":{"last":291.13,"bid":0.0,"ask":0.0,"prevClosePrice":295.63,"percVar":-1.52,"volume":38784789,"lastTradedDatetime":"2026-06-12T20:00:00Z"}}"#,
         )
         .expect("snapshot")
+    }
+
+    // NOTE: all bond fixtures below are SYNTHETIC (the repo is public). They keep
+    // the real upstream field SHAPES but invented ISINs/values, chosen so the
+    // arithmetic checks (annual = per-period × payments, dirty = clean + accrued)
+    // still exercise the per-payment-coupon and computed-dirty-price logic.
+    fn bond_candidate() -> MarketSearchCandidate {
+        MarketSearchCandidate {
+            fineco_key: "IT0009999991.MOT".to_string(),
+            identifier: "MOT/SYNTHGOV".to_string(),
+            name: "Synthetic Govt 4% 2035".to_string(),
+            venue: "MOT".to_string(),
+            symbol: "IT0009999991".to_string(),
+            display_symbol: "SYNGOV.HM".to_string(),
+            isin: Some("IT0009999991".to_string()),
+            currency: Some("EUR".to_string()),
+            asset_type: MarketAssetType::Bond,
+            preferred: false,
+        }
+    }
+
+    fn bond_params(sections: Option<Vec<MarketDetailsSection>>) -> MarketDetailsParams {
+        MarketDetailsParams {
+            identifier: "MOT/SYNTHGOV".to_string(),
+            expected_isin: Some("IT0009999991".to_string()),
+            sections,
+        }
+    }
+
+    fn bond_static_response() -> StaticSearchResponse {
+        serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Govt 4% 2035","symbol":"SYNGOV.HM","currencyCd":"EUR","preferredVenue":"MOT","instrTyp":"BND","newType":"Obbligazione","bondCouponRate":2.0,"bondCouponTyp":"FISSO","bondFrequency":"SEM.","bondExpiryDate":"01/04/2035","bondMaturityDate":"01/04/2027","bondAccruedInterestRate":1.25,"bondSubordinate":"N","bondParValue":1.0,"bondIssueDate":"01/04/2024","issueDate":"29/03/2024","bondIssuePrice":99.0,"minQty":1000.0,"issuerRating":"BBB","bailin":0,"flagPriips":"N","valueAtRisk":9.0}}"#,
+        )
+        .expect("bond static")
+    }
+
+    fn bond_snapshot_response() -> SnapshotResponse {
+        serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":101.0,"bid":100.9,"ask":101.1,"prevClosePrice":100.8,"percVar":0.2,"volume":12000,"lastTradedDatetime":"2026-06-15T09:00:00Z","yeldNet":2.5,"yeldGross":3.0}}"#,
+        )
+        .expect("bond snapshot")
+    }
+
+    fn corporate_bond_candidate() -> MarketSearchCandidate {
+        MarketSearchCandidate {
+            fineco_key: "XS9999999991.ETLX".to_string(),
+            identifier: "ETLX/SYNTHCORP".to_string(),
+            name: "Synthetic Corp 5% 2028".to_string(),
+            venue: "ETLX".to_string(),
+            symbol: "XS9999999991".to_string(),
+            display_symbol: "SYNCRP.HM".to_string(),
+            isin: Some("XS9999999991".to_string()),
+            currency: Some("EUR".to_string()),
+            asset_type: MarketAssetType::Bond,
+            preferred: false,
+        }
+    }
+
+    fn corporate_bond_static_response() -> StaticSearchResponse {
+        serde_json::from_str(
+            r#"{"XS9999999991.ETLX":{"instrId":"XS9999999991","venueSystem":"ETLX","description":"Synthetic Corp 5% 2028","symbol":"SYNCRP.HM","currencyCd":"EUR","preferredVenue":"ETLX","instrTyp":"BND","newType":"Obbligazione","bondCouponRate":5.0,"bondCouponTyp":"FISSO","bondFrequency":"ANN.","bondExpiryDate":"21/06/2028","bondMaturityDate":"21/06/2026","bondAccruedInterestRate":4.0,"bondSubordinate":"N","bondParValue":1.0,"bondIssueDate":"20/06/2008","bondIssuePrice":99.5,"minQty":100000.0,"rating":"BBB","issuerRating":"BBB","bailin":0,"flagPriips":"N","valueAtRisk":2.0}}"#,
+        )
+        .expect("corporate bond static")
+    }
+
+    fn corporate_bond_snapshot_response() -> SnapshotResponse {
+        serde_json::from_str(
+            r#"{"XS9999999991.ETLX":{"last":102.0,"bid":101.9,"ask":102.1,"prevClosePrice":102.2,"percVar":-0.2,"volume":0,"lastTradedDatetime":"2026-05-12T14:08:39Z","yeldNet":1.5,"yeldGross":2.5}}"#,
+        )
+        .expect("corporate bond snapshot")
+    }
+
+    fn approx(left: f64, right: f64) {
+        assert!((left - right).abs() < 1e-6, "expected {right}, got {left}");
+    }
+
+    #[test]
+    fn bond_details_normalize_core_fields() {
+        let candidate = bond_candidate();
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert_eq!(result.data_class, "authenticated_market");
+        assert_eq!(result.asset.asset_type.value, MarketAssetType::Bond);
+        assert_eq!(
+            result.asset.isin.as_ref().expect("isin").value,
+            "IT0009999991"
+        );
+        assert_eq!(result.asset.venue.value, "MOT");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        // C-1: per-period 2.0 × 2 payments (SEM.) = 4.0 annual nominal.
+        approx(bond.coupon_rate.as_ref().expect("coupon").value, 4.0);
+        approx(
+            bond.coupon_rate_per_period
+                .as_ref()
+                .expect("per period")
+                .value,
+            2.0,
+        );
+        approx(
+            bond.coupon_payments_per_year
+                .as_ref()
+                .expect("payments")
+                .value,
+            2.0,
+        );
+        assert_eq!(bond.coupon_type.as_ref().expect("type").value, "fixed");
+        assert_eq!(
+            bond.coupon_frequency.as_ref().expect("freq").value,
+            "semi_annual"
+        );
+        // C-2: maturity is bondExpiryDate, next coupon is bondMaturityDate.
+        assert_eq!(
+            bond.maturity_date.as_ref().expect("maturity").value,
+            "2035-04-01"
+        );
+        assert_eq!(
+            bond.next_coupon_date.as_ref().expect("next coupon").value,
+            "2027-04-01"
+        );
+        // C-6: bondIssueDate is issuance, ISO-normalized.
+        assert_eq!(
+            bond.issue_date.as_ref().expect("issue date").value,
+            "2024-04-01"
+        );
+        approx(bond.issue_price.as_ref().expect("issue price").value, 99.0);
+        approx(bond.accrued_interest.as_ref().expect("accrued").value, 1.25);
+        assert_eq!(
+            bond.accrued_interest
+                .as_ref()
+                .expect("accrued")
+                .unit
+                .as_deref(),
+            Some("price")
+        );
+        approx(bond.clean_price.as_ref().expect("clean").value, 101.0);
+        // Dirty = clean + accrued (computed).
+        approx(
+            bond.dirty_price.as_ref().expect("dirty").value,
+            101.0 + 1.25,
+        );
+        assert_eq!(
+            bond.dirty_price.as_ref().expect("dirty").source_ref,
+            "computed"
+        );
+        // The `computed` ref is enumerated in the sources array.
+        assert!(
+            result
+                .sources
+                .iter()
+                .any(|source| source.source_ref == "computed")
+        );
+        approx(
+            bond.yield_to_maturity_gross.as_ref().expect("ytm g").value,
+            3.0,
+        );
+        approx(
+            bond.yield_to_maturity_net.as_ref().expect("ytm n").value,
+            2.5,
+        );
+        // Govt bond exposes only issuer rating.
+        assert_eq!(
+            bond.issuer_rating.as_ref().expect("issuer rating").value,
+            "BBB"
+        );
+        assert!(bond.rating.is_none());
+        assert!(!bond.subordinated.as_ref().expect("subordinated").value);
+        approx(bond.min_lot.as_ref().expect("min lot").value, 1000.0);
+        approx(bond.par_value.as_ref().expect("par").value, 1.0);
+
+        // C-3: ratings carry an "unverified" caveat warning.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_rating_unverified")
+        );
+        // Default sections include listing, quote, bond.
+        assert!(result.sections.listing.is_some());
+        assert!(result.sections.quote.is_some());
+    }
+
+    #[test]
+    fn bond_details_corporate_exposes_instrument_and_issuer_rating() {
+        let candidate = corporate_bond_candidate();
+        let result = to_bond_asset_details(
+            &MarketDetailsParams {
+                identifier: "ETLX/SYNTHCORP".to_string(),
+                expected_isin: Some("XS9999999991".to_string()),
+                sections: None,
+            },
+            &candidate,
+            BondDetailsInputs {
+                static_response: corporate_bond_static_response(),
+                snapshot_response: Some(corporate_bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("corporate bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        // ANN. → 1 payment/year, annual == per-period.
+        approx(bond.coupon_rate.as_ref().expect("coupon").value, 5.0);
+        approx(
+            bond.coupon_payments_per_year
+                .as_ref()
+                .expect("payments")
+                .value,
+            1.0,
+        );
+        assert_eq!(
+            bond.coupon_frequency.as_ref().expect("freq").value,
+            "annual"
+        );
+        assert_eq!(bond.rating.as_ref().expect("rating").value, "BBB");
+        assert_eq!(
+            bond.issuer_rating.as_ref().expect("issuer rating").value,
+            "BBB"
+        );
+        approx(bond.min_lot.as_ref().expect("min lot").value, 100000.0);
+    }
+
+    #[test]
+    fn bond_details_warn_for_inapplicable_equity_sections() {
+        let candidate = bond_candidate();
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![
+                MarketDetailsSection::Bond,
+                MarketDetailsSection::Stock,
+                MarketDetailsSection::Etf,
+                MarketDetailsSection::Ratios,
+            ])),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert!(result.sections.stock.is_none());
+        assert!(result.sections.etf.is_none());
+        assert!(result.sections.ratios.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("not applicable to a bond"))
+        );
+    }
+
+    #[test]
+    fn bond_details_warn_when_yield_absent() {
+        let candidate = bond_candidate();
+        // Snapshot without yeldNet/yeldGross (e.g. an illiquid venue with no quote).
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":101.0,"lastTradedDatetime":"2026-06-15T09:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.yield_to_maturity_gross.is_none());
+        assert!(bond.yield_to_maturity_net.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_yield_unavailable")
+        );
+    }
+
+    #[test]
+    fn bond_details_unknown_frequency_omits_annual_and_warns() {
+        let candidate = bond_candidate();
+        // An unrecognized coupon frequency: the annual rate cannot be derived from
+        // the per-payment rate, so `coupon_rate` is omitted and a warning is raised,
+        // while the raw frequency string is still surfaced.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Bond","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":3.0,"bondCouponTyp":"FISSO","bondFrequency":"BIENN.","bondExpiryDate":"01/04/2035"}}"#,
+        )
+        .expect("static");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert!(bond.coupon_rate.is_none());
+        approx(
+            bond.coupon_rate_per_period
+                .as_ref()
+                .expect("per period")
+                .value,
+            3.0,
+        );
+        assert!(bond.coupon_payments_per_year.is_none());
+        assert_eq!(
+            bond.coupon_frequency.as_ref().expect("raw freq").value,
+            "BIENN."
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_coupon_frequency_unknown")
+        );
+    }
+
+    #[test]
+    fn bond_details_zero_coupon_has_known_annual_rate_without_frequency() {
+        let candidate = bond_candidate();
+        // A zero-coupon bond carries no coupon schedule (no/blank frequency); the
+        // annual coupon is still a known 0%, with no "frequency unknown" warning.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Zero","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":0.0,"bondCouponTyp":"ZERO COUPON","bondExpiryDate":"01/04/2035"}}"#,
+        )
+        .expect("static");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        approx(bond.coupon_rate.as_ref().expect("coupon").value, 0.0);
+        assert_eq!(
+            bond.coupon_type.as_ref().expect("type").value,
+            "zero_coupon"
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "bond_coupon_frequency_unknown")
+        );
+    }
+
+    #[test]
+    fn bond_details_warn_missing_timestamp_for_bond_only_request() {
+        let candidate = bond_candidate();
+        // Bond section only (no quote). The snapshot still feeds clean price + YTM;
+        // a snapshot with values but no provider timestamp must still warn.
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":101.0,"yeldNet":2.5,"yeldGross":3.0}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert!(result.sections.quote.is_none());
+        assert!(result.sections.bond.is_some());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "missing_provider_timestamp")
+        );
+    }
+
+    #[test]
+    fn bond_details_quote_only_does_not_warn_for_yield_only_snapshot() {
+        let candidate = bond_candidate();
+        // Quote-only request: the quote section surfaces no yields, so a snapshot
+        // with only yield fields and no timestamp must NOT trigger the missing-
+        // timestamp warning (there are no untimestamped quote values to flag).
+        let snapshot: SnapshotResponse =
+            serde_json::from_str(r#"{"IT0009999991.MOT":{"yeldNet":2.5,"yeldGross":3.0}}"#)
+                .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Quote])),
+            &candidate,
+            BondDetailsInputs {
+                static_response: bond_static_response(),
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert!(result.sections.bond.is_none());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "missing_provider_timestamp")
+        );
+    }
+
+    #[test]
+    fn bond_details_floating_flags_and_malformed_date() {
+        let candidate = bond_candidate();
+        // Floating coupon; subordinated + PRIIPs "S" → true; malformed maturity date
+        // → None (no guessing); unrecognized subordinate code would fail closed.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic FRN","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":1.0,"bondCouponTyp":"VARIABILE","bondFrequency":"TRIM.","bondExpiryDate":"1/4/35","bondSubordinate":"S","flagPriips":"S","bailin":1}}"#,
+        )
+        .expect("static");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        assert_eq!(bond.coupon_type.as_ref().expect("type").value, "floating");
+        // TRIM. → 4 payments/year, so annual = 1.0 × 4 = 4.0.
+        approx(bond.coupon_rate.as_ref().expect("coupon").value, 4.0);
+        assert!(bond.subordinated.as_ref().expect("subordinated").value);
+        assert!(bond.priips.as_ref().expect("priips").value);
+        assert!(bond.bail_in.as_ref().expect("bail-in").value);
+        // C-6: a malformed `DD/MM/YYYY` is dropped, not guessed.
+        assert!(bond.maturity_date.is_none());
+    }
+
+    #[test]
+    fn iso_date_from_european_rejects_impossible_calendar_dates() {
+        // Valid dates normalize.
+        assert_eq!(
+            iso_date_from_european(Some("01/07/2034")).as_deref(),
+            Some("2034-07-01")
+        );
+        assert_eq!(
+            iso_date_from_european(Some("29/02/2024")).as_deref(),
+            Some("2024-02-29")
+        );
+        // Impossible / placeholder dates are omitted, not formatted into ISO.
+        assert_eq!(iso_date_from_european(Some("00/00/0000")), None);
+        assert_eq!(iso_date_from_european(Some("31/02/2026")), None); // Feb 31
+        assert_eq!(iso_date_from_european(Some("29/02/2025")), None); // not a leap year
+        assert_eq!(iso_date_from_european(Some("31/04/2030")), None); // Apr has 30
+        assert_eq!(iso_date_from_european(Some("00/07/2034")), None); // day 0
+        assert_eq!(iso_date_from_european(Some("01/13/2034")), None); // month 13
+        // Mis-shaped values remain rejected.
+        assert_eq!(iso_date_from_european(Some("1/7/2034")), None);
+        assert_eq!(iso_date_from_european(Some("01/07/34")), None);
+        assert_eq!(iso_date_from_european(None), None);
+    }
+
+    #[test]
+    fn bond_yes_no_fails_closed_on_unknown() {
+        assert_eq!(bond_yes_no(Some("N")), Some(false));
+        assert_eq!(bond_yes_no(Some("s")), Some(true));
+        assert_eq!(bond_yes_no(Some("Y")), Some(true));
+        assert_eq!(bond_yes_no(Some("maybe")), None);
+        assert_eq!(bond_yes_no(Some("")), None);
+        assert_eq!(bond_yes_no(None), None);
+    }
+
+    #[test]
+    fn bond_bailin_fails_closed_on_unknown_code() {
+        let candidate = bond_candidate();
+        // An unexpected bail-in sentinel (2) must omit the field, not assume `true`.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Bond","currencyCd":"EUR","instrTyp":"BND","bailin":2}}"#,
+        )
+        .expect("static");
+        let result = to_bond_asset_details(
+            &bond_params(Some(vec![MarketDetailsSection::Bond])),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(bond_snapshot_response()),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        assert!(
+            result
+                .sections
+                .bond
+                .as_ref()
+                .expect("bond section")
+                .bail_in
+                .is_none()
+        );
     }
 }

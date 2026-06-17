@@ -175,7 +175,10 @@ Product (`crates/`):
   data class `credentialed_live`) cover refresh.
   `MarketControlRequest::{MarketSearchAsset,MarketGetAssetDetails}`,
   `MarketControlClient`, normalized `MarketSearchResult` /
-  `MarketAssetDetailsResult`, status-only
+  `MarketAssetDetailsResult` (typed detail sections for **stocks, ETFs, and
+  bonds** — the bond section carries coupon/maturity/yield/accrued/rating/min-lot
+  from `instruments/static/search` + `instruments/snapshot`, no new endpoint; other
+  resolved asset types remain search-only), status-only
   `MarketSessionStatus` / `MarketSearchLiveResult` /
   `MarketAssetDetailsLiveResult`,
   and `market.authenticated.read` (audit data class `authenticated_market`) cover

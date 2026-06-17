@@ -1,0 +1,13 @@
+{
+  "IT0005560948.MOT": {
+    "last": 101.5,
+    "bid": 101.4,
+    "ask": 101.6,
+    "prevClosePrice": 101.3,
+    "percVar": 0.2,
+    "volume": 15000.0,
+    "lastTradedDatetime": "2026-06-14T08:31:11Z",
+    "yeldNet": 2.5,
+    "yeldGross": 3.0
+  }
+}

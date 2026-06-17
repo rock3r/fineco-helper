@@ -396,7 +396,7 @@ impl Gateway {
 
     #[tool(
         name = "market_get_asset_details",
-        description = "Authenticated Fineco stock/ETF details for a venue-qualified identifier such as NASDAQ/AAPL or AFF/VHYL. Defaults to lightweight identity/listing/quote/profile/core asset sections; heavy ETF sections and stock ratios require explicit section names."
+        description = "Authenticated Fineco stock, ETF, and bond details for a venue-qualified identifier such as NASDAQ/AAPL, AFF/VHYL, or a bond's venue plus ISIN. Defaults to lightweight identity, listing, and quote plus the asset-type core section (profile for stocks/ETFs; coupon/maturity/yield/rating fixed-income facts for bonds). Heavy ETF sections (holdings, exposures, returns, risk) and stock ratios require explicit section names."
     )]
     pub async fn market_get_asset_details(
         &self,

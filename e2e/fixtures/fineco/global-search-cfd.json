@@ -1,0 +1,32 @@
+{
+  "Azione": [],
+  "Obbligazione": [],
+  "LevaFissa": [],
+  "Turbo": [],
+  "Knockout": [],
+  "CFD": [
+    {
+      "d": "Synthetic Equity CFD",
+      "m": "CFDC",
+      "s": "SYNTHCFD.CFDC",
+      "i": "SYNTHCFD0001",
+      "c": "EUR",
+      "t": "CFD",
+      "lg": "SYNTHCFD0001"
+    }
+  ],
+  "FxCfd": [],
+  "ETF": [],
+  "resultCounter": [
+    {
+      "Azione": 0,
+      "Obbligazione": 0,
+      "LevaFissa": 0,
+      "Turbo": 0,
+      "Knockout": 0,
+      "CFD": 1,
+      "FxCfd": 0,
+      "ETF": 0
+    }
+  ]
+}

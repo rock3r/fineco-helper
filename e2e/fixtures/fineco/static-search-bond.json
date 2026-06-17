@@ -1,0 +1,28 @@
+{
+  "IT0005560948.MOT": {
+    "instrId": "IT0005560948",
+    "venueSystem": "MOT",
+    "description": "Synthetic Italian Government Bond",
+    "symbol": "T56094.MOT",
+    "currencyCd": "EUR",
+    "preferredVenue": "MOT",
+    "newType": "Obbligazione",
+    "instrTyp": "BND",
+    "bondCouponRate": 2.0,
+    "bondCouponTyp": "FISSO",
+    "bondFrequency": "SEM.",
+    "bondExpiryDate": "01/07/2034",
+    "bondMaturityDate": "01/07/2026",
+    "bondAccruedInterestRate": 1.5,
+    "bondSubordinate": "N",
+    "bondParValue": 1.0,
+    "bondIssueDate": "01/03/2024",
+    "issueDate": "29/02/2024",
+    "bondIssuePrice": 99.5,
+    "minQty": 1000.0,
+    "issuerRating": "BBB",
+    "bailin": 0,
+    "flagPriips": "N",
+    "valueAtRisk": 10.0
+  }
+}
