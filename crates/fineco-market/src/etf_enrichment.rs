@@ -2,8 +2,10 @@
 //!
 //! The enrichment page server-renders a fund "basics" table whose rows are keyed
 //! by stable, locale-independent `data-testid` attributes
-//! (`tl_etf-basics_value_<key>`), plus a header that echoes the page ISIN. We scan
-//! that markup textually and read each value as **data** — there is no `eval`,
+//! (`tl_etf-basics_value_<key>`), plus a header that echoes the page ISIN and the
+//! fund size under their own value-only anchors (the basics-table fund-size cell
+//! keys only an empty trend-indicator span, so the value is read from the header).
+//! We scan that markup textually and read each value as **data** — there is no `eval`,
 //! `Function`, or DOM/JS engine anywhere in this path. Every extracted string is
 //! control-stripped and length-bounded before it leaves this module.
 
@@ -71,7 +73,12 @@ pub(crate) fn build_etf_report(
 
     let isin = field(html, "etf-profile-header_isin-value").unwrap_or_default();
     let ter_percent = field(html, "tl_etf-basics_value_ter").and_then(|raw| parse_percent(&raw));
-    let fund_size = field(html, "tl_etf-basics_value_fund-size_indicator")
+    // The basics table keys fund size only on an empty trailing trend-indicator span
+    // (`tl_etf-basics_value_fund-size_indicator`); the value itself is an unkeyed text
+    // node in an unkeyed wrapper, with no value-only testid. The header carries the
+    // same number under a value-only anchor, so read it there (consistent with the ISIN
+    // header read above).
+    let fund_size = field(html, "etf-profile-header_fund-size-value-wrapper")
         .and_then(|raw| parse_fund_size(&raw));
     let volatility_1y_percent =
         field(html, "tl_etf-basics_value_volatility").and_then(|raw| parse_percent(&raw));
@@ -374,13 +381,14 @@ mod tests {
             "<html><body>\
              <span data-testid=\"etf-profile-header_etf-name\">Synthetic World ETF</span>\
              <span data-testid=\"etf-profile-header_isin-value\">{isin}</span>\
+             <div class=\"val bold\" data-testid=\"etf-profile-header_fund-size-value-wrapper\"> <span> EUR 8,622 </span> m <span class=\"indicator-3 indicator-3--green ml-2\" data-testid=\"etf-profile-header_fund-size-indicator\"></span> </div>\
              <table><tbody>\
              <tr><td class=\"vallabel\">Index</td>\
                <td class=\"val\" data-testid=\"tl_etf-basics_value_index-name\">Synthetic World Index</td></tr>\
              <tr><td>Investment focus</td>\
                <td data-testid=\"tl_etf-basics_value_investment-focus\">Equity, World</td></tr>\
-             <tr><td>Fund size</td>\
-               <td data-testid=\"tl_etf-basics_value_fund-size_indicator\"> <span> EUR 8,622 </span> m <span class=\"indicator-3\">x</span></td></tr>\
+             <tr data-testid=\"etf-basics_row_fund-size\"><td class=\"vallabel\" data-testid=\"etf-basics_label_fund-size\">Fund size</td>\
+               <td><div> EUR 8,622 m <span class=\"indicator-3 indicator-3--green ml-2\" data-testid=\"tl_etf-basics_value_fund-size_indicator\"></span></div></td></tr>\
              <tr><td>TER</td>\
                <td data-testid=\"tl_etf-basics_value_ter\">0.29% p.a.</td></tr>\
              <tr><td>Replication</td>\
@@ -464,7 +472,7 @@ mod tests {
             <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
             <td data-testid=\"tl_etf-basics_value_ter\">NaN% p.a.</td>\
             <td data-testid=\"tl_etf-basics_value_volatility\">inf%</td>\
-            <td data-testid=\"tl_etf-basics_value_fund-size_indicator\">EUR 1e309 m</td>\
+            <div data-testid=\"etf-profile-header_fund-size-value-wrapper\">EUR 1e309 m</div>\
             <td data-testid=\"tl_etf-basics_value_domicile-country\">Ireland</td>\
             </body></html>";
         let report = build_etf_report(html, HOST, "t", None).expect("parse");
@@ -490,7 +498,7 @@ mod tests {
             <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
             <td data-testid=\"tl_etf-basics_value_index-name\">S&amp;P 500&reg;</td>\
             <td data-testid=\"tl_etf-basics_value_ter\">0.29&nbsp;% p.a.</td>\
-            <td data-testid=\"tl_etf-basics_value_fund-size_indicator\">EUR&nbsp;8,622 m</td>\
+            <div data-testid=\"etf-profile-header_fund-size-value-wrapper\">EUR&nbsp;8,622 m</div>\
             <td data-testid=\"tl_etf-basics_value_fund-provider\">Acme &#39;Funds&#39;</td>\
             </body></html>";
         let report = build_etf_report(html, HOST, "t", None).expect("parse");
@@ -524,7 +532,7 @@ mod tests {
         // `</td>` and bleed later rows — and a comment may even contain a `>`.
         let html = "<html><body>\
             <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
-            <td data-testid=\"tl_etf-basics_value_fund-size_indicator\">EUR<!-- a > b -->8,622 m</td>\
+            <div data-testid=\"etf-profile-header_fund-size-value-wrapper\">EUR<!-- a > b -->8,622 m</div>\
             <td data-testid=\"tl_etf-basics_value_domicile-country\">Ireland</td>\
             </body></html>";
         let report = build_etf_report(html, HOST, "t", None).expect("parse");
@@ -590,6 +598,34 @@ mod tests {
             !domicile.chars().any(char::is_control),
             "control char survived: {domicile:?}"
         );
+    }
+
+    #[test]
+    fn fund_size_is_read_from_header_value_wrapper() {
+        // Live shape: the basics-table `tl_etf-basics_value_fund-size_indicator` testid
+        // is on an EMPTY trailing trend-indicator span, NOT the value. The value is an
+        // unkeyed text node in an unkeyed div preceding it, so the only value-only
+        // anchor is the header wrapper (`etf-profile-header_fund-size-value-wrapper`).
+        let html = "<html><body>\
+            <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
+            <div class=\"val bold\" data-testid=\"etf-profile-header_fund-size-value-wrapper\"> <span> EUR 129,586 </span> m <span class=\"indicator-3 indicator-3--green ml-2\" data-testid=\"etf-profile-header_fund-size-indicator\"></span> </div>\
+            <table><tbody>\
+            <tr data-testid=\"etf-basics_row_fund-size\">\
+              <td class=\"vallabel\" data-testid=\"etf-basics_label_fund-size\"> Fund size </td>\
+              <td><div> EUR 129,586 m <span class=\"indicator-3 indicator-3--green ml-2\" data-testid=\"tl_etf-basics_value_fund-size_indicator\"></span></div></td></tr>\
+            <tr data-testid=\"etf-basics_row_domicile-country\">\
+              <td class=\"vallabel\" data-testid=\"etf-basics_label_domicile-country\"> Fund domicile </td>\
+              <td class=\"val\" data-testid=\"tl_etf-basics_value_domicile-country\">Ireland</td></tr>\
+            </tbody></table>\
+            </body></html>";
+        let report = build_etf_report(html, HOST, "t", None).expect("parse");
+        let size = report
+            .fund_size
+            .expect("fund size from header value-wrapper");
+        assert_eq!(size.value, 129_586.0);
+        assert_eq!(size.unit, "EUR million");
+        // The empty basics-table indicator span must not be mistaken for the value.
+        assert_eq!(report.domicile.as_deref(), Some("Ireland"));
     }
 
     #[test]
