@@ -304,7 +304,9 @@ fn is_void_tag(tag: &str) -> bool {
 /// Parse a leading percentage like "0.29% p.a." or "8.22%" into a bare f64.
 fn parse_percent(raw: &str) -> Option<f64> {
     let head = raw.split('%').next()?.trim();
-    head.parse::<f64>().ok()
+    // Reject non-finite: `f64::parse` accepts "NaN"/"inf" and overflows to inf, none
+    // of which is a valid percentage to surface.
+    head.parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
 /// Parse a fund-size cell like "EUR 8,622 m" into a magnitude + "currency scale"
@@ -317,7 +319,11 @@ fn parse_fund_size(raw: &str) -> Option<EtfFundSize> {
     for token in raw.split_whitespace() {
         if magnitude.is_none() && token.chars().any(|c| c.is_ascii_digit()) {
             let digits: String = token.chars().filter(|c| *c != ',').collect();
-            if let Ok(value) = digits.parse::<f64>() {
+            // `f64::parse` accepts NaN/inf and overflows large exponents to inf;
+            // reject non-finite so a hostile/garbled cell can't surface as a value.
+            if let Ok(value) = digits.parse::<f64>()
+                && value.is_finite()
+            {
                 magnitude = Some(value);
                 continue;
             }
@@ -448,6 +454,31 @@ mod tests {
         let report = build_etf_report(&html, HOST, "2026-06-17T09:00:00Z", None).expect("parse");
         assert_eq!(report.distribution_policy.as_deref(), Some("Accumulating"));
         assert_eq!(report.distribution_frequency, None);
+    }
+
+    #[test]
+    fn non_finite_numeric_values_are_dropped() {
+        // `f64::parse` accepts NaN/inf and overflows large exponents to inf. Such a
+        // value must be dropped (field absent), never surfaced as a NaN/inf number.
+        let html = "<html><body>\
+            <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
+            <td data-testid=\"tl_etf-basics_value_ter\">NaN% p.a.</td>\
+            <td data-testid=\"tl_etf-basics_value_volatility\">inf%</td>\
+            <td data-testid=\"tl_etf-basics_value_fund-size_indicator\">EUR 1e309 m</td>\
+            <td data-testid=\"tl_etf-basics_value_domicile-country\">Ireland</td>\
+            </body></html>";
+        let report = build_etf_report(html, HOST, "t", None).expect("parse");
+        assert_eq!(report.ter_percent, None, "NaN TER must be dropped");
+        assert_eq!(
+            report.volatility_1y_percent, None,
+            "inf volatility must be dropped"
+        );
+        assert!(
+            report.fund_size.is_none(),
+            "overflowing fund size must be dropped"
+        );
+        // A normal sibling field still parses (the page is otherwise usable).
+        assert_eq!(report.domicile.as_deref(), Some("Ireland"));
     }
 
     #[test]
