@@ -15,9 +15,9 @@ use fineco_gateway::Gateway;
 use fineco_ipc::{
     MarketAssetDetailsResult, MarketAssetIdentity, MarketAssetSections, MarketAssetType,
     MarketControlClient, MarketControlOutcome, MarketControlRequest, MarketDetailsParams,
-    MarketDetailsSection, MarketEnrichmentParams, MarketEtfsParams, MarketField, MarketIndexCard,
-    MarketIndexRegion, MarketIndicesParams, MarketIndicesResult, MarketSearchCandidate,
-    MarketSearchGroup, MarketSearchParams, MarketSearchResult, MarketSource, MarketWarning, Policy,
+    MarketDetailsSection, MarketEtfsParams, MarketField, MarketIndexCard, MarketIndexRegion,
+    MarketIndicesParams, MarketIndicesResult, MarketSearchCandidate, MarketSearchGroup,
+    MarketSearchParams, MarketSearchResult, MarketSource, MarketWarning, Policy,
     serve_market_control_blocking,
 };
 use fineco_market::{EnrichmentHostAllowlist, MarketClient};
@@ -44,7 +44,6 @@ fn owner_all_market_policy() -> Policy {
 }
 
 const ETF_PATH: &str = "/common-pvt/js/json/etf-zero/etf_piu_scambiati.json";
-const ENRICHMENT_ID: &str = "BIT/TIP";
 /// The market tools never reach the store socket; this path is never bound.
 const UNUSED_SOCKET: &str = "/tmp/fineco-gateway-market-unused.sock";
 static SOCKET_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -328,41 +327,6 @@ async fn etf_tool_applies_the_query_filter() {
 }
 
 #[tokio::test]
-async fn enrichment_tool_answers_from_the_mock() {
-    let enrichment = spawn(|req| {
-        let path = req.path.split('?').next().unwrap_or(&req.path);
-        if req.method == "GET" && path == "/stock/BIT/TIP" {
-            mock_enrichment::route(&httptiny::Request {
-                method: req.method.clone(),
-                path: "/stocks/it/diversified-financials/syn-tip/synth-shares".to_string(),
-                headers: req.headers.clone(),
-                body: String::new(),
-            })
-        } else {
-            httptiny::Response::not_found()
-        }
-    });
-    let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
-        .with_policy(owner_policy());
-
-    let report = gateway
-        .market_get_stock_enrichment(Parameters(MarketEnrichmentParams {
-            identifier: ENRICHMENT_ID.to_string(),
-            expected_isin: Some("IT0003153621".to_string()),
-        }))
-        .await
-        .expect("enrichment tool")
-        .0;
-    assert_eq!(
-        report.company.name,
-        "SYNTHETIC Tamburi Investment Partners SpA"
-    );
-    assert_eq!(report.company.isin, "IT0003153621");
-    assert_eq!(report.source_url, format!("{enrichment}/stock/BIT/TIP"));
-}
-
-#[tokio::test]
 async fn authenticated_market_search_routes_through_the_controller_socket() {
     let path = market_control_socket_path();
     let listener = UnixListener::bind(&path).expect("bind market-control socket");
@@ -567,7 +531,7 @@ async fn asset_details_can_fold_stock_external_enrichment_outside_the_worker() {
 }
 
 #[tokio::test]
-async fn folded_external_enrichment_matches_the_wrapper_payload() {
+async fn folded_external_enrichment_returns_the_full_report_payload() {
     let enrichment = spawn(|req| {
         let path = req.path.split('?').next().unwrap_or(&req.path);
         if req.method == "GET" && path == "/stock/BIT/TIP" {
@@ -605,14 +569,6 @@ async fn folded_external_enrichment_matches_the_wrapper_payload() {
         .with_market(market_client(&enrichment, "http://127.0.0.1:9/etf"))
         .with_market_control_client(MarketControlClient::new(&path));
 
-    let wrapper = gateway
-        .market_get_stock_enrichment(Parameters(MarketEnrichmentParams {
-            identifier: "BIT/TIP".to_string(),
-            expected_isin: Some("IT0003153621".to_string()),
-        }))
-        .await
-        .expect("wrapper enrichment")
-        .0;
     let folded = gateway
         .market_get_asset_details(Parameters(MarketDetailsParams {
             identifier: "BIT/TIP".to_string(),
@@ -626,16 +582,17 @@ async fn folded_external_enrichment_matches_the_wrapper_payload() {
         .external_enrichment
         .expect("external enrichment section");
 
-    assert_eq!(folded.company.name, wrapper.company.name);
-    assert_eq!(folded.company.ticker, wrapper.company.ticker);
-    assert_eq!(folded.company.exchange, wrapper.company.exchange);
-    assert_eq!(folded.company.isin, wrapper.company.isin);
-    assert_eq!(folded.company.country, wrapper.company.country);
-    assert_eq!(folded.company.website, wrapper.company.website);
-    assert_eq!(folded.company.description, wrapper.company.description);
-    assert_eq!(folded.scores, wrapper.scores);
-    assert_eq!(folded.metrics, wrapper.metrics);
-    assert_eq!(folded.warnings, wrapper.warnings);
+    // An external-enrichment-only request (the socket handler above asserts the
+    // worker is asked for `identity` only) still yields the full enrichment report
+    // the standalone tool used to return: data-class tag, source URL, and the
+    // parsed company overview.
+    assert_eq!(folded.data_class, "external_enrichment");
+    assert_eq!(folded.source_url, format!("{enrichment}/stock/BIT/TIP"));
+    assert_eq!(
+        folded.company.name,
+        "SYNTHETIC Tamburi Investment Partners SpA"
+    );
+    assert_eq!(folded.company.isin, "IT0003153621");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1112,33 +1069,6 @@ async fn authenticated_market_search_requires_the_authenticated_capability() {
         Err(err) => err,
     };
     assert!(err.message.contains("policy"), "message: {}", err.message);
-}
-
-#[tokio::test]
-async fn enrichment_tool_rejects_an_empty_identifier_before_any_request() {
-    // Bounds validation runs at the gateway before the market client; an empty
-    // identifier is a safe validation error even pointed at a dead port.
-    let gateway = Gateway::new(UNUSED_SOCKET)
-        .with_market(market_client(
-            "http://127.0.0.1:9",
-            "http://127.0.0.1:9/etf",
-        ))
-        .with_policy(owner_policy());
-    let err = match gateway
-        .market_get_stock_enrichment(Parameters(MarketEnrichmentParams {
-            identifier: String::new(),
-            expected_isin: None,
-        }))
-        .await
-    {
-        Ok(_) => panic!("empty identifier must be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        err.message.contains("identifier"),
-        "message: {}",
-        err.message
-    );
 }
 
 #[tokio::test]

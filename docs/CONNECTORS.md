@@ -80,15 +80,16 @@ On a **dual-pin** deployment the two Access channels are scoped differently:
   `market_search_asset`, `market_get_asset_details`, `market_get_indices`.
   Those are hidden from `tools/list` and refused by `tools/call` on the connector
   channel. This also hides the `external_enrichment` details section by default,
-  because that section is available only through `market_get_asset_details`;
-  the standalone `market_get_stock_enrichment` wrapper remains the
-  connector-visible credential-free enrichment path.
+  because that section is available only through `market_get_asset_details`. With
+  the standalone `market_get_stock_enrichment` wrapper removed, third-party stock
+  enrichment is reachable **only** through that authenticated details path, so it
+  is not available on the default connector channel at all — surface it explicitly
+  via `FINECO_CONNECTOR_TOOLS` or use the CLI channel.
 
 Everything else — `portfolio_get_freshness`, `portfolio_get_latest_shareable_report`,
 `portfolio_get_allocation_history`, `orders_get_latest_monitor`, both tax tools,
-the public/third-party market tools (`market_get_zero_commission_etfs`,
-`market_get_stock_enrichment`), and all three `private_*_refresh_live_sensitive`
-tools — is in the default connector set.
+the public market tool (`market_get_zero_commission_etfs`), and all three
+`private_*_refresh_live_sensitive` tools — is in the default connector set.
 
 Override it per deployment with `FINECO_CONNECTOR_TOOLS` in `/etc/fineco/access.env`:
 
