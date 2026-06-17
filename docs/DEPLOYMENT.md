@@ -187,7 +187,7 @@ committed.
 | --- | --- | --- | --- |
 | `policy.json` | `0640 root:fineco-policy` | gateway + store-server | capability policy (required; non-secret) |
 | `access.env` | `0640 root:fineco-gateway` | gateway drop-in | Cloudflare Access issuer/audience/JWKS (required — fail-closed) + the service-token `FINECO_ACCESS_OWNER_COMMON_NAME` pin |
-| `enrichment.env` | `0640 root:fineco-gateway` | gateway drop-in | enrichment host base + SHA-256 host hash(es); both present → market tools on, absent → off. The enrichment host is **config-only**. |
+| `enrichment.env` | `0640 root:fineco-gateway` | gateway drop-in | two **independent** config-only host pairs: stock enrichment (`FINECO_ENRICHMENT_BASE` + `FINECO_ENRICHMENT_HOST_HASHES`) and ISIN-keyed ETF enrichment (`FINECO_ETF_ENRICHMENT_BASE` + `FINECO_ETF_ENRICHMENT_HOST_HASHES`). Each pair: both present → that route on, one alone → fail closed. **Either** pair enables the market tools; neither → off. Both hosts are **config-only** (never in source). |
 | `cloudflared.env` | `0600 root:root` | `cloudflared` unit | `TUNNEL_TOKEN` (the tunnel credential) |
 | `private-worker.env` | `0640 root:fineco-worker` | private-worker unit (M8) | `FINECO_USER_ID` + `FINECO_PASSWORD` (the Fineco credential — **only `fineco-worker` can read it**) |
 | `backup.env` | `0640 root:fineco-store` | backup unit (M8) | `FINECO_BACKUP_AGE_RECIPIENT` (the age **public** key; the private identity stays offline) + optional `FINECO_BACKUP_DIR` |
@@ -274,7 +274,7 @@ Process-specific:
   the private netns).
 - **gateway** allows `AF_INET`/`AF_INET6` (the loopback bind) + `AF_UNIX` (the
   socket); its real egress is **pinned by the firewall** to its resolved targets
-  (CF JWKS + enrichment + ETF) via `meta skuid "fineco-gateway"`, so a compromised
+  (CF JWKS + stock & ETF enrichment hosts + ETF list) via `meta skuid "fineco-gateway"`, so a compromised
   gateway can't exfiltrate cached private data to an arbitrary host — see *Live
   refresh* for the egress-set + the loopback-first ordering and the host check.
 - **private-worker** (M8) keeps the network for Fineco (`AF_UNIX AF_INET

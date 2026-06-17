@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use ureq::Agent;
 
 use crate::build_enrichment_report;
+use crate::etf_enrichment::{EtfEnrichmentReport, build_etf_report};
 use crate::report::{EnrichmentReport, normalize_expected_isin};
-use crate::source::{EnrichmentHostAllowlist, validate_fetch_target};
+use crate::source::{EnrichmentHostAllowlist, validate_etf_fetch_target, validate_fetch_target};
 
 /// Cap the enrichment page read at the network layer (matches the parser's page
 /// cap), so an oversized response is bounded as it is read, not after.
@@ -85,20 +86,39 @@ pub struct ZeroCommissionEtfs {
     pub instruments: Vec<ZeroCommissionEtf>,
 }
 
-/// Config + agent for the market reads. Construct with the enrichment base URL
-/// and host allowlist, plus the public ETF list URL. The enrichment base must be
-/// HTTPS in production; only the local mock uses plain HTTP.
+/// Config + agent for the market reads. The public ETF list always works; stock
+/// enrichment and ETF reference-data enrichment are **independently optional**
+/// (each its own configured host + allowlist), enabled via the builder methods.
+/// Production hosts must be HTTPS; only the local mock uses plain HTTP.
 pub struct MarketClient {
     agent: Agent,
-    enrichment_base: String,
-    allowlist: EnrichmentHostAllowlist,
+    stock_enrichment: Option<StockEnrichmentConfig>,
     zero_commission_etfs_url: String,
+    etf_enrichment: Option<EtfEnrichmentConfig>,
+}
+
+/// Config for the stock enrichment route: the scheme+host the server prepends to
+/// the fixed stock-page route, plus the host allowlist that pins it.
+struct StockEnrichmentConfig {
+    base: String,
+    allowlist: EnrichmentHostAllowlist,
+}
+
+/// Config for the ETF reference-data enrichment route: the scheme+host the server
+/// prepends to the fixed ISIN-keyed profile route, plus the host allowlist that
+/// pins it. Independent of the stock-enrichment host (a separate allowlist), so
+/// the two surfaces cannot widen each other.
+struct EtfEnrichmentConfig {
+    base: String,
+    allowlist: EnrichmentHostAllowlist,
 }
 
 impl MarketClient {
-    /// Build a client. `enrichment_base` is the scheme+host the server prepends
-    /// to a fixed stock-page route; `allowlist` pins the acceptable host(s);
-    /// `zero_commission_etfs_url` is the public ETF list endpoint.
+    /// Build a client with stock enrichment enabled. `enrichment_base` is the
+    /// scheme+host the server prepends to a fixed stock-page route; `allowlist`
+    /// pins the acceptable host(s); `zero_commission_etfs_url` is the public ETF
+    /// list endpoint. Convenience wrapper over [`MarketClient::list_only`] +
+    /// [`MarketClient::with_stock_enrichment`].
     #[must_use]
     pub fn new(
         enrichment_base: impl Into<String>,
@@ -123,10 +143,28 @@ impl MarketClient {
         zero_commission_etfs_url: impl Into<String>,
         fetch_timeout: std::time::Duration,
     ) -> Self {
-        // Handle non-2xx ourselves and never follow redirects: a stock page is
-        // fetched at its canonical URL, and we do not chase untrusted hops. Bound
-        // the whole fetch so a CDN/upstream that accepts the connection but stalls
-        // cannot pin a gateway worker thread forever (mirrors the JWKS posture).
+        Self::list_only_with_timeout(zero_commission_etfs_url, fetch_timeout)
+            .with_stock_enrichment(enrichment_base, allowlist)
+    }
+
+    /// Build a client with **no** enrichment configured — only the public ETF
+    /// list. Stock and ETF enrichment are layered on via the builder methods, so a
+    /// deployment can enable either, both, or neither independently.
+    #[must_use]
+    pub fn list_only(zero_commission_etfs_url: impl Into<String>) -> Self {
+        Self::list_only_with_timeout(zero_commission_etfs_url, MARKET_FETCH_TIMEOUT)
+    }
+
+    /// Like [`MarketClient::list_only`] but with an explicit global fetch timeout.
+    #[must_use]
+    pub fn list_only_with_timeout(
+        zero_commission_etfs_url: impl Into<String>,
+        fetch_timeout: std::time::Duration,
+    ) -> Self {
+        // Handle non-2xx ourselves and never follow redirects: a page is fetched at
+        // its canonical URL, and we do not chase untrusted hops. Bound the whole
+        // fetch so a CDN/upstream that accepts the connection but stalls cannot pin
+        // a gateway worker thread forever (mirrors the JWKS posture).
         let config = Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
@@ -139,10 +177,55 @@ impl MarketClient {
             .build();
         Self {
             agent: Agent::new_with_config(config),
-            enrichment_base: enrichment_base.into(),
-            allowlist,
+            stock_enrichment: None,
             zero_commission_etfs_url: zero_commission_etfs_url.into(),
+            etf_enrichment: None,
         }
+    }
+
+    /// Enable the stock enrichment route. `base` is the scheme+host the server
+    /// prepends to the fixed stock-page route; `allowlist` pins the acceptable
+    /// host(s) for that route only.
+    #[must_use]
+    pub fn with_stock_enrichment(
+        mut self,
+        base: impl Into<String>,
+        allowlist: EnrichmentHostAllowlist,
+    ) -> Self {
+        self.stock_enrichment = Some(StockEnrichmentConfig {
+            base: base.into(),
+            allowlist,
+        });
+        self
+    }
+
+    /// Enable the ETF reference-data enrichment route. `base` is the scheme+host
+    /// the server prepends to the fixed ISIN-keyed profile route; `allowlist` pins
+    /// the acceptable host(s) for that route only. Without this, ETF enrichment is
+    /// unconfigured and callers receive a clean "unconfigured" path.
+    #[must_use]
+    pub fn with_etf_enrichment(
+        mut self,
+        base: impl Into<String>,
+        allowlist: EnrichmentHostAllowlist,
+    ) -> Self {
+        self.etf_enrichment = Some(EtfEnrichmentConfig {
+            base: base.into(),
+            allowlist,
+        });
+        self
+    }
+
+    /// Whether the stock enrichment route is configured.
+    #[must_use]
+    pub fn stock_enrichment_enabled(&self) -> bool {
+        self.stock_enrichment.is_some()
+    }
+
+    /// Whether the ETF enrichment route is configured.
+    #[must_use]
+    pub fn etf_enrichment_enabled(&self) -> bool {
+        self.etf_enrichment.is_some()
     }
 
     /// The configured zero-commission ETF list URL (the default Fineco endpoint
@@ -158,8 +241,8 @@ impl MarketClient {
     /// `captured_at`.
     ///
     /// # Errors
-    /// - [`SafeError::invalid_request`] for an unsafe identifier, a non-pinned
-    ///   host, or an unparseable page.
+    /// - [`SafeError::invalid_request`] if stock enrichment is not configured, for
+    ///   an unsafe identifier, a non-pinned host, or an unparseable page.
     /// - Upstream/internal envelopes on transport failure.
     pub fn fetch_enrichment(
         &self,
@@ -167,19 +250,57 @@ impl MarketClient {
         expected_isin: Option<&str>,
         now_iso: &str,
     ) -> Result<EnrichmentReport, SafeError> {
+        let config = self
+            .stock_enrichment
+            .as_ref()
+            .ok_or_else(|| SafeError::invalid_request("Stock enrichment is not configured."))?;
         let normalized_identifier = normalize_identifier(identifier)?;
         let normalized_expected_isin = normalize_expected_isin(expected_isin)?;
         let url = format!(
             "{}{}",
-            self.enrichment_base.trim_end_matches('/'),
+            config.base.trim_end_matches('/'),
             enrichment_path(&normalized_identifier)
         );
         // Defense in depth: even though the base is trusted config, confirm the
         // built URL still hits a pinned host and a stock-page path.
-        validate_fetch_target(&url, &self.allowlist)?;
+        validate_fetch_target(&url, &config.allowlist)?;
 
         let html = self.get_text(&url)?;
         build_enrichment_report(&html, &url, now_iso, normalized_expected_isin.as_deref())
+    }
+
+    /// Fetch and parse the ETF reference-data report for an `isin`. The server
+    /// builds the one allowlisted, ISIN-keyed profile URL; `expected_isin`, when
+    /// present, verifies the parsed page; `now_iso` stamps `captured_at`.
+    ///
+    /// # Errors
+    /// - [`SafeError::invalid_request`] if ETF enrichment is not configured, the
+    ///   ISIN is malformed, the built URL is not host-/path-allowed, or the page is
+    ///   unparseable / its ISIN disagrees with `expected_isin`.
+    /// - Upstream/internal envelopes on transport failure.
+    pub fn fetch_etf_enrichment(
+        &self,
+        isin: &str,
+        expected_isin: Option<&str>,
+        now_iso: &str,
+    ) -> Result<EtfEnrichmentReport, SafeError> {
+        let config = self
+            .etf_enrichment
+            .as_ref()
+            .ok_or_else(|| SafeError::invalid_request("ETF enrichment is not configured."))?;
+        let isin = fineco_core::normalize_expected_isin(isin)?;
+        let normalized_expected_isin = normalize_expected_isin(expected_isin)?;
+        let url = format!(
+            "{}{}",
+            config.base.trim_end_matches('/'),
+            etf_enrichment_path(&isin)
+        );
+        // Defense in depth: the base is trusted config, but confirm the built URL
+        // still hits the pinned ETF host and an ETF-profile path.
+        validate_etf_fetch_target(&url, &config.allowlist)?;
+
+        let html = self.get_text(&url)?;
+        build_etf_report(&html, &url, now_iso, normalized_expected_isin.as_deref())
     }
 
     /// Fetch and parse the public zero-commission ETF list. `now_iso` stamps
@@ -339,6 +460,12 @@ fn normalize_identifier(identifier: &str) -> Result<String, SafeError> {
 
 fn enrichment_path(identifier: &str) -> String {
     format!("/stock/{identifier}")
+}
+
+/// The fixed ISIN-keyed ETF-profile route. `isin` is already validated/normalized
+/// (12 uppercase alphanumerics), so it is URL-safe to interpolate into the query.
+fn etf_enrichment_path(isin: &str) -> String {
+    format!("/en/etf-profile.html?isin={isin}")
 }
 
 fn looks_like_market_code(segment: &str) -> bool {

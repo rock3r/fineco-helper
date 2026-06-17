@@ -95,6 +95,12 @@ if grep -qE "^FINECO_ENRICHMENT_BASE=[\"']?[^[:space:]\"']" "$ENRICHMENT_ENV" 2>
         GATEWAY_HOSTS+=(images.finecobank.com)
     fi
 fi
+# The ETF reference-data enrichment host — config-only, NEVER hardcoded here — is
+# allowlisted only when its own pair is configured (GatewayConfig layers it onto the
+# market client; without it the gateway never calls that host).
+if grep -qE "^FINECO_ETF_ENRICHMENT_BASE=[\"']?[^[:space:]\"']" "$ENRICHMENT_ENV" 2>/dev/null; then
+    add_gateway_host FINECO_ETF_ENRICHMENT_BASE "$ENRICHMENT_ENV"
+fi
 
 resolve4() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u; }
 resolve6() { getent ahostsv6 "$1" 2>/dev/null | awk '{print $1}' | sort -u; }

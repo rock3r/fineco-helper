@@ -19,14 +19,15 @@ use crate::access::AuthChannel;
 use fineco_ipc::{
     AllocationHistoryDto, Capability, Client, FreshnessReportDto, FullSnapshotDto, HistoryParams,
     MarketAssetDetailsResult, MarketControlClient, MarketControlOutcome, MarketControlRequest,
-    MarketDetailsParams, MarketDetailsSection, MarketEtfsParams, MarketExternalCompanyOverview,
-    MarketExternalEnrichmentSection, MarketIndicesParams, MarketIndicesResult, MarketSearchParams,
-    MarketSearchResult, MarketSource, MarketWarning, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams,
-    Policy, PortfolioHistoryDto, PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams,
-    RefreshClient, RefreshOutcome, RefreshRequest, Request, ResponseBody, SafeErrorDto,
-    ShareableReportDto, TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
+    MarketDetailsParams, MarketDetailsSection, MarketEtfExternalEnrichment, MarketEtfsParams,
+    MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketField,
+    MarketIndicesParams, MarketIndicesResult, MarketSearchParams, MarketSearchResult, MarketSource,
+    MarketWarning, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams, Policy, PortfolioHistoryDto,
+    PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams, RefreshClient, RefreshOutcome,
+    RefreshRequest, Request, ResponseBody, SafeErrorDto, ShareableReportDto,
+    TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
 };
-use fineco_market::{EnrichmentReport, MarketClient, ZeroCommissionEtfs};
+use fineco_market::{EnrichmentReport, EtfEnrichmentReport, MarketClient, ZeroCommissionEtfs};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams, ServerInfo,
@@ -895,19 +896,33 @@ impl Gateway {
         params: &MarketDetailsParams,
         details: &mut MarketAssetDetailsResult,
     ) -> Result<(), (String, ErrorData)> {
-        if details.asset.asset_type.value != fineco_ipc::MarketAssetType::Stock {
-            push_bounded_details_warning(
-                &mut details.warnings,
-                MarketWarning {
-                    code: "external_enrichment_unsupported_asset_type".to_string(),
-                    message: "external_enrichment is available for stock details only.".to_string(),
-                },
-            );
-            return Ok(());
+        match details.asset.asset_type.value {
+            fineco_ipc::MarketAssetType::Stock => {
+                self.append_stock_enrichment(params, details).await
+            }
+            fineco_ipc::MarketAssetType::Etf => self.append_etf_enrichment(params, details).await,
+            _ => {
+                push_bounded_details_warning(
+                    &mut details.warnings,
+                    MarketWarning {
+                        code: "external_enrichment_unsupported_asset_type".to_string(),
+                        message: "external_enrichment is available for stock and ETF details only."
+                            .to_string(),
+                    },
+                );
+                Ok(())
+            }
         }
+    }
+
+    async fn append_stock_enrichment(
+        &self,
+        params: &MarketDetailsParams,
+        details: &mut MarketAssetDetailsResult,
+    ) -> Result<(), (String, ErrorData)> {
         let market = match self.market() {
-            Ok(market) => market,
-            Err(_) => {
+            Ok(market) if market.stock_enrichment_enabled() => market,
+            _ => {
                 push_bounded_details_warning(
                     &mut details.warnings,
                     MarketWarning {
@@ -989,6 +1004,96 @@ impl Gateway {
             },
         );
         details.sections.external_enrichment = Some(external_enrichment_section(report));
+        Ok(())
+    }
+
+    async fn append_etf_enrichment(
+        &self,
+        params: &MarketDetailsParams,
+        details: &mut MarketAssetDetailsResult,
+    ) -> Result<(), (String, ErrorData)> {
+        let market = match self.market() {
+            Ok(market) if market.etf_enrichment_enabled() => market,
+            _ => {
+                push_bounded_details_warning(
+                    &mut details.warnings,
+                    MarketWarning {
+                        code: "external_enrichment_unconfigured".to_string(),
+                        message: "ETF external enrichment is not configured; Fineco details are returned without that supplemental section.".to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        // ETF enrichment is keyed by Fineco's canonical ISIN; without it we cannot
+        // build the source URL, so surface a warning rather than guessing.
+        let Some(fineco_isin) = details.asset.isin.as_ref().map(|isin| isin.value.clone()) else {
+            push_bounded_details_warning(
+                &mut details.warnings,
+                MarketWarning {
+                    code: "external_enrichment_missing_isin".to_string(),
+                    message: "ETF external enrichment requires an ISIN, which Fineco did not provide; the supplemental section is omitted.".to_string(),
+                },
+            );
+            return Ok(());
+        };
+        let lookup_isin = fineco_isin.clone();
+        let expected_isin = params.expected_isin.clone();
+        let now = fineco_core::now_iso8601_utc();
+        let start = std::time::Instant::now();
+        let report_result = tokio::task::spawn_blocking(move || {
+            market.fetch_etf_enrichment(&lookup_isin, expected_isin.as_deref(), &now)
+        })
+        .await
+        .map_err(|_| fineco_core::SafeError::internal())
+        .and_then(std::convert::identity);
+        let report = match report_result {
+            Ok(report) => {
+                emit_external_enrichment_audit("ok", None, start.elapsed(), Some(1));
+                report
+            }
+            Err(err) => {
+                emit_external_enrichment_audit(
+                    "error",
+                    Some(err.code().to_string()),
+                    start.elapsed(),
+                    None,
+                );
+                push_bounded_details_warning(
+                    &mut details.warnings,
+                    MarketWarning {
+                        code: format!("external_enrichment_{}", err.code()),
+                        message: format!(
+                            "ETF external enrichment was unavailable; Fineco details are returned without that supplemental section. {}",
+                            err.safe_message()
+                        ),
+                    },
+                );
+                return Ok(());
+            }
+        };
+
+        if !report.isin.is_empty() && comparable_isin(&fineco_isin) != comparable_isin(&report.isin)
+        {
+            push_bounded_details_warning(
+                &mut details.warnings,
+                MarketWarning {
+                    code: "external_enrichment_isin_disagreement".to_string(),
+                    message: "Fineco and external enrichment ISIN values disagree; Fineco identity is canonical.".to_string(),
+                },
+            );
+        }
+
+        push_bounded_details_source(
+            &mut details.sources,
+            MarketSource {
+                source: "external_enrichment".to_string(),
+                data_class: "external_enrichment".to_string(),
+                source_ref: report.source_url.clone(),
+                captured_at: report.captured_at.clone(),
+            },
+        );
+        details.sections.etf_external_enrichment = Some(etf_external_enrichment_section(report));
         Ok(())
     }
 
@@ -1135,6 +1240,45 @@ fn external_enrichment_section(report: EnrichmentReport) -> MarketExternalEnrich
         },
         scores: report.scores,
         metrics: report.metrics,
+        warnings: report.warnings,
+    }
+}
+
+/// Map the parsed ETF reference report into the typed IPC section. Every value is
+/// wrapped in a `MarketField` at Medium confidence (third-party data); numerics
+/// carry units (percent / the fund-size currency). The parser already sanitized
+/// every string, so the field constructors receive clean text.
+fn etf_external_enrichment_section(report: EtfEnrichmentReport) -> MarketEtfExternalEnrichment {
+    const SRC: &str = "external_enrichment";
+    const REF: &str = "external_enrichment.basics";
+    let at = report.captured_at.as_str();
+    let number = |value: f64, unit: &str| {
+        MarketField::medium(value, Some(unit), SRC, "external_enrichment", REF, None, at)
+    };
+    let text = |value: &str| MarketField::medium_string(value, SRC, "external_enrichment", REF, at);
+    let text_field = |value: Option<String>| value.map(|v| text(&v));
+
+    MarketEtfExternalEnrichment {
+        data_class: "external_enrichment".to_string(),
+        captured_at: report.captured_at.clone(),
+        source_url: report.source_url.clone(),
+        ter: report.ter_percent.map(|v| number(v, "percent")),
+        fund_size: report.fund_size.map(|size| number(size.value, &size.unit)),
+        volatility_1y: report.volatility_1y_percent.map(|v| number(v, "percent")),
+        replication: text_field(report.replication),
+        legal_structure: text_field(report.legal_structure),
+        domicile: text_field(report.domicile),
+        fund_provider: text_field(report.fund_provider),
+        distribution_policy: text_field(report.distribution_policy),
+        distribution_frequency: text_field(report.distribution_frequency),
+        fund_currency: text_field(report.fund_currency),
+        currency_hedge: text_field(report.currency_hedge),
+        index_name: text_field(report.index_name),
+        investment_focus: text_field(report.investment_focus),
+        launch_date: text_field(report.launch_date),
+        strategy_risk: text_field(report.strategy_risk),
+        sustainable: text_field(report.sustainable),
+        securities_lending: text_field(report.securities_lending),
         warnings: report.warnings,
     }
 }

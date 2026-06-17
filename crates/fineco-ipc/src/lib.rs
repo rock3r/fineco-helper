@@ -776,6 +776,72 @@ pub struct MarketExternalEnrichmentSection {
     pub warnings: Vec<String>,
 }
 
+/// Third-party ETF reference data (the `external_enrichment` data class), keyed by
+/// ISIN. Distinct from [`MarketExternalEnrichmentSection`] (stock-oriented, plain
+/// strings + score/metric bags): ETF enrichment is a fixed set of named fund
+/// attributes, each a typed [`MarketField`] so numerics (TER, fund size, 1-year
+/// volatility) carry units and provenance like the rest of the response. Every
+/// field is optional — present only when the source exposed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct MarketEtfExternalEnrichment {
+    pub data_class: String,
+    pub captured_at: String,
+    pub source_url: String,
+    /// Total expense ratio, percent per annum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ter: Option<MarketField<f64>>,
+    /// Total fund size; `unit` carries the currency + magnitude (e.g. "EUR million").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fund_size: Option<MarketField<f64>>,
+    /// 1-year volatility, percent (as published, in the source's reference currency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volatility_1y: Option<MarketField<f64>>,
+    /// Replication method, e.g. "Physical (Optimized sampling)" / "Synthetic".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<MarketField<String>>,
+    /// Legal structure, e.g. "ETF".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legal_structure: Option<MarketField<String>>,
+    /// Fund domicile country, e.g. "Ireland".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domicile: Option<MarketField<String>>,
+    /// Fund provider / issuer, e.g. "iShares".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fund_provider: Option<MarketField<String>>,
+    /// Distribution policy, e.g. "Accumulating" / "Distributing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution_policy: Option<MarketField<String>>,
+    /// Distribution frequency, e.g. "Quarterly" (absent for accumulating funds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution_frequency: Option<MarketField<String>>,
+    /// Fund (share-class) currency, e.g. "USD".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fund_currency: Option<MarketField<String>>,
+    /// Currency hedging, e.g. "Currency unhedged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency_hedge: Option<MarketField<String>>,
+    /// Tracked index name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_name: Option<MarketField<String>>,
+    /// Investment focus, e.g. "Equity, World, Dividend".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investment_focus: Option<MarketField<String>>,
+    /// Launch / inception date, as published text (e.g. "21 May 2013").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_date: Option<MarketField<String>>,
+    /// Strategy / risk descriptor, e.g. "Long-only".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_risk: Option<MarketField<String>>,
+    /// Sustainability flag as published, e.g. "Yes" / "No".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sustainable: Option<MarketField<String>>,
+    /// Securities lending flag, e.g. "Yes" / "No".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub securities_lending: Option<MarketField<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// Normalized details sections. Missing sections mean not requested, not
 /// available, or not applicable; explicit warnings explain important absences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema, Default)]
@@ -804,6 +870,8 @@ pub struct MarketAssetSections {
     pub risk: Option<MarketRiskSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_enrichment: Option<MarketExternalEnrichmentSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etf_external_enrichment: Option<MarketEtfExternalEnrichment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2161,6 +2229,57 @@ impl RefreshClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn etf_external_enrichment_section_round_trips() {
+        let section = MarketEtfExternalEnrichment {
+            data_class: "external_enrichment".to_string(),
+            captured_at: "2026-06-17T09:00:00Z".to_string(),
+            source_url: "https://example.test/etf-profile.html?isin=IE00B5BMR087".to_string(),
+            ter: Some(MarketField::medium(
+                0.07,
+                Some("percent"),
+                "external_enrichment",
+                "external_enrichment",
+                "external_enrichment.basics",
+                None,
+                "2026-06-17T09:00:00Z",
+            )),
+            fund_size: Some(MarketField::medium(
+                129_586.0,
+                Some("EUR million"),
+                "external_enrichment",
+                "external_enrichment",
+                "external_enrichment.basics",
+                None,
+                "2026-06-17T09:00:00Z",
+            )),
+            distribution_policy: Some(MarketField::medium_string(
+                "Accumulating",
+                "external_enrichment",
+                "external_enrichment",
+                "external_enrichment.basics",
+                "2026-06-17T09:00:00Z",
+            )),
+            warnings: vec!["example warning".to_string()],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&section).expect("serialize");
+        let back: MarketEtfExternalEnrichment = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(section, back);
+        // Absent optional fields are skipped, not serialized as null.
+        assert!(!json.contains("\"domicile\""));
+        assert_eq!(back.ter.unwrap().value, 0.07);
+
+        // It slots into the sections envelope under its own key.
+        let sections = MarketAssetSections {
+            etf_external_enrichment: Some(section),
+            ..Default::default()
+        };
+        let sections_json = serde_json::to_string(&sections).expect("serialize sections");
+        assert!(sections_json.contains("etf_external_enrichment"));
+    }
 
     #[test]
     fn market_field_metadata_is_sanitized() {
