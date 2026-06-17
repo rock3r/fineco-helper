@@ -289,7 +289,16 @@ impl MarketClient {
             .as_ref()
             .ok_or_else(|| SafeError::invalid_request("ETF enrichment is not configured."))?;
         let isin = fineco_core::normalize_expected_isin(isin)?;
-        let normalized_expected_isin = normalize_expected_isin(expected_isin)?;
+        // Both ISINs are canonicalized by `normalize_expected_isin`, so a caller
+        // `expected_isin` that disagrees with the ISIN we key the URL by is a
+        // contradictory request — fail fast before fetching.
+        if let Some(expected) = normalize_expected_isin(expected_isin)?
+            && expected != isin
+        {
+            return Err(SafeError::invalid_request(
+                "expected_isin disagrees with the lookup ISIN.",
+            ));
+        }
         let url = format!(
             "{}{}",
             config.base.trim_end_matches('/'),
@@ -300,12 +309,11 @@ impl MarketClient {
         validate_etf_fetch_target(&url, &config.allowlist)?;
 
         let html = self.get_text(&url)?;
-        // The URL is keyed by `isin`, so the page header MUST echo it. Verify
-        // against the caller's `expected_isin` when given, else against the lookup
-        // ISIN itself — a header mismatch is then a hard error (the section is
-        // dropped) rather than wrong-ETF data published with only a warning.
-        let verify_isin = normalized_expected_isin.as_deref().unwrap_or(isin.as_str());
-        build_etf_report(&html, &url, now_iso, Some(verify_isin))
+        // The URL is keyed by `isin`, so the page header MUST echo it — always
+        // verify against the lookup ISIN (a mismatch is a hard error, dropping the
+        // section, rather than wrong-ETF data published with only a warning). Any
+        // caller `expected_isin` was already required to equal `isin` above.
+        build_etf_report(&html, &url, now_iso, Some(isin.as_str()))
     }
 
     /// Fetch and parse the public zero-commission ETF list. `now_iso` stamps

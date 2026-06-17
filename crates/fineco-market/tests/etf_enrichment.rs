@@ -123,3 +123,27 @@ fn page_isin_mismatch_is_rejected_even_without_expected_isin() {
         .expect_err("page ISIN mismatch must be rejected without expected_isin");
     assert_eq!(err.code(), "invalid_request");
 }
+
+#[test]
+fn page_is_verified_against_lookup_isin_not_just_expected() {
+    // The route is keyed by the lookup ISIN. A page for a DIFFERENT ISIN must be
+    // rejected even if the caller's (stale/mismatched) expected_isin happens to
+    // match that wrong page — verification is anchored to the lookup ISIN.
+    let profile = spawn(|req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/en/etf-profile.html" {
+            httptiny::Response::html(200, synthetic_profile("IE00B5BMR087"))
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let client = MarketClient::list_only(UNUSED_LIST_URL).with_etf_enrichment(
+        &profile,
+        EnrichmentHostAllowlist::from_allowed_hosts(["127.0.0.1"]),
+    );
+    // Lookup IE00B8GKDB10, but the caller passes the wrong page's ISIN as expected.
+    let err = client
+        .fetch_etf_enrichment("IE00B8GKDB10", Some("IE00B5BMR087"), NOW)
+        .expect_err("must verify against the lookup ISIN, not just expected_isin");
+    assert_eq!(err.code(), "invalid_request");
+}

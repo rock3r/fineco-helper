@@ -83,26 +83,28 @@ add_gateway_host() { # var_name file
 }
 # JWKS host — only when Cloudflare Access is configured (no Access -> no JWKS fetch).
 add_gateway_host FINECO_ACCESS_JWKS_URL "$ACCESS_ENV"
-# Market targets: each enrichment host is allowlisted ONLY when its own config pair
-# is present, and the ETF list host is allowlisted whenever the market client exists
-# at all. GatewayConfig::build_market builds the client when EITHER the stock OR the
-# ETF enrichment pair is configured (each independently optional); the public ETF
-# list tool then works regardless of which enrichment is on, so its host must be
-# allowed in both cases. Without any pair, build_market returns None and the gateway
-# never calls these hosts, so none are allowlisted. The enrichment hosts are
-# config-only and NEVER hardcoded here.
+# Market targets: each enrichment host is allowlisted ONLY when its OWN full config
+# pair (base + host-hashes) is present, and the ETF list host whenever the market
+# client exists at all. GatewayConfig::build_market builds the client when EITHER the
+# stock OR the ETF enrichment pair is configured (each independently optional, and a
+# PARTIAL pair fails closed there), so the egress must match: require the pair, and
+# open the public ETF list host in both cases (its tool works regardless of which
+# enrichment is on). Without any pair, build_market returns None and the gateway never
+# calls these hosts. The enrichment hosts are config-only and NEVER hardcoded here.
+# A var counts as present only with a non-space value (GatewayConfig's blank-is-unset).
+env_present() { grep -qE "^$1=[\"']?[^[:space:]\"']" "$ENRICHMENT_ENV" 2>/dev/null; }
 market_enabled=0
-if grep -qE "^FINECO_ENRICHMENT_BASE=[\"']?[^[:space:]\"']" "$ENRICHMENT_ENV" 2>/dev/null; then
+if env_present FINECO_ENRICHMENT_BASE && env_present FINECO_ENRICHMENT_HOST_HASHES; then
     add_gateway_host FINECO_ENRICHMENT_BASE "$ENRICHMENT_ENV"
     market_enabled=1
 fi
-if grep -qE "^FINECO_ETF_ENRICHMENT_BASE=[\"']?[^[:space:]\"']" "$ENRICHMENT_ENV" 2>/dev/null; then
+if env_present FINECO_ETF_ENRICHMENT_BASE && env_present FINECO_ETF_ENRICHMENT_HOST_HASHES; then
     add_gateway_host FINECO_ETF_ENRICHMENT_BASE "$ENRICHMENT_ENV"
     market_enabled=1
 fi
 if [[ "$market_enabled" == "1" ]]; then
     # The ETF list endpoint: an explicit FINECO_ETF_URL override, else the default host.
-    if grep -qE "^FINECO_ETF_URL=[\"']?[^[:space:]\"']" "$ENRICHMENT_ENV" 2>/dev/null; then
+    if env_present FINECO_ETF_URL; then
         add_gateway_host FINECO_ETF_URL "$ENRICHMENT_ENV"
     else
         GATEWAY_HOSTS+=(images.finecobank.com)
