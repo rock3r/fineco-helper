@@ -176,6 +176,18 @@ fn inner_text(mut rest: &str) -> String {
     while let Some(lt) = rest.find('<') {
         out.push_str(&rest[..lt]);
         let tail = &rest[lt..];
+        // An HTML comment never nests and may itself contain `>`, so skip to its
+        // real `-->` end rather than the next `>`. (Replace it with a space too.)
+        if let Some(after_open) = tail.strip_prefix("<!--") {
+            out.push(' ');
+            match after_open.find("-->") {
+                Some(end) => {
+                    rest = &after_open[end + "-->".len()..];
+                    continue;
+                }
+                None => break,
+            }
+        }
         let Some(gt) = tail.find('>') else { break };
         let tag = &tail[..=gt];
         // Replace the tag with a space so text either side of it (e.g. a `<br>`)
@@ -472,6 +484,23 @@ mod tests {
             !domicile.chars().any(char::is_control),
             "decoded control char survived: {domicile:?}"
         );
+    }
+
+    #[test]
+    fn html_comments_in_a_cell_do_not_break_parsing() {
+        // A React-rendered page can embed HTML comments inside a cell. A comment has
+        // no closing tag, so counting it as a nested level would consume the cell's
+        // `</td>` and bleed later rows — and a comment may even contain a `>`.
+        let html = "<html><body>\
+            <span data-testid=\"etf-profile-header_isin-value\">XX0000000001</span>\
+            <td data-testid=\"tl_etf-basics_value_fund-size_indicator\">EUR<!-- a > b -->8,622 m</td>\
+            <td data-testid=\"tl_etf-basics_value_domicile-country\">Ireland</td>\
+            </body></html>";
+        let report = build_etf_report(html, HOST, "t", None).expect("parse");
+        let size = report.fund_size.expect("fund size");
+        assert_eq!(size.value, 8622.0);
+        // The comment did not bleed the next cell into this one or vice-versa.
+        assert_eq!(report.domicile.as_deref(), Some("Ireland"));
     }
 
     #[test]
