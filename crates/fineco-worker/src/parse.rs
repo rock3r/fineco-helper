@@ -1965,9 +1965,10 @@ fn bond_section(
 }
 
 /// The result of the bond cashflow analytics, all in years / years² except the
-/// present value (per 100 face) and DV01 (price change per basis point).
+/// present value (per 100 face) and DV01 (price change per basis point). The
+/// reported years-to-maturity is the date difference, computed by the caller, not
+/// the idealized schedule grid, so it is not returned here.
 struct BondAnalyticsResult {
-    years_to_maturity: f64,
     macaulay_duration: f64,
     modified_duration: f64,
     convexity: f64,
@@ -2029,10 +2030,8 @@ fn coupon_bond_analytics(
     let modified_duration = macaulay_duration / growth;
     let convexity = convexity_numerator
         / (present_value * growth * growth * payments_per_year * payments_per_year);
-    let years_to_maturity = (periods_to_first + f64::from(num_coupons - 1)) / payments_per_year;
     let dv01 = modified_duration * dirty_price / 10_000.0;
     Some(BondAnalyticsResult {
-        years_to_maturity,
         macaulay_duration,
         modified_duration,
         convexity,
@@ -2128,11 +2127,14 @@ fn apply_bond_analytics(
         bond.dirty_price
             .as_ref()
             .or(bond.clean_price.as_ref())
-            .map(|field| field.value),
+            .map(|field| field.value)
+            // A non-positive price is nonsensical and would invert the consistency
+            // guard / produce a negative DV01, so treat it as missing.
+            .filter(|&price| price.is_finite() && price > 0.0),
     ) else {
         warnings.push(warning(
             "bond_analytics_unavailable",
-            "Bond duration analytics need a gross yield, a maturity date, and a price.",
+            "Bond duration analytics need a gross yield, a maturity date, and a positive price.",
         ));
         return;
     };
@@ -2197,7 +2199,10 @@ fn apply_bond_analytics(
             return;
         };
         let remaining = (years_to_maturity * payments_per_year - periods_to_first).round();
-        if !remaining.is_finite() || remaining < 0.0 {
+        // Bound before the cast: a non-finite, negative, or absurdly large schedule
+        // is rejected here (so the `as u32` can never wrap or the `+ 1` overflow), and
+        // `coupon_bond_analytics` re-checks the same ceiling.
+        if !remaining.is_finite() || remaining < 0.0 || remaining >= f64::from(MAX_BOND_COUPONS) {
             warnings.push(warning(
                 "bond_analytics_unavailable",
                 "Bond coupon schedule could not be reconstructed for duration analytics.",
@@ -2231,7 +2236,9 @@ fn apply_bond_analytics(
         ));
         return;
     }
-    bond.years_to_maturity = computed_number_field(result.years_to_maturity, "years", captured_at);
+    // Report the actual ACT/365 time to maturity (the date difference), not the
+    // idealized coupon-grid maturity used internally for the duration schedule.
+    bond.years_to_maturity = computed_number_field(years_to_maturity, "years", captured_at);
     bond.macaulay_duration = computed_number_field(result.macaulay_duration, "years", captured_at);
     bond.modified_duration = computed_number_field(result.modified_duration, "years", captured_at);
     bond.convexity = computed_number_field(result.convexity, "years_squared", captured_at);
@@ -5360,12 +5367,14 @@ mod tests {
         .expect("bond details");
 
         let bond = result.sections.bond.as_ref().expect("bond section");
-        // Schedule maturity is exactly 5.0y (10 semi-annual coupons, full first stub).
-        approx(bond.years_to_maturity.as_ref().expect("ytm yrs").value, 5.0);
+        // years_to_maturity is the ACT/365 date difference (~5.003y over a span that
+        // includes the 2028 leap day), not the idealized 5.0 coupon grid.
+        let yrs = bond.years_to_maturity.as_ref().expect("ytm yrs").value;
+        assert!((yrs - 5.003).abs() < 0.01, "years_to_maturity {yrs}");
         let macaulay = bond.macaulay_duration.as_ref().expect("macaulay").value;
         let modified = bond.modified_duration.as_ref().expect("modified").value;
-        // Duration is positive and below the 5y maturity; Macaulay exceeds Modified.
-        assert!(modified > 0.0 && modified < 5.0, "modified {modified}");
+        // This is the 5y 3% semi par bond: modified duration ≈ 4.611y (textbook).
+        assert!((modified - 4.611).abs() < 0.02, "modified {modified}");
         assert!(
             macaulay > modified,
             "macaulay {macaulay} vs modified {modified}"
@@ -5390,6 +5399,41 @@ mod tests {
                 .sources
                 .iter()
                 .any(|source| source.source_ref == "computed")
+        );
+    }
+
+    #[test]
+    fn bond_details_compute_duration_for_zero_coupon() {
+        let candidate = bond_candidate();
+        // A zero-coupon bond: price = 100/(1+y)^T must be consistent. With y=3% and
+        // ~5y to maturity, the consistent clean price is ~86.18; Macaulay == T.
+        let static_response: StaticSearchResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"instrId":"IT0009999991","venueSystem":"MOT","description":"Synthetic Zero","currencyCd":"EUR","instrTyp":"BND","bondCouponRate":0.0,"bondCouponTyp":"ZERO COUPON","bondExpiryDate":"17/06/2031","bondAccruedInterestRate":0.0}}"#,
+        )
+        .expect("static");
+        let snapshot: SnapshotResponse = serde_json::from_str(
+            r#"{"IT0009999991.MOT":{"last":86.18,"yeldGross":3.0,"lastTradedDatetime":"2026-06-17T08:00:00Z"}}"#,
+        )
+        .expect("snapshot");
+        let result = to_bond_asset_details(
+            &bond_params(None),
+            &candidate,
+            BondDetailsInputs {
+                static_response,
+                snapshot_response: Some(snapshot),
+            },
+            "2026-06-17T09:30:00Z",
+        )
+        .expect("bond details");
+
+        let bond = result.sections.bond.as_ref().expect("bond section");
+        let yrs = bond.years_to_maturity.as_ref().expect("yrs").value;
+        let macaulay = bond.macaulay_duration.as_ref().expect("macaulay").value;
+        // A zero's Macaulay duration equals its years to maturity.
+        approx(macaulay, yrs);
+        approx(
+            bond.modified_duration.as_ref().expect("modified").value,
+            yrs / 1.03,
         );
     }
 
@@ -5458,7 +5502,6 @@ mod tests {
         // that cashflow in years = p0/n. Here p0=0.5 period at n=2 → 0.25y.
         let single = coupon_bond_analytics(2.0, 0.015, 2.0, 0.5, 1, 102.0).expect("single");
         approx(single.macaulay_duration, 0.25);
-        approx(single.years_to_maturity, 0.25);
         // Modified = Macaulay / (1 + periodic_yield), always.
         approx(single.modified_duration, 0.25 / 1.015);
         // DV01 = modified × dirty / 10_000.
@@ -5467,7 +5510,6 @@ mod tests {
         // A "zero coupon" modeled as n=1, c=0, single 100 at T years: Macaulay == T.
         let zero = coupon_bond_analytics(0.0, 0.05, 1.0, 10.0, 1, 61.39).expect("zero");
         approx(zero.macaulay_duration, 10.0);
-        approx(zero.years_to_maturity, 10.0);
         approx(zero.modified_duration, 10.0 / 1.05);
         // Convexity of a zero (annual comp.) = T(T+1)/(1+y)^2 = 110/1.05^2.
         approx(zero.convexity, 110.0 / (1.05 * 1.05));
@@ -5479,8 +5521,16 @@ mod tests {
         let par = coupon_bond_analytics(2.0, 0.02, 2.0, 1.0, 2, 100.0).expect("par");
         approx(par.present_value, 100.0);
         approx(par.modified_duration, par.macaulay_duration / 1.02);
-        // Maturity = last cashflow at period (p0 + N-1) = 2 periods / n=2 = 1.0y.
-        approx(par.years_to_maturity, 1.0);
+
+        // Independent reference: a 5y 3% semi-annual bond at par (yield 3%) has a
+        // textbook modified duration of ~4.611y (full first stub, 10 coupons).
+        let ref5y = coupon_bond_analytics(1.5, 0.015, 2.0, 1.0, 10, 100.0).expect("ref");
+        approx(ref5y.present_value, 100.0);
+        assert!(
+            (ref5y.modified_duration - 4.611).abs() < 0.01,
+            "modified {}",
+            ref5y.modified_duration
+        );
     }
 
     #[test]
