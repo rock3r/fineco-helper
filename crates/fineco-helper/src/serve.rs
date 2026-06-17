@@ -428,15 +428,32 @@ fn enrichment_pair(
     hashes_key: &str,
     label: &str,
 ) -> Result<Option<(String, EnrichmentHostAllowlist)>, ServeError> {
-    match (get(base_key), get(hashes_key)) {
+    // A present-but-blank/whitespace value counts as unset — the same rule as the
+    // egress allow-set script (which only treats a non-space value as configured)
+    // and FINECO_ETF_URL — so a stray `VAR=` line cannot enable a broken route.
+    let nonblank = |key: &str| {
+        get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    match (nonblank(base_key), nonblank(hashes_key)) {
         (Some(base), Some(hashes)) => {
-            let allowlist = EnrichmentHostAllowlist::from_host_hashes(
-                hashes
-                    .split(',')
-                    .map(|hash| hash.trim().to_string())
-                    .filter(|hash| !hash.is_empty()),
-            );
-            Ok(Some((base, allowlist)))
+            let hash_list: Vec<String> = hashes
+                .split(',')
+                .map(|hash| hash.trim().to_string())
+                .filter(|hash| !hash.is_empty())
+                .collect();
+            // A hash list that is all separators/whitespace yields no host pin;
+            // fail closed rather than build an allow-nothing allowlist.
+            if hash_list.is_empty() {
+                return Err(ServeError::new(format!(
+                    "{label}: {hashes_key} has no usable host hash"
+                )));
+            }
+            Ok(Some((
+                base,
+                EnrichmentHostAllowlist::from_host_hashes(hash_list),
+            )))
         }
         (None, None) => Ok(None),
         _ => Err(ServeError::new(format!(
