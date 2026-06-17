@@ -1088,6 +1088,12 @@ pub(crate) fn to_market_asset_details(
             "Requested stock ratios are not applicable to an ETF.",
         ));
     }
+    if requested(params, MarketDetailsSection::Bond) {
+        warnings.push(warning(
+            "section_missing",
+            "Requested bond data is not applicable to an ETF.",
+        ));
+    }
 
     Ok(MarketAssetDetailsResult {
         schema_version: 1,
@@ -1461,6 +1467,10 @@ pub(crate) fn to_stock_asset_details(
         (
             MarketDetailsSection::Risk,
             "Requested ETF risk data is not applicable to a stock.",
+        ),
+        (
+            MarketDetailsSection::Bond,
+            "Requested bond data is not applicable to a stock.",
         ),
     ] {
         if requested(params, section) {
@@ -3508,6 +3518,7 @@ mod tests {
                 MarketDetailsSection::Etf,
                 MarketDetailsSection::Stock,
                 MarketDetailsSection::Ratios,
+                MarketDetailsSection::Bond,
             ]),
             &candidate,
             MarketDetailsInputs {
@@ -3523,11 +3534,18 @@ mod tests {
 
         assert!(result.sections.stock.is_none());
         assert!(result.sections.ratios.is_none());
+        assert!(result.sections.bond.is_none());
         assert!(
             result
                 .warnings
                 .iter()
                 .any(|warning| warning.message.contains("not applicable to an ETF"))
+        );
+        // A bond section requested on an ETF is reported as inapplicable, not silent.
+        assert!(
+            result.warnings.iter().any(
+                |warning| warning.message == "Requested bond data is not applicable to an ETF."
+            )
         );
     }
 
@@ -4430,6 +4448,7 @@ mod tests {
                     MarketDetailsSection::Exposures,
                     MarketDetailsSection::Returns,
                     MarketDetailsSection::Risk,
+                    MarketDetailsSection::Bond,
                 ]),
             },
             &candidate,
@@ -4448,13 +4467,22 @@ mod tests {
 
         assert!(result.sections.etf.is_none());
         assert!(result.sections.holdings.is_none());
+        assert!(result.sections.bond.is_none());
         assert!(
             result
                 .warnings
                 .iter()
                 .filter(|warning| warning.message.contains("not applicable to a stock"))
                 .count()
-                >= 5
+                >= 6
+        );
+        // A bond section requested on a stock is reported as inapplicable, not silent.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.message
+                    == "Requested bond data is not applicable to a stock.")
         );
     }
 
