@@ -13,6 +13,7 @@ members = [
     "crates/fineco-query",
     "crates/fineco-refresh",
     "crates/fineco-store",
+    "crates/fineco-tls",
     "crates/fineco-worker",
     "e2e/httptiny",
     "e2e/mock-fineco",

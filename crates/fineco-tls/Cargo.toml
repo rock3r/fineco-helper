@@ -1,0 +1,37 @@
+[package]
+name = "fineco-tls"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "fineco_tls"
+path = "src/lib.rs"
+
+[dependencies]
+# Single source of truth for the workspace's rustls crypto backend. Every ureq
+# agent that does TLS (the credentialed Fineco worker, the market/enrichment
+# fetcher, the gateway JWKS fetch) MUST build its agent with `tls_config()` so
+# the whole workspace negotiates TLS through ONE backend: aws-lc-rs.
+#
+# Why aws-lc-rs and not ring: jsonwebtoken 10.x (needed for CVE-2026-25537 /
+# GHSA-h395-gr6q-cpjc) dropped ring support entirely, so JWT verification must
+# use aws-lc-rs (its `rust_crypto` backend pulls `rsa`, which carries the
+# unpatched RUSTSEC-2023-0071 Marvin advisory). Rather than ship TWO crypto
+# backends (ring for TLS + aws-lc-rs for JWT), the owner chose to unify on
+# aws-lc-rs and drop ring from the tree. ureq's `rustls` feature force-pins ring
+# (`_ring`), so we use `rustls-no-provider` + an explicit provider instead.
+ureq = { version = "3.3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+# Direct rustls dep solely to (a) flip the `aws-lc-rs` provider feature for the
+# unified rustls in the graph and (b) hand ureq an explicit `CryptoProvider`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
+
+[dev-dependencies]
+# Generates a synthetic self-signed cert at test time for the loopback TLS
+# handshake test (default backend is aws-lc-rs, matching this crate — no ring).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs"] }

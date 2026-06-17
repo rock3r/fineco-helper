@@ -14,9 +14,12 @@ fineco-core = { path = "../fineco-core" }
 fineco-ipc = { path = "../fineco-ipc" }
 fineco-store = { path = "../fineco-store" }
 fineco-refresh = { path = "../fineco-refresh" }
+fineco-tls = { path = "../fineco-tls" }
 # Credentialed HTTP/TLS client (owner-approved: ureq + rustls). serde/serde_json
 # ride along via ureq's `json` feature and are used to parse Fineco JSON.
-ureq = { version = "3.3", default-features = false, features = ["rustls", "json"] }
+# `rustls-no-provider` (not `rustls`, which force-pins ring): the crypto backend
+# is aws-lc-rs, injected via `fineco_tls::tls_config()`. See `fineco-tls`.
+ureq = { version = "3.3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Owner-approved credentialed-path dep: zero the Fineco password + session-cookie
