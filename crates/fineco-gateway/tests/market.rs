@@ -530,6 +530,96 @@ async fn asset_details_can_fold_stock_external_enrichment_outside_the_worker() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A synthetic ETF-profile page mirroring the `data-testid` basics contract. No
+/// real host/provider is referenced; values are fictional.
+fn synthetic_etf_profile(isin: &str) -> String {
+    format!(
+        "<html><body>\
+         <span data-testid=\"etf-profile-header_isin-value\">{isin}</span>\
+         <td data-testid=\"tl_etf-basics_value_ter\">0.29% p.a.</td>\
+         <td data-testid=\"tl_etf-basics_value_fund-size_indicator\"> <span>EUR 8,622</span> m</td>\
+         <td data-testid=\"tl_etf-basics_value_domicile-country\">Ireland</td>\
+         <td data-testid=\"tl_etf-basics_value_distribution-policy\">Distributing</td>\
+         <td data-testid=\"tl_etf-basics_value_replication\">Physical (Optimized sampling)</td>\
+         </body></html>"
+    )
+}
+
+#[tokio::test]
+async fn asset_details_can_fold_etf_external_enrichment_outside_the_worker() {
+    let profile_hits = Arc::new(AtomicU32::new(0));
+    let hits_for_server = Arc::clone(&profile_hits);
+    let profile = spawn(move |req| {
+        let path = req.path.split('?').next().unwrap_or(&req.path);
+        if req.method == "GET" && path == "/en/etf-profile.html" {
+            hits_for_server.fetch_add(1, Ordering::SeqCst);
+            httptiny::Response::html(200, synthetic_etf_profile("IE00B8GKDB10"))
+        } else {
+            httptiny::Response::not_found()
+        }
+    });
+    let path = market_control_socket_path();
+    let listener = UnixListener::bind(&path).expect("bind market-control socket");
+    thread::spawn(move || {
+        let _ = serve_market_control_blocking(&listener, |request| match request {
+            MarketControlRequest::MarketGetAssetDetails(params) => {
+                Ok(MarketControlOutcome::Details {
+                    result: Box::new(sample_details_result(&params.identifier)),
+                    session: fineco_ipc::MarketSessionStatus::fresh_login(),
+                })
+            }
+            _ => panic!("wrong request"),
+        });
+    });
+
+    let gateway = Gateway::new(UNUSED_SOCKET)
+        .with_policy(owner_all_market_policy())
+        .with_market(
+            market_client("http://unused.invalid", "http://127.0.0.1:9/etf").with_etf_enrichment(
+                &profile,
+                EnrichmentHostAllowlist::from_allowed_hosts(["127.0.0.1"]),
+            ),
+        )
+        .with_market_control_client(MarketControlClient::new(&path));
+
+    let result = gateway
+        .market_get_asset_details(Parameters(MarketDetailsParams {
+            identifier: "AFF/VHYL".to_string(),
+            expected_isin: Some("IE00B8GKDB10".to_string()),
+            sections: Some(vec![
+                MarketDetailsSection::Identity,
+                MarketDetailsSection::Etf,
+                MarketDetailsSection::ExternalEnrichment,
+            ]),
+        }))
+        .await
+        .expect("details with ETF external enrichment")
+        .0;
+
+    let etf = result
+        .sections
+        .etf_external_enrichment
+        .expect("etf external enrichment section");
+    assert_eq!(etf.data_class, "external_enrichment");
+    assert_eq!(etf.ter.expect("ter").value, 0.29);
+    assert_eq!(etf.domicile.expect("domicile").value, "Ireland");
+    assert_eq!(
+        etf.distribution_policy.expect("distribution policy").value,
+        "Distributing"
+    );
+    let size = etf.fund_size.expect("fund size");
+    assert_eq!(size.value, 8622.0);
+    assert_eq!(size.unit.as_deref(), Some("EUR million"));
+    assert_eq!(profile_hits.load(Ordering::SeqCst), 1);
+    // The stock-oriented section must NOT be populated for an ETF.
+    assert!(result.sections.external_enrichment.is_none());
+    assert!(result.sources.iter().any(|source| {
+        source.data_class == "external_enrichment"
+            && source.source_ref == format!("{profile}/en/etf-profile.html?isin=IE00B8GKDB10")
+    }));
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn folded_external_enrichment_returns_the_full_report_payload() {
     let enrichment = spawn(|req| {

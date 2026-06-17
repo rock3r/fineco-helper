@@ -76,6 +76,9 @@ Environment=FINECO_POLICY_PATH=/etc/fineco/policy.json
 # Environment=FINECO_ENRICHMENT_BASE=https://<configured-host>
 # Environment=FINECO_ENRICHMENT_HOST_HASHES=<sha256(host)>
 # Environment=FINECO_ETF_URL=https://<configured-etf-list-url>
+# Optional ISIN-keyed ETF reference-data enrichment (separate config-only host):
+# Environment=FINECO_ETF_ENRICHMENT_BASE=https://<configured-etf-enrichment-host>
+# Environment=FINECO_ETF_ENRICHMENT_HOST_HASHES=<sha256(host)>
 
 ExecStart=/usr/local/bin/fineco-helper gateway
 Restart=on-failure

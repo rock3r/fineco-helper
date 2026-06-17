@@ -194,6 +194,126 @@ fn gateway_config_rejects_partial_market() {
 }
 
 #[test]
+fn gateway_config_etf_enrichment_disabled_without_its_vars() {
+    // The stock-enrichment pair alone enables the market client but leaves ETF
+    // enrichment off until its own host config is supplied.
+    let config = GatewayConfig::from_env(env_from(&[
+        ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),
+        ("FINECO_POLICY_PATH", POLICY_PATH),
+        ("FINECO_ACCESS_DISABLED", "true"),
+        ("FINECO_ENRICHMENT_BASE", "https://enrich.example"),
+        ("FINECO_ENRICHMENT_HOST_HASHES", "abc123"),
+    ]))
+    .expect("market enabled");
+    let market = config.market.expect("market enabled");
+    assert!(
+        !market.etf_enrichment_enabled(),
+        "ETF enrichment must stay off without its config"
+    );
+}
+
+#[test]
+fn gateway_config_enables_etf_enrichment_with_its_pair() {
+    let config = GatewayConfig::from_env(env_from(&[
+        ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),
+        ("FINECO_POLICY_PATH", POLICY_PATH),
+        ("FINECO_ACCESS_DISABLED", "true"),
+        ("FINECO_ENRICHMENT_BASE", "https://enrich.example"),
+        ("FINECO_ENRICHMENT_HOST_HASHES", "abc123"),
+        ("FINECO_ETF_ENRICHMENT_BASE", "https://etf-enrich.example"),
+        ("FINECO_ETF_ENRICHMENT_HOST_HASHES", "deadbeef"),
+    ]))
+    .expect("market + etf enrichment enabled");
+    let market = config.market.expect("market enabled");
+    assert!(
+        market.etf_enrichment_enabled(),
+        "ETF enrichment must be enabled when its pair is set"
+    );
+}
+
+#[test]
+fn gateway_config_enables_market_with_etf_enrichment_only() {
+    // ETF enrichment is independently enableable: its pair alone builds the market
+    // client (stock enrichment off), decoupled from the stock-enrichment pair.
+    let config = GatewayConfig::from_env(env_from(&[
+        ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),
+        ("FINECO_POLICY_PATH", POLICY_PATH),
+        ("FINECO_ACCESS_DISABLED", "true"),
+        ("FINECO_ETF_ENRICHMENT_BASE", "https://etf-enrich.example"),
+        ("FINECO_ETF_ENRICHMENT_HOST_HASHES", "deadbeef"),
+        // no stock-enrichment pair
+    ]))
+    .expect("etf-only config enables the market client");
+    let market = config.market.expect("market enabled by etf-only config");
+    assert!(
+        market.etf_enrichment_enabled(),
+        "ETF enrichment must be enabled"
+    );
+    assert!(
+        !market.stock_enrichment_enabled(),
+        "stock enrichment must stay off when only the ETF pair is set"
+    );
+}
+
+#[test]
+fn gateway_config_treats_blank_etf_enrichment_vars_as_unset() {
+    // A present-but-blank/whitespace ETF pair must be treated as unset (the same
+    // blank-is-no-config rule as FINECO_ETF_URL and the egress script), not enable
+    // a market client with an empty allowlist. Stock pair present → market on, ETF
+    // enrichment off.
+    let config = GatewayConfig::from_env(env_from(&[
+        ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),
+        ("FINECO_POLICY_PATH", POLICY_PATH),
+        ("FINECO_ACCESS_DISABLED", "true"),
+        ("FINECO_ENRICHMENT_BASE", "https://enrich.example"),
+        ("FINECO_ENRICHMENT_HOST_HASHES", "abc123"),
+        ("FINECO_ETF_ENRICHMENT_BASE", "   "),
+        ("FINECO_ETF_ENRICHMENT_HOST_HASHES", ""),
+    ]))
+    .expect("blank ETF vars are unset, not a broken config");
+    let market = config.market.expect("market enabled by the stock pair");
+    assert!(
+        !market.etf_enrichment_enabled(),
+        "blank ETF enrichment vars must leave the route off"
+    );
+}
+
+#[test]
+fn gateway_config_rejects_etf_enrichment_with_empty_hash_list() {
+    // A base with a hash list that is all separators/whitespace yields no usable
+    // host pin; fail closed rather than building an allow-nothing allowlist.
+    let message = gateway_config_err(&[
+        ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),
+        ("FINECO_POLICY_PATH", POLICY_PATH),
+        ("FINECO_ACCESS_DISABLED", "true"),
+        ("FINECO_ETF_ENRICHMENT_BASE", "https://etf-enrich.example"),
+        ("FINECO_ETF_ENRICHMENT_HOST_HASHES", " , "),
+    ]);
+    assert!(
+        message.contains("ETF enrichment config"),
+        "message: {message}"
+    );
+}
+
+#[test]
+fn gateway_config_rejects_partial_etf_enrichment() {
+    // The ETF enrichment base without its host hashes (or vice-versa) is a
+    // misconfiguration (fail closed), same rule as the stock pair.
+    let message = gateway_config_err(&[
+        ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),
+        ("FINECO_POLICY_PATH", POLICY_PATH),
+        ("FINECO_ACCESS_DISABLED", "true"),
+        ("FINECO_ENRICHMENT_BASE", "https://enrich.example"),
+        ("FINECO_ENRICHMENT_HOST_HASHES", "abc123"),
+        ("FINECO_ETF_ENRICHMENT_BASE", "https://etf-enrich.example"),
+    ]);
+    assert!(
+        message.contains("ETF enrichment config"),
+        "message: {message}"
+    );
+}
+
+#[test]
 fn gateway_config_access_disabled_opt_out_yields_no_access() {
     let config = GatewayConfig::from_env(env_from(&[
         ("FINECO_QUERY_SOCKET", "/tmp/q.sock"),

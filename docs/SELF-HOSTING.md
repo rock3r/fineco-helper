@@ -32,7 +32,8 @@ rationale, threat model) see [`ARCHITECTURE.md`](ARCHITECTURE.md) and
 - An **MCP client** that can send Cloudflare Access credentials (e.g. a service
   token) — that's how you'll actually call the tools.
 - *(Optional)* a third-party **stock-enrichment host** of your choosing, to enable
-  the market enrichment tools. It is config-only.
+  the market enrichment tools, and *(optionally)* a separate **ETF-enrichment host**
+  for ISIN-keyed ETF reference data. Both are config-only.
 - *(Optional)* **age** for encrypted backups.
 
 ## Security model in one paragraph

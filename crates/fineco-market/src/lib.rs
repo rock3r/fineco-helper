@@ -9,6 +9,7 @@
 //! client-supplied URL and no `validateSource`/`userAgent` knob.
 
 mod client;
+mod etf_enrichment;
 mod report;
 mod source;
 mod state;
@@ -16,6 +17,7 @@ mod state;
 pub use client::{
     DEFAULT_ZERO_COMMISSION_ETFS_URL, MarketClient, ZeroCommissionEtf, ZeroCommissionEtfs,
 };
+pub use etf_enrichment::{EtfEnrichmentReport, EtfFundSize};
 pub use report::{CompanyOverview, EnrichmentReport};
 pub use source::{EnrichmentHostAllowlist, validate_source_url};
 

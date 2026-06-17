@@ -138,6 +138,9 @@ impl GatewayConfig {
     /// - Market (all-or-nothing): `FINECO_ENRICHMENT_BASE`, `FINECO_ETF_URL`,
     ///   and `FINECO_ENRICHMENT_HOST_HASHES` (comma-separated SHA-256 host
     ///   hashes). Absent → market tools disabled; partial → an error.
+    /// - ETF enrichment (optional, all-or-nothing): `FINECO_ETF_ENRICHMENT_BASE`
+    ///   and `FINECO_ETF_ENRICHMENT_HOST_HASHES` layer the ISIN-keyed ETF
+    ///   reference-data route onto the market client; partial → an error.
     /// - Access (all-or-nothing): `FINECO_ACCESS_ISSUER`, `FINECO_ACCESS_AUDIENCE`,
     ///   `FINECO_ACCESS_JWKS_URL` (+ optional `FINECO_OWNER_EMAIL` and
     ///   `FINECO_ACCESS_OWNER_COMMON_NAME`, the service-token Client-ID pin).
@@ -373,37 +376,89 @@ fn build_access(
     }
 }
 
-/// Build the optional market client from config. The enrichment pair —
-/// `FINECO_ENRICHMENT_BASE` + `FINECO_ENRICHMENT_HOST_HASHES` — enables the market
-/// tools (both together → `Some`; neither → `None`; one alone → an error, fail
-/// closed). `FINECO_ETF_URL` is **optional**: the zero-commission ETF list is a
-/// fixed public Fineco endpoint, so it defaults to
-/// [`DEFAULT_ZERO_COMMISSION_ETFS_URL`] and a deployment only sets it to point at
-/// a mock or a moved list.
+/// Build the optional market client from config. Stock enrichment
+/// (`FINECO_ENRICHMENT_BASE` + `FINECO_ENRICHMENT_HOST_HASHES`) and ETF enrichment
+/// (`FINECO_ETF_ENRICHMENT_BASE` + `FINECO_ETF_ENRICHMENT_HOST_HASHES`) are each an
+/// **independent** all-or-nothing pair (both → that route enabled; neither → off;
+/// one alone → an error, fail closed). The market client is built when **either**
+/// pair is configured (so ETF enrichment does not require stock enrichment, and
+/// vice-versa); neither configured → `None` (market tools disabled). `FINECO_ETF_URL`
+/// is **optional**: the zero-commission ETF list is a fixed public Fineco endpoint,
+/// so it defaults to [`DEFAULT_ZERO_COMMISSION_ETFS_URL`] and a deployment only sets
+/// it to point at a mock or a moved list.
 fn build_market(get: &impl Fn(&str) -> Option<String>) -> Result<Option<MarketClient>, ServeError> {
-    let base = get("FINECO_ENRICHMENT_BASE");
-    let hashes = get("FINECO_ENRICHMENT_HOST_HASHES");
-    match (base, hashes) {
+    let stock = enrichment_pair(
+        get,
+        "FINECO_ENRICHMENT_BASE",
+        "FINECO_ENRICHMENT_HOST_HASHES",
+        "market config",
+    )?;
+    let etf = enrichment_pair(
+        get,
+        "FINECO_ETF_ENRICHMENT_BASE",
+        "FINECO_ETF_ENRICHMENT_HOST_HASHES",
+        "ETF enrichment config",
+    )?;
+    if stock.is_none() && etf.is_none() {
+        return Ok(None);
+    }
+    // A blank/whitespace override must fall back to the default, not become the
+    // literal (empty) ETF endpoint — same rule as the Access pins.
+    let etf_url = get("FINECO_ETF_URL")
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_ZERO_COMMISSION_ETFS_URL.to_string());
+    let mut market = MarketClient::list_only(etf_url);
+    if let Some((base, allowlist)) = stock {
+        market = market.with_stock_enrichment(base, allowlist);
+    }
+    if let Some((base, allowlist)) = etf {
+        market = market.with_etf_enrichment(base, allowlist);
+    }
+    Ok(Some(market))
+}
+
+/// Resolve one config-only, SHA-256-pinned enrichment host pair: `Some((base,
+/// allowlist))` when both vars are present, `None` when neither is, and a
+/// fail-closed error when exactly one is (the `label` names the pair in the error).
+/// The host stays config-only — only its hashes enter the allowlist.
+fn enrichment_pair(
+    get: &impl Fn(&str) -> Option<String>,
+    base_key: &str,
+    hashes_key: &str,
+    label: &str,
+) -> Result<Option<(String, EnrichmentHostAllowlist)>, ServeError> {
+    // A present-but-blank/whitespace value counts as unset — the same rule as the
+    // egress allow-set script (which only treats a non-space value as configured)
+    // and FINECO_ETF_URL — so a stray `VAR=` line cannot enable a broken route.
+    let nonblank = |key: &str| {
+        get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    match (nonblank(base_key), nonblank(hashes_key)) {
         (Some(base), Some(hashes)) => {
-            let allowlist = EnrichmentHostAllowlist::from_host_hashes(
-                hashes
-                    .split(',')
-                    .map(|hash| hash.trim().to_string())
-                    .filter(|hash| !hash.is_empty()),
-            );
-            // A blank/whitespace override must fall back to the default, not become
-            // the literal (empty) ETF endpoint — same rule as the Access pins.
-            let etf_url = get("FINECO_ETF_URL")
-                .map(|url| url.trim().to_string())
-                .filter(|url| !url.is_empty())
-                .unwrap_or_else(|| DEFAULT_ZERO_COMMISSION_ETFS_URL.to_string());
-            Ok(Some(MarketClient::new(base, allowlist, etf_url)))
+            let hash_list: Vec<String> = hashes
+                .split(',')
+                .map(|hash| hash.trim().to_string())
+                .filter(|hash| !hash.is_empty())
+                .collect();
+            // A hash list that is all separators/whitespace yields no host pin;
+            // fail closed rather than build an allow-nothing allowlist.
+            if hash_list.is_empty() {
+                return Err(ServeError::new(format!(
+                    "{label}: {hashes_key} has no usable host hash"
+                )));
+            }
+            Ok(Some((
+                base,
+                EnrichmentHostAllowlist::from_host_hashes(hash_list),
+            )))
         }
         (None, None) => Ok(None),
-        _ => Err(ServeError::new(
-            "market config needs FINECO_ENRICHMENT_BASE and FINECO_ENRICHMENT_HOST_HASHES together \
-             (FINECO_ETF_URL is optional and defaults to Fineco's public zero-commission list)",
-        )),
+        _ => Err(ServeError::new(format!(
+            "{label} needs {base_key} and {hashes_key} together"
+        ))),
     }
 }
 

@@ -72,7 +72,7 @@ pub fn validate_source_url(
             "Enrichment source URL must use https.",
         ));
     }
-    check_authority_and_path(authority, path, allowlist)
+    check_authority_and_path(authority, path, allowlist, is_stock_page_path)
 }
 
 /// Validates the host pin + stock-page path for a URL the server built from a
@@ -87,14 +87,29 @@ pub(crate) fn validate_fetch_target(
 ) -> Result<(), SafeError> {
     let (_scheme, authority, path) = split_url(url)
         .ok_or_else(|| SafeError::invalid_request("Enrichment source URL is malformed."))?;
-    check_authority_and_path(authority, path, allowlist)
+    check_authority_and_path(authority, path, allowlist, is_stock_page_path)
 }
 
-/// Shared host/path checks: no userinfo, an allowlisted host, a stock-page path.
+/// Like [`validate_fetch_target`] but for the **ETF** enrichment route. The host
+/// pin and the path rule are scoped to this validator (a separate allowlist holds
+/// only the ETF host; the path must be an ETF-profile route), so the stock and ETF
+/// enrichment surfaces cannot widen each other.
+pub(crate) fn validate_etf_fetch_target(
+    url: &str,
+    allowlist: &EnrichmentHostAllowlist,
+) -> Result<(), SafeError> {
+    let (_scheme, authority, path) = split_url(url)
+        .ok_or_else(|| SafeError::invalid_request("Enrichment source URL is malformed."))?;
+    check_authority_and_path(authority, path, allowlist, is_etf_profile_path)
+}
+
+/// Shared host/path checks: no userinfo, an allowlisted host, and a path the
+/// caller's `path_ok` predicate accepts (host-scoped: stock vs ETF route).
 fn check_authority_and_path(
     authority: &str,
     path: &str,
     allowlist: &EnrichmentHostAllowlist,
+    path_ok: fn(&str) -> bool,
 ) -> Result<(), SafeError> {
     if authority.contains('@') {
         return Err(SafeError::invalid_request(
@@ -122,9 +137,9 @@ fn check_authority_and_path(
             "Enrichment source host is not allowed.",
         ));
     }
-    if !is_stock_page_path(&normalized_path(path)) {
+    if !path_ok(&normalized_path(path, path_ok)) {
         return Err(SafeError::invalid_request(
-            "Enrichment source URL does not look like a stock page.",
+            "Enrichment source URL path is not allowed.",
         ));
     }
     Ok(())
@@ -158,12 +173,12 @@ fn normalized_host(authority: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Strip a leading locale segment (`/it`, `/en`, …) when it precedes a stock
-/// page route.
-fn normalized_path(path: &str) -> String {
+/// Strip a leading locale segment (`/it`, `/en`, …) when it precedes a route the
+/// caller's `path_ok` predicate accepts.
+fn normalized_path(path: &str, path_ok: fn(&str) -> bool) -> String {
     for locale in LOCALE_SEGMENTS {
         if let Some(rest) = path.strip_prefix(&format!("/{locale}"))
-            && is_stock_page_path(rest)
+            && path_ok(rest)
         {
             return rest.to_string();
         }
@@ -175,10 +190,83 @@ fn is_stock_page_path(path: &str) -> bool {
     path.starts_with("/stocks/") || path.starts_with("/stock/")
 }
 
+fn is_etf_profile_path(path: &str) -> bool {
+    // Exactly the one route the server builds (`/etf-profile.html`, after locale
+    // stripping). Tighter than a `/etf-profile` prefix so no broader same-host path
+    // could pass even if the configured base or a future caller changed.
+    path == "/etf-profile.html"
+}
+
 /// Lowercase hex SHA-256 of `input`.
 fn sha256_hex(input: &str) -> String {
     Sha256::digest(input.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn etf_allow() -> EnrichmentHostAllowlist {
+        EnrichmentHostAllowlist::from_allowed_hosts(["etf.example"])
+    }
+
+    #[test]
+    fn etf_target_accepts_pinned_host_and_profile_path() {
+        validate_etf_fetch_target(
+            "https://etf.example/en/etf-profile.html?isin=XX0000000001",
+            &etf_allow(),
+        )
+        .expect("etf host + etf-profile path is allowed");
+    }
+
+    #[test]
+    fn etf_target_rejects_offlist_host() {
+        let err = validate_etf_fetch_target(
+            "https://other.example/en/etf-profile.html?isin=XX0000000001",
+            &etf_allow(),
+        )
+        .expect_err("off-allowlist host must be rejected");
+        assert_eq!(err.code(), "invalid_request");
+    }
+
+    #[test]
+    fn etf_target_rejects_non_profile_path_on_etf_host() {
+        // Host-scoping: the ETF validator must not accept a stock-page path even on
+        // the pinned ETF host, so the two enrichment surfaces cannot widen each other.
+        let err = validate_etf_fetch_target("https://etf.example/stock/LSE/VHYL", &etf_allow())
+            .expect_err("stock path must not pass the ETF validator");
+        assert_eq!(err.code(), "invalid_request");
+    }
+
+    #[test]
+    fn etf_target_rejects_broader_etf_profile_prefixed_paths() {
+        // Defense in depth: only the exact /etf-profile.html route is built, so the
+        // validator must reject other /etf-profile-prefixed paths on the pinned host
+        // rather than accept any path that merely starts with /etf-profile.
+        for path in [
+            "/en/etf-profile-admin",
+            "/en/etf-profile/secret",
+            "/en/etf-profile.html.evil",
+            "/etf-profileXYZ",
+        ] {
+            let url = format!("https://etf.example{path}");
+            let err = validate_etf_fetch_target(&url, &etf_allow())
+                .expect_err(&format!("path must be rejected: {path}"));
+            assert_eq!(err.code(), "invalid_request", "path: {path}");
+        }
+    }
+
+    #[test]
+    fn stock_validator_rejects_etf_profile_path() {
+        // Symmetric: the stock validator must not accept the ETF route.
+        let err = validate_source_url(
+            "https://etf.example/en/etf-profile.html?isin=XX0000000001",
+            &etf_allow(),
+        )
+        .expect_err("etf path must not pass the stock validator");
+        assert_eq!(err.code(), "invalid_request");
+    }
 }

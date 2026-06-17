@@ -65,8 +65,10 @@ Product (`crates/`):
   scheduled live refresh (only `portfolio`; holds no credentials).
   The gateway/store-server read a **required** capability-policy JSON file
   (`FINECO_POLICY_PATH`, `load_policy`, fail closed) and the rest of their config
-  from the environment; the enrichment host stays config-only
-  (`FINECO_ENRICHMENT_BASE`/`_HOST_HASHES`/`FINECO_ETF_URL`). Depends on
+  from the environment; the enrichment hosts stay config-only — stock
+  (`FINECO_ENRICHMENT_BASE`/`_HOST_HASHES`) and ETF
+  (`FINECO_ETF_ENRICHMENT_BASE`/`_HOST_HASHES`) are independently optional pairs,
+  plus the optional `FINECO_ETF_URL` list override. Depends on
   `fineco-gateway` + `fineco-query` + `fineco-ipc` (+ core/market/store) and —
   for the M8 worker/controller roles — `fineco-worker` + `fineco-refresh` +
   `fineco-live` (these enter only the binary, never the gateway crate's closure).
@@ -252,14 +254,17 @@ Product (`crates/`):
   `/v1/private/tol/indicesbar/indices` widget shape and returns bounded headline
   cards only; Fineco includes a few FX/commodity/crypto/spread cards there, so
   the result is not a venue registry or complete index universe.
-  When stock details explicitly request `external_enrichment`, the gateway first
+  When details explicitly request `external_enrichment`, the gateway first
   resolves/fetches the requested Fineco sections through market-control, then
   appends the third-party enrichment section via the credential-free
-  `fineco-market` client. If `external_enrichment` is the only requested section,
-  the worker stops after Fineco search identity resolution rather than fetching
-  default quote/profile/core detail endpoints. The supplemental fetch emits its
-  own `external_enrichment` audit line and source entry; the credentialed worker
-  never calls the enrichment host.
+  `fineco-market` client. The append path dispatches by asset type: **stocks** get
+  the equity enrichment section (`external_enrichment`); **ETFs** get an ISIN-keyed
+  ETF reference-data section (`etf_external_enrichment`); other types get a bounded
+  "unsupported asset type" warning. If `external_enrichment` is the only requested
+  section, the worker stops after Fineco search identity resolution rather than
+  fetching default quote/profile/core detail endpoints. The supplemental fetch emits
+  its own `external_enrichment` audit line and source entry; the credentialed worker
+  never calls either enrichment host.
   Market-control audit logs include only status metadata (login/session booleans),
   never cookies or session handles. The gateway has **no** `fineco-live` client —
   it cannot reach the live socket by any path. Verifies Cloudflare Access JWTs
@@ -273,24 +278,29 @@ Product (`crates/`):
   chart/time-series data is captured yet — the store holds
   snapshots/positions/orders/tax only).
 - **`crates/fineco-market`** (M3) — **credential-free** market path: stock
-  enrichment + the public zero-commission ETF list. Reaches **no** authenticated
-  Fineco endpoint and holds **no** credentials. Enrichment is
-  **parse-not-execute**: it extracts the embedded `window.__REACT_QUERY_STATE__`
-  payload textually (no regex dep), normalizes the one JS-ism (`undefined` →
-  `null` outside strings), and parses it with `serde_json` — there is no
-  `eval`/`Function`/JS engine. Source URLs are restricted to a **SHA-256-pinned
-  host** (`EnrichmentHostAllowlist` — hashes only, no plaintext host in source)
-  with a fixed stock-page route. The enrichment client accepts a venue-qualified
-  ticker (`<venue>/<symbol>` or `<venue>:<symbol>`), normalizes it to
-  `/stock/<venue>/<symbol>`, and optionally verifies the parsed page against an
-  `expected_isin` (plain ISIN or ISIN plus suffix). The server builds exactly one
-  URL from a configured base + the validated identifier (no client `url`, no
-  lookup/guessing, no `validateSource`/`userAgent`).
-  There is no standalone enrichment MCP tool: this report is reachable only
-  embedded in `market_get_asset_details` when a stock details request includes
-  `external_enrichment`. The identifier is the Fineco-resolved venue-qualified
-  identifier; Fineco identity remains canonical and cross-source identifier
-  disagreements are bounded warnings.
+  enrichment, ETF reference-data enrichment, and the public zero-commission ETF
+  list. Reaches **no** authenticated Fineco endpoint and holds **no** credentials.
+  Enrichment is **parse-not-execute**: stock enrichment extracts the embedded
+  `window.__REACT_QUERY_STATE__` payload textually (no regex dep), normalizes the
+  one JS-ism (`undefined` → `null` outside strings), and parses it with
+  `serde_json`; ETF enrichment scans a fund "basics" table by stable
+  `data-testid="tl_etf-basics_value_<key>"` anchors. Neither path has an
+  `eval`/`Function`/JS engine. Source URLs are restricted to **SHA-256-pinned
+  hosts** (`EnrichmentHostAllowlist` — hashes only, no plaintext host in source).
+  The stock and ETF routes use **separate, host-scoped** allowlists and path rules
+  (`/stock(s)/` for stocks, `/etf-profile` for ETFs) so neither surface can widen
+  the other. The stock enrichment client accepts a venue-qualified ticker
+  (`<venue>/<symbol>` or `<venue>:<symbol>`), normalizes it to
+  `/stock/<venue>/<symbol>`; ETF enrichment is **ISIN-keyed** (the server builds
+  `…/en/etf-profile.html?isin=<ISIN>` from a configured base + the validated ISIN,
+  always verifying the page header against that ISIN).
+  The server builds exactly one URL per fetch (no client `url`, no lookup/guessing,
+  no `validateSource`/`userAgent`).
+  There is no standalone enrichment MCP tool: these reports are reachable only
+  embedded in `market_get_asset_details` when a details request includes
+  `external_enrichment` (stocks → `external_enrichment`; ETFs → the typed
+  `etf_external_enrichment` section, numerics carrying units). Fineco identity
+  remains canonical and cross-source identifier disagreements are bounded warnings.
   Output is bounded/sanitized. `MarketClient` uses `ureq`+rustls with the
   **aws-lc-rs** backend pinned via `fineco_tls::tls_config()` (redirects
   disabled). Depends on `fineco-core` + `fineco-tls` (+ `serde`/`serde_json`/`sha2`).

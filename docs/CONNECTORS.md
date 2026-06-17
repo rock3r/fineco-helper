@@ -79,12 +79,14 @@ On a **dual-pin** deployment the two Access channels are scoped differently:
   `portfolio_get_history`, `portfolio_get_position_history`,
   `market_search_asset`, `market_get_asset_details`, `market_get_indices`.
   Those are hidden from `tools/list` and refused by `tools/call` on the connector
-  channel. This also hides the `external_enrichment` details section by default,
-  because that section is available only through `market_get_asset_details`. With
-  the standalone `market_get_stock_enrichment` wrapper removed, third-party stock
-  enrichment is reachable **only** through that authenticated details path, so it
-  is not available on the default connector channel at all — surface it explicitly
-  via `FINECO_CONNECTOR_TOOLS` or use the CLI channel.
+  channel. This also hides the `external_enrichment` details section by default
+  (both the stock `external_enrichment` and the ETF `etf_external_enrichment`
+  outputs, which share the one `ExternalEnrichment` section toggle), because that
+  section is available only through `market_get_asset_details`. With the standalone
+  `market_get_stock_enrichment` wrapper removed, third-party enrichment is reachable
+  **only** through that authenticated details path, so it is not available on the
+  default connector channel at all — surface it explicitly via
+  `FINECO_CONNECTOR_TOOLS` or use the CLI channel.
 
 Everything else — `portfolio_get_freshness`, `portfolio_get_latest_shareable_report`,
 `portfolio_get_allocation_history`, `orders_get_latest_monitor`, both tax tools,
