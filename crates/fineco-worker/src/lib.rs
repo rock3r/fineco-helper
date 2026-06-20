@@ -41,9 +41,9 @@ use fineco_ipc::{
     MARKET_SESSION_REUSE_TTL_SECS, MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher,
     MarketAssetDetailsLiveResult, MarketAssetDetailsResult, MarketAssetIdentity,
     MarketAssetSections, MarketAssetType, MarketDetailsParams, MarketDetailsSection, MarketField,
-    MarketIndicesLiveFetcher, MarketIndicesLiveResult, MarketIndicesParams, MarketSearchCandidate,
-    MarketSearchLiveFetcher, MarketSearchLiveResult, MarketSearchParams, MarketSessionStatus,
-    MarketSource,
+    MarketIndicesLiveFetcher, MarketIndicesLiveResult, MarketIndicesParams, MarketLiveError,
+    MarketSearchCandidate, MarketSearchLiveFetcher, MarketSearchLiveResult, MarketSearchParams,
+    MarketSessionStatus, MarketSource,
 };
 use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder};
@@ -319,9 +319,13 @@ impl FinecoWorker {
         &self,
         now_iso: &str,
         read: impl Fn(&str) -> Result<T, SafeError>,
-    ) -> Result<(T, MarketSessionStatus), SafeError> {
-        let now_epoch = parse_iso8601_utc(now_iso).ok_or_else(SafeError::internal)?;
-        let acquired = self.acquire_market_session(now_epoch)?;
+    ) -> Result<(T, MarketSessionStatus), MarketLiveError> {
+        let now_epoch = parse_iso8601_utc(now_iso)
+            .ok_or_else(SafeError::internal)
+            .map_err(MarketLiveError::from)?;
+        let acquired = self
+            .acquire_market_session(now_epoch)
+            .map_err(MarketLiveError::from)?;
         match read(acquired.cookie.as_str()) {
             Ok(value) => {
                 // The read proved the session good and reset the server idle timer:
@@ -354,9 +358,12 @@ impl FinecoWorker {
             Err(error) if error.code() == "market_auth_required" => {
                 self.evict_market_session();
                 if !acquired.reused {
-                    return Err(error);
+                    return Err(MarketLiveError::from(error));
                 }
-                let fresh = self.login().map_err(market_login_error)?;
+                let fresh = self
+                    .login()
+                    .map_err(market_login_error)
+                    .map_err(MarketLiveError::from)?;
                 let cookie = fresh.cookie.clone();
                 let expires = fresh.expires_in_secs;
                 self.store_market_session(fresh, now_epoch);
@@ -382,14 +389,44 @@ impl FinecoWorker {
                         if error.code() == "market_auth_required" {
                             self.evict_market_session();
                         }
-                        Err(error)
+                        Err(MarketLiveError::new(
+                            error,
+                            Some(MarketSessionStatus {
+                                login_performed: true,
+                                session_reused: false,
+                                session_evicted: true,
+                                reused_session_401_recovered: true,
+                                session_expires_in_secs: expires,
+                            }),
+                        ))
                     }
                 }
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if should_preserve_market_session_after_error(&error) {
+                    self.store_market_session_parts(
+                        acquired.cookie.clone(),
+                        acquired.expires_in_secs,
+                        now_epoch,
+                    );
+                }
+                Err(MarketLiveError::new(
+                    error,
+                    Some(if acquired.reused {
+                        MarketSessionStatus {
+                            login_performed: false,
+                            session_reused: true,
+                            session_evicted: false,
+                            reused_session_401_recovered: false,
+                            session_expires_in_secs: acquired.expires_in_secs,
+                        }
+                    } else {
+                        MarketSessionStatus::fresh_login_with_expiry(acquired.expires_in_secs)
+                    }),
+                ))
+            }
         }
     }
-
     /// Reuse a still-valid held market session, or log in fresh (holding the new
     /// session when reuse is enabled). With reuse disabled, always logs in fresh
     /// and holds nothing (the historic stateless-per-call behavior).
@@ -613,6 +650,13 @@ impl FinecoWorker {
     }
 }
 
+fn should_preserve_market_session_after_error(error: &SafeError) -> bool {
+    matches!(
+        error.code(),
+        "market_not_found" | "market_ambiguous_identifier" | "market_unsupported_asset_type"
+    )
+}
+
 impl PortfolioFetcher for FinecoWorker {
     fn fetch_portfolio(&self, now_iso: &str) -> Result<NewPortfolioSnapshot, SafeError> {
         let session = self.refresh_login()?;
@@ -702,8 +746,8 @@ impl MarketSearchLiveFetcher for FinecoWorker {
         &self,
         params: &MarketSearchParams,
         now_iso: &str,
-    ) -> Result<MarketSearchLiveResult, SafeError> {
-        params.validate()?;
+    ) -> Result<MarketSearchLiveResult, MarketLiveError> {
+        params.validate().map_err(MarketLiveError::from)?;
         let url = format!(
             "{}?term={}",
             self.endpoints.global_search,
@@ -728,9 +772,10 @@ impl MarketAssetDetailsLiveFetcher for FinecoWorker {
         &self,
         params: &MarketDetailsParams,
         now_iso: &str,
-    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
-        params.validate()?;
-        let parsed = ParsedMarketIdentifier::parse(&params.identifier)?;
+    ) -> Result<MarketAssetDetailsLiveResult, MarketLiveError> {
+        params.validate().map_err(MarketLiveError::from)?;
+        let parsed =
+            ParsedMarketIdentifier::parse(&params.identifier).map_err(MarketLiveError::from)?;
         // The whole resolve-and-fetch fan-out runs on one session under
         // `run_market_read`: it shares a single login across every endpoint, and a
         // reused session the server has expired (a 401 on any call) re-runs this
@@ -936,8 +981,8 @@ impl MarketIndicesLiveFetcher for FinecoWorker {
         &self,
         params: &MarketIndicesParams,
         now_iso: &str,
-    ) -> Result<MarketIndicesLiveResult, SafeError> {
-        params.validate()?;
+    ) -> Result<MarketIndicesLiveResult, MarketLiveError> {
+        params.validate().map_err(MarketLiveError::from)?;
         let (result, session) = self.run_market_read(now_iso, |cookie| {
             let response: parse::MarketIndicesResponse =
                 self.get_market_json(&self.endpoints.indicesbar, cookie, MARKET_SEARCH_REFERER)?;

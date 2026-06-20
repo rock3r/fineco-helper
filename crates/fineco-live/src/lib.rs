@@ -36,7 +36,7 @@ pub use fineco_ipc::{
 };
 use fineco_ipc::{
     MarketAssetDetailsLiveResult, MarketDetailsParams, MarketIndicesLiveResult,
-    MarketIndicesParams, MarketSearchLiveResult, MarketSearchParams, SafeErrorDto,
+    MarketIndicesParams, MarketLiveError, MarketSearchLiveResult, MarketSearchParams, SafeErrorDto,
 };
 use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{
@@ -168,7 +168,61 @@ pub enum LiveResponse {
 #[serde(tag = "status", content = "body", rename_all = "snake_case")]
 enum LiveReply {
     Ok(LiveResponse),
-    Err(SafeErrorDto),
+    Err {
+        error: SafeErrorDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_session: Option<fineco_ipc::MarketSessionStatus>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LiveError {
+    error: SafeError,
+    market_session: Option<fineco_ipc::MarketSessionStatus>,
+}
+
+impl LiveError {
+    fn new(error: SafeError, market_session: Option<fineco_ipc::MarketSessionStatus>) -> Self {
+        Self {
+            error,
+            market_session,
+        }
+    }
+}
+
+impl From<SafeError> for LiveError {
+    fn from(error: SafeError) -> Self {
+        Self::new(error, None)
+    }
+}
+
+impl From<MarketLiveError> for LiveError {
+    fn from(error: MarketLiveError) -> Self {
+        Self::new(error.error, error.session)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveCallError {
+    error: SafeError,
+    market_session: Option<fineco_ipc::MarketSessionStatus>,
+}
+
+impl LiveCallError {
+    fn safe(error: SafeError) -> Self {
+        Self {
+            error,
+            market_session: None,
+        }
+    }
+
+    fn into_safe_error(self) -> SafeError {
+        self.error
+    }
+
+    fn into_market_error(self) -> MarketLiveError {
+        MarketLiveError::new(self.error, self.market_session)
+    }
 }
 
 /// Dispatch one [`LiveRequest`] to the worker's fetchers, producing a
@@ -178,7 +232,7 @@ enum LiveReply {
 ///
 /// # Errors
 /// The fetcher's [`SafeError`] on validation/auth/upstream/internal failure.
-pub fn handle_live_request<F>(fetcher: &F, request: LiveRequest) -> Result<LiveResponse, SafeError>
+fn handle_live_request<F>(fetcher: &F, request: LiveRequest) -> Result<LiveResponse, LiveError>
 where
     F: PortfolioFetcher
         + RawOrdersFetcher
@@ -191,24 +245,31 @@ where
     match request {
         LiveRequest::Portfolio(p) => fetcher
             .fetch_portfolio(&p.now_iso)
+            .map_err(LiveError::from)
             .map(LiveResponse::Portfolio),
         LiveRequest::Orders(p) => fetcher
             .fetch_raw_orders(&p.instrument_kind, p.days)
+            .map_err(LiveError::from)
             .map(LiveResponse::Orders),
         LiveRequest::TaxCarryForward(p) => fetcher
             .fetch_tax_carry_forward(&p.date_from, &p.date_to)
+            .map_err(LiveError::from)
             .map(LiveResponse::TaxCarryForward),
         LiveRequest::TaxMinusByYear => fetcher
             .fetch_tax_minus_by_year()
+            .map_err(LiveError::from)
             .map(LiveResponse::TaxMinusByYear),
         LiveRequest::MarketSearch(p) => fetcher
             .fetch_market_search(&p.search, &p.now_iso)
+            .map_err(LiveError::from)
             .map(LiveResponse::MarketSearch),
         LiveRequest::MarketAssetDetails(p) => fetcher
             .fetch_market_asset_details(&p.details, &p.now_iso)
+            .map_err(LiveError::from)
             .map(|result| LiveResponse::MarketAssetDetails(Box::new(result))),
         LiveRequest::MarketIndices(p) => fetcher
             .fetch_market_indices(&p.indices, &p.now_iso)
+            .map_err(LiveError::from)
             .map(LiveResponse::MarketIndices),
     }
 }
@@ -269,9 +330,15 @@ where
     let reply = match decoded {
         Ok(request) => match handle_live_request(fetcher, request) {
             Ok(body) => LiveReply::Ok(body),
-            Err(error) => LiveReply::Err(SafeErrorDto::from(&error)),
+            Err(error) => LiveReply::Err {
+                error: SafeErrorDto::from(&error.error),
+                market_session: error.market_session,
+            },
         },
-        Err(error) => LiveReply::Err(SafeErrorDto::from(&error)),
+        Err(error) => LiveReply::Err {
+            error: SafeErrorDto::from(&error),
+            market_session: None,
+        },
     };
     fineco_ipc::write_message(stream, &reply)
 }
@@ -306,18 +373,24 @@ impl LiveClient {
     /// `live_transport_failure` so the controller does not infer that a worker
     /// Fineco login happened. Once the request is written, a missing reply is
     /// ambiguous and stays `internal`; the controller debits conservatively.
-    fn call(&self, request: &LiveRequest) -> Result<LiveResponse, SafeError> {
-        let mut stream =
-            UnixStream::connect(&self.path).map_err(|_| SafeError::live_transport_failure())?;
+    fn call(&self, request: &LiveRequest) -> Result<LiveResponse, LiveCallError> {
+        let mut stream = UnixStream::connect(&self.path)
+            .map_err(|_| LiveCallError::safe(SafeError::live_transport_failure()))?;
         let _ = stream.set_read_timeout(Some(client_timeout_for(request)));
         let _ = stream.set_write_timeout(Some(LIVE_SERVER_TIMEOUT));
         fineco_ipc::write_message(&mut stream, request)
-            .map_err(|_| SafeError::live_transport_failure())?;
-        let reply: LiveReply =
-            fineco_ipc::read_message(&mut stream).map_err(|_| SafeError::internal())?;
+            .map_err(|_| LiveCallError::safe(SafeError::live_transport_failure()))?;
+        let reply: LiveReply = fineco_ipc::read_message(&mut stream)
+            .map_err(|_| LiveCallError::safe(SafeError::internal()))?;
         match reply {
             LiveReply::Ok(body) => Ok(body),
-            LiveReply::Err(dto) => Err(safe_error_from_dto(&dto)),
+            LiveReply::Err {
+                error,
+                market_session,
+            } => Err(LiveCallError {
+                error: safe_error_from_dto(&error),
+                market_session,
+            }),
         }
     }
 }
@@ -337,9 +410,12 @@ fn client_timeout_for(request: &LiveRequest) -> Duration {
 
 impl PortfolioFetcher for LiveClient {
     fn fetch_portfolio(&self, now_iso: &str) -> Result<NewPortfolioSnapshot, SafeError> {
-        match self.call(&LiveRequest::Portfolio(LivePortfolioParams {
-            now_iso: now_iso.to_string(),
-        }))? {
+        match self
+            .call(&LiveRequest::Portfolio(LivePortfolioParams {
+                now_iso: now_iso.to_string(),
+            }))
+            .map_err(LiveCallError::into_safe_error)?
+        {
             LiveResponse::Portfolio(snapshot) => Ok(snapshot),
             // The worker answered a portfolio request with the wrong response
             // type: a protocol violation, never surfaced as a payload.
@@ -354,18 +430,22 @@ impl LiveClient {
     /// the normalized candidates can use the trait method and unwrap `.result`.
     ///
     /// # Errors
-    /// [`SafeError`] on worker/transport failure.
+    /// [`MarketLiveError`] on worker/transport failure, optionally with
+    /// status-only session facts for market read errors.
     pub fn fetch_market_search_live(
         &self,
         params: &MarketSearchParams,
         now_iso: &str,
-    ) -> Result<MarketSearchLiveResult, SafeError> {
-        match self.call(&LiveRequest::MarketSearch(LiveMarketSearchParams {
-            search: params.clone(),
-            now_iso: now_iso.to_string(),
-        }))? {
+    ) -> Result<MarketSearchLiveResult, MarketLiveError> {
+        match self
+            .call(&LiveRequest::MarketSearch(LiveMarketSearchParams {
+                search: params.clone(),
+                now_iso: now_iso.to_string(),
+            }))
+            .map_err(LiveCallError::into_market_error)?
+        {
             LiveResponse::MarketSearch(result) => Ok(result),
-            _ => Err(SafeError::internal()),
+            _ => Err(MarketLiveError::from(SafeError::internal())),
         }
     }
 
@@ -373,18 +453,22 @@ impl LiveClient {
     /// session facts.
     ///
     /// # Errors
-    /// [`SafeError`] on worker/transport failure.
+    /// [`MarketLiveError`] on worker/transport failure, optionally with
+    /// status-only session facts for market read errors.
     pub fn fetch_market_asset_details_live(
         &self,
         params: &MarketDetailsParams,
         now_iso: &str,
-    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
-        match self.call(&LiveRequest::MarketAssetDetails(LiveMarketDetailsParams {
-            details: params.clone(),
-            now_iso: now_iso.to_string(),
-        }))? {
+    ) -> Result<MarketAssetDetailsLiveResult, MarketLiveError> {
+        match self
+            .call(&LiveRequest::MarketAssetDetails(LiveMarketDetailsParams {
+                details: params.clone(),
+                now_iso: now_iso.to_string(),
+            }))
+            .map_err(LiveCallError::into_market_error)?
+        {
             LiveResponse::MarketAssetDetails(result) => Ok(*result),
-            _ => Err(SafeError::internal()),
+            _ => Err(MarketLiveError::from(SafeError::internal())),
         }
     }
 
@@ -392,18 +476,22 @@ impl LiveClient {
     /// session facts.
     ///
     /// # Errors
-    /// [`SafeError`] on worker/transport failure.
+    /// [`MarketLiveError`] on worker/transport failure, optionally with
+    /// status-only session facts for market read errors.
     pub fn fetch_market_indices_live(
         &self,
         params: &MarketIndicesParams,
         now_iso: &str,
-    ) -> Result<MarketIndicesLiveResult, SafeError> {
-        match self.call(&LiveRequest::MarketIndices(LiveMarketIndicesParams {
-            indices: params.clone(),
-            now_iso: now_iso.to_string(),
-        }))? {
+    ) -> Result<MarketIndicesLiveResult, MarketLiveError> {
+        match self
+            .call(&LiveRequest::MarketIndices(LiveMarketIndicesParams {
+                indices: params.clone(),
+                now_iso: now_iso.to_string(),
+            }))
+            .map_err(LiveCallError::into_market_error)?
+        {
             LiveResponse::MarketIndices(result) => Ok(result),
-            _ => Err(SafeError::internal()),
+            _ => Err(MarketLiveError::from(SafeError::internal())),
         }
     }
 }
@@ -413,7 +501,7 @@ impl MarketSearchLiveFetcher for LiveClient {
         &self,
         params: &MarketSearchParams,
         now_iso: &str,
-    ) -> Result<MarketSearchLiveResult, SafeError> {
+    ) -> Result<MarketSearchLiveResult, MarketLiveError> {
         self.fetch_market_search_live(params, now_iso)
     }
 }
@@ -423,7 +511,7 @@ impl MarketAssetDetailsLiveFetcher for LiveClient {
         &self,
         params: &MarketDetailsParams,
         now_iso: &str,
-    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
+    ) -> Result<MarketAssetDetailsLiveResult, MarketLiveError> {
         self.fetch_market_asset_details_live(params, now_iso)
     }
 }
@@ -433,7 +521,7 @@ impl MarketIndicesLiveFetcher for LiveClient {
         &self,
         params: &MarketIndicesParams,
         now_iso: &str,
-    ) -> Result<MarketIndicesLiveResult, SafeError> {
+    ) -> Result<MarketIndicesLiveResult, MarketLiveError> {
         self.fetch_market_indices_live(params, now_iso)
     }
 }
@@ -444,10 +532,13 @@ impl OrdersFetcher for LiveClient {
         instrument_kind: &str,
         days: u32,
     ) -> Result<Vec<NewOrder>, SafeError> {
-        match self.call(&LiveRequest::Orders(LiveOrdersParams {
-            instrument_kind: instrument_kind.to_string(),
-            days,
-        }))? {
+        match self
+            .call(&LiveRequest::Orders(LiveOrdersParams {
+                instrument_kind: instrument_kind.to_string(),
+                days,
+            }))
+            .map_err(LiveCallError::into_safe_error)?
+        {
             // Hash the raw broker ids controller-side (the worker has no key).
             LiveResponse::Orders(raw_orders) => raw_orders
                 .iter()
@@ -464,17 +555,23 @@ impl TaxFetcher for LiveClient {
         date_from: &str,
         date_to: &str,
     ) -> Result<NewTaxCarryForward, SafeError> {
-        match self.call(&LiveRequest::TaxCarryForward(LiveTaxCarryForwardParams {
-            date_from: date_from.to_string(),
-            date_to: date_to.to_string(),
-        }))? {
+        match self
+            .call(&LiveRequest::TaxCarryForward(LiveTaxCarryForwardParams {
+                date_from: date_from.to_string(),
+                date_to: date_to.to_string(),
+            }))
+            .map_err(LiveCallError::into_safe_error)?
+        {
             LiveResponse::TaxCarryForward(carry_forward) => Ok(carry_forward),
             _ => Err(SafeError::internal()),
         }
     }
 
     fn fetch_tax_minus_by_year(&self) -> Result<Vec<NewTaxMinusByYear>, SafeError> {
-        match self.call(&LiveRequest::TaxMinusByYear)? {
+        match self
+            .call(&LiveRequest::TaxMinusByYear)
+            .map_err(LiveCallError::into_safe_error)?
+        {
             LiveResponse::TaxMinusByYear(rows) => Ok(rows),
             _ => Err(SafeError::internal()),
         }
@@ -591,7 +688,7 @@ mod tests {
             )
             .expect_err("missing live socket is a local transport failure");
 
-        assert_eq!(err.code(), "live_transport_failure");
+        assert_eq!(err.error.code(), "live_transport_failure");
     }
 
     #[test]
@@ -623,6 +720,6 @@ mod tests {
 
         server.join().expect("server joined");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(err.code(), "internal");
+        assert_eq!(err.error.code(), "internal");
     }
 }

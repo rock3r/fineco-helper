@@ -15,8 +15,8 @@ use fineco_ipc::{
     MarketAssetIdentity, MarketAssetSections, MarketAssetType, MarketDetailsParams,
     MarketDetailsSection, MarketField, MarketIndexCard, MarketIndexRegion,
     MarketIndicesLiveFetcher, MarketIndicesLiveResult, MarketIndicesParams, MarketIndicesResult,
-    MarketSearchCandidate, MarketSearchGroup, MarketSearchLiveResult, MarketSearchParams,
-    MarketSearchResult, MarketSessionStatus,
+    MarketLiveError, MarketSearchCandidate, MarketSearchGroup, MarketSearchLiveResult,
+    MarketSearchParams, MarketSearchResult, MarketSessionStatus,
 };
 use fineco_live::{LiveClient, MarketSearchLiveFetcher, serve_live_blocking};
 use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
@@ -138,12 +138,15 @@ impl MarketSearchLiveFetcher for FakeWorker {
         &self,
         params: &MarketSearchParams,
         now_iso: &str,
-    ) -> Result<MarketSearchLiveResult, SafeError> {
-        self.market_search.clone().map(|mut result| {
-            result.result.query = params.query.clone();
-            result.result.captured_at = now_iso.to_string();
-            result
-        })
+    ) -> Result<MarketSearchLiveResult, MarketLiveError> {
+        self.market_search
+            .clone()
+            .map_err(MarketLiveError::from)
+            .map(|mut result| {
+                result.result.query = params.query.clone();
+                result.result.captured_at = now_iso.to_string();
+                result
+            })
     }
 }
 
@@ -152,12 +155,15 @@ impl MarketAssetDetailsLiveFetcher for FakeWorker {
         &self,
         params: &MarketDetailsParams,
         now_iso: &str,
-    ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
-        self.market_details.clone().map(|mut result| {
-            result.result.asset.identifier = params.identifier.clone();
-            result.result.captured_at = now_iso.to_string();
-            result
-        })
+    ) -> Result<MarketAssetDetailsLiveResult, MarketLiveError> {
+        self.market_details
+            .clone()
+            .map_err(MarketLiveError::from)
+            .map(|mut result| {
+                result.result.asset.identifier = params.identifier.clone();
+                result.result.captured_at = now_iso.to_string();
+                result
+            })
     }
 }
 
@@ -166,11 +172,14 @@ impl MarketIndicesLiveFetcher for FakeWorker {
         &self,
         _params: &MarketIndicesParams,
         now_iso: &str,
-    ) -> Result<MarketIndicesLiveResult, SafeError> {
-        self.market_indices.clone().map(|mut result| {
-            result.result.captured_at = now_iso.to_string();
-            result
-        })
+    ) -> Result<MarketIndicesLiveResult, MarketLiveError> {
+        self.market_indices
+            .clone()
+            .map_err(MarketLiveError::from)
+            .map(|mut result| {
+                result.result.captured_at = now_iso.to_string();
+                result
+            })
     }
 }
 

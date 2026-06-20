@@ -1373,7 +1373,7 @@ impl fineco_live::MarketSearchLiveFetcher for FakeLiveWorker {
         &self,
         params: &fineco_ipc::MarketSearchParams,
         now_iso: &str,
-    ) -> Result<fineco_ipc::MarketSearchLiveResult, fineco_core::SafeError> {
+    ) -> Result<fineco_ipc::MarketSearchLiveResult, fineco_ipc::MarketLiveError> {
         Ok(fineco_ipc::MarketSearchLiveResult {
             result: fineco_ipc::MarketSearchResult {
                 query: params.query.clone(),
@@ -1408,7 +1408,7 @@ impl fineco_live::MarketAssetDetailsLiveFetcher for FakeLiveWorker {
         &self,
         params: &fineco_ipc::MarketDetailsParams,
         now_iso: &str,
-    ) -> Result<fineco_ipc::MarketAssetDetailsLiveResult, fineco_core::SafeError> {
+    ) -> Result<fineco_ipc::MarketAssetDetailsLiveResult, fineco_ipc::MarketLiveError> {
         Ok(fineco_ipc::MarketAssetDetailsLiveResult {
             result: fineco_ipc::MarketAssetDetailsResult {
                 schema_version: 1,
@@ -1483,7 +1483,7 @@ impl fineco_live::MarketIndicesLiveFetcher for FakeLiveWorker {
         &self,
         _params: &fineco_ipc::MarketIndicesParams,
         now_iso: &str,
-    ) -> Result<fineco_ipc::MarketIndicesLiveResult, fineco_core::SafeError> {
+    ) -> Result<fineco_ipc::MarketIndicesLiveResult, fineco_ipc::MarketLiveError> {
         Ok(fineco_ipc::MarketIndicesLiveResult {
             result: fineco_ipc::MarketIndicesResult {
                 schema_version: 1,
