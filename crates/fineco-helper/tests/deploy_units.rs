@@ -300,6 +300,24 @@ fn private_worker_unit_holds_creds_has_network_and_no_db() {
 }
 
 #[test]
+fn runbooks_verify_private_worker_boot_persistence() {
+    for doc in ["docs/DEPLOYMENT.md", "docs/SELF-HOSTING.md"] {
+        let body = repo_file(doc);
+        for needle in [
+            "systemctl is-enabled fineco-store-server fineco-gateway fineco-private-worker cloudflared",
+            "systemctl is-active  fineco-store-server fineco-gateway fineco-private-worker cloudflared",
+            "test -S /run/fineco-worker/fineco-live.sock",
+            "live_transport_failure",
+        ] {
+            assert!(
+                body.contains(needle),
+                "{doc} must document the private-worker boot-persistence check `{needle}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn tmpfiles_declares_the_three_setgid_socket_dirs() {
     // Each socket dir is setgid 2750 to its IPC group so the socket inherits the group;
     // owner-write only (no group write) so only the SERVING process creates/unlinks the

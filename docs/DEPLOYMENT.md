@@ -164,6 +164,20 @@ systemctl enable --now fineco-store-server.service fineco-gateway.service cloudf
 systemctl enable --now fineco-private-worker.service                            # M8 live refresh (after private-worker.env exists)
 ```
 
+Post-deploy verification must check **boot persistence**, not only the current
+process state:
+
+```
+systemctl is-enabled fineco-store-server fineco-gateway fineco-private-worker cloudflared
+systemctl is-active  fineco-store-server fineco-gateway fineco-private-worker cloudflared
+test -S /run/fineco-worker/fineco-live.sock
+```
+
+`fineco-private-worker` is easy to miss because cached tools still work when it is
+down: the gateway and store-server remain healthy, but authenticated market tools
+fail immediately with `live_transport_failure`. Always include the worker in both
+`enable --now` and the post-reboot `is-enabled`/socket checks.
+
 The capability policy (`/etc/fineco/policy.json`) is **required** — both roles
 fail closed without it. Grant `owner` only the capabilities for the tools you
 expose (`market.read`, `portfolio.cached.full_read`, `portfolio.shareable.read`,
