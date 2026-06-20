@@ -167,12 +167,22 @@ The bundled `cloudflared` unit runs `/usr/bin/cloudflared` — install the
     systemctl daemon-reload
     systemctl enable --now fineco-store-server fineco-gateway fineco-private-worker cloudflared
 
-Verify: all units `active`; the gateway boots (it fails closed without a valid
-Access config); `cloudflared` registers; an authenticated MCP `initialize` to your
-public hostname returns HTTP 200; a cached read works. Live refresh works once the
-worker credential + a `*.live.refresh` capability are in place. Fineco-backed
-market reads also need the worker credential, but keep them dark until the full
-market live-session gate is green.
+Verify that the units are both **enabled** (survive reboot) and **active** now:
+
+    systemctl is-enabled fineco-store-server fineco-gateway fineco-private-worker cloudflared
+    systemctl is-active  fineco-store-server fineco-gateway fineco-private-worker cloudflared
+    test -S /run/fineco-worker/fineco-live.sock
+
+Do not skip the `fineco-private-worker` checks. Cached tools can still work when
+the private worker is missing, but authenticated market tools then fail with
+`live_transport_failure` because the live socket does not exist.
+
+Then verify: the gateway boots (it fails closed without a valid Access config);
+`cloudflared` registers; an authenticated MCP `initialize` to your public hostname
+returns HTTP 200; a cached read works. Live refresh works once the worker
+credential + a `*.live.refresh` capability are in place. Fineco-backed market
+reads also need the worker credential, but keep them dark until the full market
+live-session gate is green.
 
 ### 8. Backups (strongly recommended)
 
