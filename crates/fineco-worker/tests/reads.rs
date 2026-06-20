@@ -225,8 +225,8 @@ fn market_search_login_failure_uses_a_market_error_code() {
             NOW,
         )
         .expect_err("market login against a missing endpoint must fail");
-    assert_eq!(err.code(), "market_unexpected_response");
-    assert!(!err.safe_message().contains("SYNTHETIC"));
+    assert_eq!(err.error.code(), "market_unexpected_response");
+    assert!(!err.error.safe_message().contains("SYNTHETIC"));
 }
 
 #[test]
@@ -680,8 +680,8 @@ fn unsupported_asset_details_stop_after_resolution() {
         )
         .expect_err("unsupported details should fail closed after search resolution");
 
-    assert_eq!(err.code(), "market_unsupported_asset_type");
-    assert!(err.safe_message().contains("cfd"));
+    assert_eq!(err.error.code(), "market_unsupported_asset_type");
+    assert!(err.error.safe_message().contains("cfd"));
 }
 
 #[test]
@@ -759,6 +759,18 @@ fn spawn_login_counting_mock(logins: Arc<AtomicUsize>) -> String {
             if req.method == "POST" && path == "/v1/public/authentications/web/login" {
                 logins.fetch_add(1, Ordering::SeqCst);
             }
+            if req.method == "GET"
+                && path == "/v1/private/tol/stocklists/search/global"
+                && req.path.contains("term=NOPE")
+            {
+                if !req
+                    .header("Cookie")
+                    .is_some_and(|cookie| cookie.contains(mock_fineco::SESSION_COOKIE))
+                {
+                    return httptiny::Response::json(401, "{\"error\":\"unauthenticated\"}");
+                }
+                return httptiny::Response::json(200, "{}");
+            }
             mock_fineco::route(req)
         });
     });
@@ -831,6 +843,39 @@ fn market_reads_reuse_a_held_session_within_the_ttl() {
     assert!(fourth.session.login_performed);
     assert!(!fourth.session.session_reused);
     assert_eq!(logins.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn resolver_misses_refresh_the_held_market_session_ttl() {
+    let logins = Arc::new(AtomicUsize::new(0));
+    let base = spawn_login_counting_mock(Arc::clone(&logins));
+    let worker = worker_for(&base);
+
+    worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:00:00Z")
+        .expect("first read opens the reuse window");
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+
+    let miss = worker
+        .fetch_market_asset_details(
+            &MarketDetailsParams {
+                identifier: "NASDAQ/NOPE".to_string(),
+                expected_isin: None,
+                sections: Some(vec![MarketDetailsSection::Identity]),
+            },
+            "2026-06-03T12:02:50Z",
+        )
+        .expect_err("unknown instrument is a safe resolver miss");
+    assert_eq!(miss.error.code(), "market_not_found");
+    assert!(miss.session.expect("session facts").session_reused);
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+
+    let reused = worker
+        .fetch_market_indices(&indices_params(), "2026-06-03T12:05:40Z")
+        .expect("resolver miss refreshed the worker reuse ttl");
+    assert!(reused.session.session_reused);
+    assert!(!reused.session.login_performed);
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -921,7 +966,7 @@ fn a_fresh_login_401_evicts_the_session_so_the_next_read_relogs_in() {
     let err = worker
         .fetch_market_indices(&indices_params(), "2026-06-03T12:00:00Z")
         .expect_err("a fresh-login 401 surfaces as market_auth_required");
-    assert_eq!(err.code(), "market_auth_required");
+    assert_eq!(err.error.code(), "market_auth_required");
     assert_eq!(logins.load(Ordering::SeqCst), 1);
 
     // The next read within the window must re-login (the bad session was evicted),

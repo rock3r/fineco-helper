@@ -957,6 +957,32 @@ pub struct MarketSessionStatus {
     pub session_expires_in_secs: Option<u64>,
 }
 
+/// Authenticated-market worker error plus optional status-only session facts.
+/// This is internal to the live/controller boundary: it lets the controller
+/// account for a fresh-login recovery even when the final market read returns a
+/// resolver/domain error instead of a payload.
+#[derive(Debug, Clone)]
+pub struct MarketLiveError {
+    pub error: SafeError,
+    pub session: Option<MarketSessionStatus>,
+}
+
+impl MarketLiveError {
+    #[must_use]
+    pub fn new(error: SafeError, session: Option<MarketSessionStatus>) -> Self {
+        Self { error, session }
+    }
+}
+
+impl From<SafeError> for MarketLiveError {
+    fn from(error: SafeError) -> Self {
+        Self {
+            error,
+            session: None,
+        }
+    }
+}
+
 impl MarketDetailsParams {
     /// Validate details request bounds at every boundary.
     ///
@@ -1038,7 +1064,7 @@ pub trait MarketSearchLiveFetcher {
         &self,
         params: &MarketSearchParams,
         now_iso: &str,
-    ) -> Result<MarketSearchLiveResult, SafeError>;
+    ) -> Result<MarketSearchLiveResult, MarketLiveError>;
 }
 
 /// Authenticated market details fetcher served by the credentialed live worker.
@@ -1051,7 +1077,7 @@ pub trait MarketAssetDetailsLiveFetcher {
         &self,
         params: &MarketDetailsParams,
         now_iso: &str,
-    ) -> Result<MarketAssetDetailsLiveResult, SafeError>;
+    ) -> Result<MarketAssetDetailsLiveResult, MarketLiveError>;
 }
 
 /// Authenticated market indices-bar fetcher served by the credentialed live worker.
@@ -1064,7 +1090,7 @@ pub trait MarketIndicesLiveFetcher {
         &self,
         params: &MarketIndicesParams,
         now_iso: &str,
-    ) -> Result<MarketIndicesLiveResult, SafeError>;
+    ) -> Result<MarketIndicesLiveResult, MarketLiveError>;
 }
 
 impl MarketSearchParams {

@@ -36,7 +36,9 @@ in place for `market_search_asset`, `market_get_asset_details`, and
 `MarketAssetDetailsLiveResult` / `MarketIndicesLiveResult` carrying
 `MarketSessionStatus` (`login_performed`, `session_reused`, `session_evicted`,
 `reused_session_401_recovered`, optional expiry TTL) and no cookie values, auth
-headers, raw `Set-Cookie`, or session handles.
+headers, raw `Set-Cookie`, or session handles. Resolver/domain errors on the
+authenticated-market path can carry the same status-only facts so the controller
+can distinguish a plain reused miss from a miss after a fresh relogin recovery.
 
 **Cross-call session reuse (D-22).** The worker holds one `Zeroizing` market
 session and reuses it for a follow-up market read within

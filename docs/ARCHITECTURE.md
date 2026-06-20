@@ -154,9 +154,9 @@ Product (`crates/`):
   authenticated **market** reads additionally **hold one session for cross-call
   reuse** within `MARKET_SESSION_REUSE_TTL_SECS` (a fixed 180 s; plan D-22), so a
   basket of back-to-back instrument reads rides one login. Market live responses
-  report status-only session facts (`login_performed`, `session_reused`,
-  eviction/recovery flags, optional session-cookie expiry TTL from
-  `Max-Age`/`Expires`) across `fineco-live`; the controller models the same
+  and selected resolver/domain errors report status-only session facts
+  (`login_performed`, `session_reused`, eviction/recovery flags, optional
+  session-cookie expiry TTL from `Max-Age`/`Expires`) across `fineco-live`; the controller models the same
   TTL + last-activity to admit a reuse without the fresh-login cooldown/budget,
   never seeing cookies or handles. The held cookie is zeroized on TTL expiry, a
   reused-session 401, replacement, **any refresh login** (G-2), and shutdown (the

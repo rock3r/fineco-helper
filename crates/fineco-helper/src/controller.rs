@@ -21,8 +21,8 @@ use std::sync::Mutex;
 use fineco_core::{SafeError, parse_iso8601_utc};
 use fineco_ipc::{
     MARKET_SESSION_REUSE_TTL_SECS, MarketAssetDetailsLiveFetcher, MarketControlOutcome,
-    MarketControlRequest, MarketIndicesLiveFetcher, MarketSearchLiveFetcher, MarketSessionStatus,
-    OWNER_AUTH_ID, Policy, RefreshOutcome, RefreshRequest,
+    MarketControlRequest, MarketIndicesLiveFetcher, MarketLiveError, MarketSearchLiveFetcher,
+    MarketSessionStatus, OWNER_AUTH_ID, Policy, RefreshOutcome, RefreshRequest,
 };
 use fineco_refresh::{
     OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher, refresh_orders, refresh_portfolio,
@@ -162,7 +162,7 @@ impl LiveLoginState {
         Ok(())
     }
 
-    fn admit_market_operation(&mut self, now_iso: &str) -> Result<(), SafeError> {
+    fn admit_market_operation(&mut self, now_iso: &str) -> Result<bool, SafeError> {
         let now_epoch = parse_iso8601_utc(now_iso).ok_or_else(SafeError::internal)?;
         if self.in_flight {
             return Err(SafeError::market_rate_limited());
@@ -203,7 +203,7 @@ impl LiveLoginState {
         }
         self.in_flight = true;
         self.pending_epoch = Some(now_epoch);
-        Ok(())
+        Ok(reuse_eligible)
     }
 
     fn finish(&mut self, should_record_login: bool) {
@@ -298,9 +298,28 @@ struct LiveLoginPermit<'a> {
 impl LiveLoginPermit<'_> {
     /// Finish a failed market operation: clear the reuse window (the session
     /// state is now uncertain) and debit a login unless the failure proves none
-    /// happened (a local transport failure).
-    fn finish_after_error(self, error: &SafeError, now_epoch: i64) -> Result<(), SafeError> {
-        self.finish_market_state(should_record_assumed_fresh_login(error), false, now_epoch)
+    /// happened (a local transport failure). Resolver/domain misses are normal
+    /// authenticated read outcomes, not evidence that the held session is bad,
+    /// so they preserve the reuse window.
+    fn finish_after_error(
+        self,
+        live_error: &MarketLiveError,
+        now_epoch: i64,
+    ) -> Result<(), SafeError> {
+        let error = &live_error.error;
+        if let Some(session) = live_error.session {
+            if should_preserve_market_session_after_error(error) {
+                return self.finish_with_session_status(session, now_epoch);
+            }
+            return self.finish_market_state(
+                session.login_performed || session.reused_session_401_recovered,
+                false,
+                now_epoch,
+            );
+        }
+        let preserves_session = should_preserve_market_session_after_error(error);
+        let performed_login = !preserves_session && should_record_assumed_fresh_login(error);
+        self.finish_market_state(performed_login, preserves_session, now_epoch)
     }
 
     /// Finish a successful market operation: open the reuse window from
@@ -344,6 +363,13 @@ impl LiveLoginPermit<'_> {
 
 fn should_record_assumed_fresh_login(error: &SafeError) -> bool {
     error.code() != "live_transport_failure"
+}
+
+fn should_preserve_market_session_after_error(error: &SafeError) -> bool {
+    matches!(
+        error.code(),
+        "market_not_found" | "market_ambiguous_identifier" | "market_unsupported_asset_type"
+    )
 }
 
 impl Drop for LiveLoginPermit<'_> {
@@ -547,8 +573,8 @@ where
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
-                            .record_outcome(now_iso, Some(&error))?;
-                        Err(error)
+                            .record_outcome(now_iso, Some(&error.error))?;
+                        Err(error.error)
                     }
                 }
             }
@@ -574,8 +600,8 @@ where
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
-                            .record_outcome(now_iso, Some(&error))?;
-                        Err(error)
+                            .record_outcome(now_iso, Some(&error.error))?;
+                        Err(error.error)
                     }
                 }
             }
@@ -599,8 +625,8 @@ where
                         self.market_circuit_state
                             .lock()
                             .map_err(|_| SafeError::internal())?
-                            .record_outcome(now_iso, Some(&error))?;
-                        Err(error)
+                            .record_outcome(now_iso, Some(&error.error))?;
+                        Err(error.error)
                     }
                 }
             }
@@ -622,9 +648,10 @@ mod tests {
         MarketAssetDetailsLiveResult, MarketAssetDetailsResult, MarketAssetIdentity,
         MarketAssetSections, MarketAssetType, MarketControlOutcome, MarketControlRequest,
         MarketDetailsParams, MarketField, MarketIndexCard, MarketIndexRegion,
-        MarketIndicesLiveResult, MarketIndicesParams, MarketIndicesResult, MarketSearchCandidate,
-        MarketSearchGroup, MarketSearchLiveResult, MarketSearchParams, MarketSearchResult,
-        MarketSessionStatus, OrdersRefreshParams, Policy, RefreshRequest, TaxRefreshParams,
+        MarketIndicesLiveResult, MarketIndicesParams, MarketIndicesResult, MarketLiveError,
+        MarketSearchCandidate, MarketSearchGroup, MarketSearchLiveResult, MarketSearchParams,
+        MarketSearchResult, MarketSessionStatus, OrdersRefreshParams, Policy, RefreshRequest,
+        TaxRefreshParams,
     };
     use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher};
     use fineco_store::{
@@ -648,7 +675,7 @@ mod tests {
         /// closure so a test can simulate the real worker (fresh login first,
         /// reuse afterwards) by capturing a counter.
         market_session: Box<dyn Fn() -> MarketSessionStatus>,
-        market_result: Box<dyn Fn() -> Result<(), SafeError>>,
+        market_result: Box<dyn Fn() -> Result<(), MarketLiveError>>,
     }
 
     impl FakeWorker {
@@ -715,7 +742,7 @@ mod tests {
             &self,
             params: &MarketSearchParams,
             now_iso: &str,
-        ) -> Result<MarketSearchLiveResult, SafeError> {
+        ) -> Result<MarketSearchLiveResult, MarketLiveError> {
             (self.market_result)()?;
             Ok(MarketSearchLiveResult {
                 result: MarketSearchResult {
@@ -751,7 +778,7 @@ mod tests {
             &self,
             params: &MarketDetailsParams,
             now_iso: &str,
-        ) -> Result<MarketAssetDetailsLiveResult, SafeError> {
+        ) -> Result<MarketAssetDetailsLiveResult, MarketLiveError> {
             (self.market_result)()?;
             Ok(MarketAssetDetailsLiveResult {
                 result: MarketAssetDetailsResult {
@@ -827,7 +854,7 @@ mod tests {
             &self,
             _params: &MarketIndicesParams,
             now_iso: &str,
-        ) -> Result<MarketIndicesLiveResult, SafeError> {
+        ) -> Result<MarketIndicesLiveResult, MarketLiveError> {
             (self.market_result)()?;
             Ok(MarketIndicesLiveResult {
                 result: MarketIndicesResult {
@@ -1196,6 +1223,182 @@ mod tests {
     }
 
     #[test]
+    fn market_not_found_preserves_the_reuse_window() {
+        assert_market_error_preserves_the_reuse_window(
+            SafeError::market_not_found(),
+            "market_not_found",
+        );
+    }
+
+    #[test]
+    fn market_ambiguous_identifier_preserves_the_reuse_window() {
+        assert_market_error_preserves_the_reuse_window(
+            SafeError::market_ambiguous_identifier(),
+            "market_ambiguous_identifier",
+        );
+    }
+
+    #[test]
+    fn market_unsupported_asset_type_preserves_the_reuse_window() {
+        assert_market_error_preserves_the_reuse_window(
+            SafeError::market_unsupported_asset_type(),
+            "market_unsupported_asset_type",
+        );
+    }
+
+    fn assert_market_error_preserves_the_reuse_window(error: SafeError, expected_code: &str) {
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_in = Rc::clone(&calls);
+        let mut worker = sequenced_session_worker();
+        let error = Rc::new(error);
+        worker.market_result = Box::new(move || {
+            let call = calls_in.get();
+            calls_in.set(call + 1);
+            if call == 1 {
+                Err(MarketLiveError::from((*error).clone()))
+            } else {
+                Ok(())
+            }
+        });
+        let ctrl = controller(worker, market_policy());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("first market read opens the reuse window");
+
+        let error = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:05Z")
+            .expect_err("market error propagates to the caller");
+        assert_eq!(error.code(), expected_code);
+
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:10Z")
+            .expect("market error does not poison the held session or cooldown");
+    }
+
+    #[test]
+    fn reused_resolver_misses_do_not_burn_the_hourly_login_budget() {
+        let mut state = LiveLoginState::default();
+        let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
+        let iso = |offset: i64| fineco_core::epoch_to_iso8601_utc(t0 + offset);
+
+        state
+            .admit_market_operation(&iso(0))
+            .expect("first read is admitted as fresh");
+        state.finish_market(true, true, t0);
+
+        for second in 1..=MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+            let offset = i64::from(second);
+            let admission = state
+                .admit_market_operation(&iso(offset))
+                .expect("resolver miss admitted under reuse window");
+            assert!(admission);
+            state.finish_market(!admission, true, t0 + offset);
+        }
+
+        state
+            .admit_market_operation(&iso(61))
+            .expect("reused resolver misses do not exhaust fresh-login budget");
+    }
+
+    #[test]
+    fn sessionless_resolver_misses_do_not_burn_the_hourly_login_budget() {
+        let mut worker = FakeWorker::ok();
+        worker.market_result =
+            Box::new(|| Err(MarketLiveError::from(SafeError::market_not_found())));
+        let ctrl = controller(worker, market_policy());
+
+        for second in 0..MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR {
+            let now = format!("2026-06-14T10:00:{second:02}Z");
+            let error = ctrl
+                .handle_market_control(market_search_request(), &now)
+                .expect_err("resolver miss propagates");
+            assert_eq!(error.code(), "market_not_found");
+        }
+
+        let error = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:59Z")
+            .expect_err("the fallback still propagates the domain error");
+        assert_eq!(error.code(), "market_not_found");
+    }
+
+    #[test]
+    fn recovered_resolver_miss_debits_the_hourly_login_budget() {
+        let recovered = MarketSessionStatus {
+            login_performed: true,
+            session_reused: false,
+            session_evicted: true,
+            reused_session_401_recovered: true,
+            session_expires_in_secs: None,
+        };
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_in = Rc::clone(&calls);
+        let mut worker = sequenced_session_worker();
+        worker.market_result = Box::new(move || {
+            let call = calls_in.get();
+            calls_in.set(call + 1);
+            if call == 0 {
+                Ok(())
+            } else {
+                Err(MarketLiveError::new(
+                    SafeError::market_not_found(),
+                    Some(recovered),
+                ))
+            }
+        });
+        let ctrl = controller(worker, market_policy());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("first market read opens the reuse window");
+
+        let miss = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:05Z")
+            .expect_err("resolver miss propagates");
+        assert_eq!(miss.code(), "market_not_found");
+
+        let repeated_miss = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:10Z")
+            .expect_err("recovered fresh relogin keeps a reusable session");
+        assert_eq!(repeated_miss.code(), "market_not_found");
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn sessionful_non_domain_errors_clear_reuse_and_debit_fresh_logins() {
+        let fresh_error = MarketSessionStatus {
+            login_performed: true,
+            session_reused: false,
+            session_evicted: false,
+            reused_session_401_recovered: false,
+            session_expires_in_secs: None,
+        };
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_in = Rc::clone(&calls);
+        let mut worker = sequenced_session_worker();
+        worker.market_result = Box::new(move || {
+            let call = calls_in.get();
+            calls_in.set(call + 1);
+            if call == 0 {
+                Ok(())
+            } else {
+                Err(MarketLiveError::new(
+                    SafeError::market_upstream_failure(),
+                    Some(fresh_error),
+                ))
+            }
+        });
+        let ctrl = controller(worker, market_policy());
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
+            .expect("first market read opens the reuse window");
+
+        let upstream = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:05Z")
+            .expect_err("upstream failure propagates");
+        assert_eq!(upstream.code(), "market_upstream_failure");
+
+        let limited = ctrl
+            .handle_market_control(market_search_request(), "2026-06-14T10:00:10Z")
+            .expect_err("strict cleanup reapplies the fresh-login cooldown");
+        assert_eq!(limited.code(), "market_rate_limited");
+    }
+
+    #[test]
     fn recovered_reused_session_401_is_reported_and_debits_a_login() {
         // The worker repaired a stale reused session with one fresh login: the read
         // succeeds and reports the recovery.
@@ -1212,6 +1415,8 @@ mod tests {
             .handle_market_control(market_search_request(), "2026-06-14T10:00:00Z")
             .expect("recovered reused-session search admitted");
         assert!(market_session_of(&outcome).reused_session_401_recovered);
+        ctrl.handle_market_control(market_search_request(), "2026-06-14T10:00:05Z")
+            .expect("recovery success opens the reuse window");
 
         // That recovery performed a fresh login, so it must debit the login budget.
         let t0 = parse_iso8601_utc("2026-06-14T10:00:00Z").expect("epoch");
@@ -1345,7 +1550,8 @@ mod tests {
     #[test]
     fn market_search_opens_the_market_circuit_after_repeated_upstream_failures() {
         let mut worker = FakeWorker::ok();
-        worker.market_result = Box::new(|| Err(SafeError::market_upstream_failure()));
+        worker.market_result =
+            Box::new(|| Err(MarketLiveError::from(SafeError::market_upstream_failure())));
         let ctrl = controller(worker, market_policy());
 
         for minute in 0..MARKET_CIRCUIT_CONSECUTIVE_FAILURES {
@@ -1369,7 +1575,7 @@ mod tests {
         let mut worker = FakeWorker::ok();
         worker.market_result = Box::new(move || {
             calls_in.set(calls_in.get() + 1);
-            Err(SafeError::market_upstream_failure())
+            Err(MarketLiveError::from(SafeError::market_upstream_failure()))
         });
         let ctrl = controller(worker, market_policy());
 
@@ -1384,7 +1590,8 @@ mod tests {
     #[test]
     fn market_transport_failure_does_not_burn_fresh_login_cooldown() {
         let mut worker = FakeWorker::ok();
-        worker.market_result = Box::new(|| Err(SafeError::live_transport_failure()));
+        worker.market_result =
+            Box::new(|| Err(MarketLiveError::from(SafeError::live_transport_failure())));
         let ctrl = controller(worker, market_policy());
 
         let err = ctrl
@@ -1401,7 +1608,7 @@ mod tests {
     #[test]
     fn market_worker_internal_failure_burns_fresh_login_cooldown() {
         let mut worker = FakeWorker::ok();
-        worker.market_result = Box::new(|| Err(SafeError::internal()));
+        worker.market_result = Box::new(|| Err(MarketLiveError::from(SafeError::internal())));
         let ctrl = controller(worker, market_policy());
 
         let err = ctrl
@@ -1443,7 +1650,7 @@ mod tests {
         worker.market_result = Box::new(move || {
             if failures_in.get() > 0 {
                 failures_in.set(failures_in.get() - 1);
-                Err(SafeError::market_upstream_failure())
+                Err(MarketLiveError::from(SafeError::market_upstream_failure()))
             } else {
                 Ok(())
             }
@@ -1472,7 +1679,8 @@ mod tests {
     #[test]
     fn market_auth_failures_do_not_trip_the_upstream_circuit() {
         let mut worker = FakeWorker::ok();
-        worker.market_result = Box::new(|| Err(SafeError::market_auth_required()));
+        worker.market_result =
+            Box::new(|| Err(MarketLiveError::from(SafeError::market_auth_required())));
         let ctrl = controller(worker, market_policy());
 
         for minute in 0..MARKET_CIRCUIT_CONSECUTIVE_FAILURES {
