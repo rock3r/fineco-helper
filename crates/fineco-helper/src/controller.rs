@@ -920,8 +920,8 @@ mod tests {
             _store: &Store,
             _date_from: &str,
             _date_to: &str,
-        ) -> Result<Vec<NewMovement>, SafeError> {
-            Ok(vec![])
+        ) -> Result<(Vec<NewMovement>, fineco_store::MovementsSummary), SafeError> {
+            Ok((vec![], fineco_store::MovementsSummary::default()))
         }
     }
 

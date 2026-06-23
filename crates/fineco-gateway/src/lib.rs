@@ -289,7 +289,7 @@ impl Gateway {
 
     #[tool(
         name = "movements_get_latest",
-        description = "The latest bank account movements capture (owner-only cached private data). Returns all movement lines from the most recent live refresh, including amounts, descriptions, and dates."
+        description = "The latest bank account movements capture (owner-only cached private data). Returns all movement lines from the most recent live refresh, including amounts, descriptions, and dates, plus a per-capture account summary (balance at the latest movement and as of the search date, and current-month credit/debit spending)."
     )]
     pub async fn movements_get_latest(&self) -> Result<Json<MovementsDto>, ErrorData> {
         self.call(Request::MovementsGetLatest, |body| match body {

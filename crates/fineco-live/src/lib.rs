@@ -43,8 +43,8 @@ use fineco_refresh::{
     TaxFetcher,
 };
 use fineco_store::{
-    NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
-    RawMovement, RawOrder, Store,
+    MovementsSummary, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward,
+    NewTaxMinusByYear, RawMovement, RawOrder, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -182,7 +182,10 @@ pub enum LiveResponse {
     MarketSearch(MarketSearchLiveResult),
     MarketAssetDetails(Box<MarketAssetDetailsLiveResult>),
     MarketIndices(MarketIndicesLiveResult),
-    Movements(Vec<RawMovement>),
+    Movements {
+        movements: Vec<RawMovement>,
+        summary: MovementsSummary,
+    },
 }
 
 /// The worker's reply: a typed result or the safe error envelope. Every worker
@@ -299,7 +302,7 @@ where
         LiveRequest::Movements(p) => fetcher
             .fetch_raw_movements(&p.date_from, &p.date_to)
             .map_err(LiveError::from)
-            .map(LiveResponse::Movements),
+            .map(|(movements, summary)| LiveResponse::Movements { movements, summary }),
     }
 }
 
@@ -586,7 +589,7 @@ impl RawMovementsFetcher for LiveClient {
         &self,
         date_from: &str,
         date_to: &str,
-    ) -> Result<Vec<RawMovement>, SafeError> {
+    ) -> Result<(Vec<RawMovement>, MovementsSummary), SafeError> {
         match self
             .call(&LiveRequest::Movements(LiveMovementsParams {
                 date_from: date_from.to_string(),
@@ -594,7 +597,7 @@ impl RawMovementsFetcher for LiveClient {
             }))
             .map_err(LiveCallError::into_safe_error)?
         {
-            LiveResponse::Movements(raw_movements) => Ok(raw_movements),
+            LiveResponse::Movements { movements, summary } => Ok((movements, summary)),
             _ => Err(SafeError::internal()),
         }
     }
@@ -606,15 +609,17 @@ impl MovementsFetcher for LiveClient {
         store: &Store,
         date_from: &str,
         date_to: &str,
-    ) -> Result<Vec<NewMovement>, SafeError> {
-        let raw = self.fetch_raw_movements(date_from, date_to)?;
-        raw.iter()
+    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
+        let (raw, summary) = self.fetch_raw_movements(date_from, date_to)?;
+        let hashed = raw
+            .iter()
             .map(|r| {
                 store
                     .hash_raw_movement(r)
                     .map_err(|_| SafeError::internal())
             })
-            .collect()
+            .collect::<Result<Vec<NewMovement>, SafeError>>()?;
+        Ok((hashed, summary))
     }
 }
 

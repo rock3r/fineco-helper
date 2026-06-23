@@ -322,7 +322,7 @@ fn paginates_movements_until_last_page() {
     // offset until `lastPage` and accumulate ALL of them — never just the first
     // page (the silent-truncation bug the date-only body had).
     let base = spawn_mock_fineco();
-    let movements = worker_for(&base)
+    let (movements, summary) = worker_for(&base)
         .fetch_raw_movements("2026-03-25", "2026-06-23")
         .expect("movements fetch should succeed");
 
@@ -336,6 +336,11 @@ fn paginates_movements_until_last_page() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), 23, "every movement id is distinct across pages");
+    // The per-fetch account summary is read from the first page's top-level fields.
+    assert_eq!(summary.balance_at_movement, Some(1234.56));
+    assert_eq!(summary.balance_at_search_date, Some(1200.0));
+    assert_eq!(summary.current_month_credit_spending, Some(500.0));
+    assert_eq!(summary.current_month_debit_spending, Some(-321.0));
 }
 
 #[test]

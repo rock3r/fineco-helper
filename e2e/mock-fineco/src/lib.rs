@@ -122,9 +122,18 @@ fn movements_page(req: &Request) -> Response {
         })
         .collect();
     let last_page = end >= TOTAL;
+    // The account-level summary sits at the response top level and is carried on the
+    // first page only (offset 0), mirroring the live endpoint; the worker reads it
+    // there and ignores it on later pages.
+    let summary = if offset == 0 {
+        ",\"balanceAccountAtMovement\":1234.56,\"balanceAccountAtSearchDate\":1200.0,\
+         \"currentMonthCreditSpending\":500.0,\"currentMonthDebtSpending\":-321.0"
+    } else {
+        ""
+    };
     let body = format!(
         "{{\"movimenti\":[{}],\"lastPage\":{last_page},\
-         \"limitedResult\":false,\"missingData\":[]}}",
+         \"limitedResult\":false,\"missingData\":[]{summary}}}",
         items.join(",")
     );
     Response::json(200, body)

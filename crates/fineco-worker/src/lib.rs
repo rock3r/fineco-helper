@@ -754,9 +754,11 @@ impl RawMovementsFetcher for FinecoWorker {
     /// The endpoint is paginated, so the worker logs in once and then walks pages
     /// (`offset` += [`MOVEMENTS_PAGE_SIZE`]) under that one session, accumulating
     /// every page until the response's `lastPage` is set. No `type` filter is sent
-    /// (all movement types return). The controller caps the window at 90 days;
-    /// beyond that Fineco returns 451 "Sca di sessione non valida" (the PSD2 SCA
-    /// boundary), which a headless worker cannot satisfy.
+    /// (all movement types return). The per-fetch account summary (balances +
+    /// current-month spending, at the response top level) is read from the first
+    /// page and returned alongside the rows. The controller caps the window at 90
+    /// days; beyond that Fineco returns 451 "Sca di sessione non valida" (the PSD2
+    /// SCA boundary), which a headless worker cannot satisfy.
     ///
     /// # Errors
     /// Auth/upstream/internal envelopes on login, fetch, or parse failure; or
@@ -766,15 +768,18 @@ impl RawMovementsFetcher for FinecoWorker {
         &self,
         date_from: &str,
         date_to: &str,
-    ) -> Result<Vec<RawMovement>, SafeError> {
+    ) -> Result<(Vec<RawMovement>, fineco_store::MovementsSummary), SafeError> {
         // Defense in depth: re-check the resolved range (dates, ordering, and the
         // 90-day span) worker-side before any Fineco call, as the orders path does.
         validate_movements_range(date_from, date_to)?;
 
         let session = self.refresh_login()?;
         let mut all = Vec::new();
+        // The account-level summary is per fetch (response top level), not per page,
+        // so it is read once from the first page (offset 0) and held for the walk.
+        let mut summary = fineco_store::MovementsSummary::default();
         let mut offset: i32 = 0;
-        for _ in 0..MAX_MOVEMENTS_PAGES {
+        for page in 0..MAX_MOVEMENTS_PAGES {
             let body = parse::MovementsApiRequest {
                 date_from: date_from.to_string(),
                 date_to: date_to.to_string(),
@@ -800,6 +805,11 @@ impl RawMovementsFetcher for FinecoWorker {
             // items all lacked `progressivoMovimento` would look "empty" and stop
             // pagination, silently dropping later pages.
             let raw_page_len = response.movimenti.len();
+            // The account summary is per fetch, carried on the first page; read it
+            // before `to_raw_movements` consumes the response.
+            if page == 0 {
+                summary = parse::to_movements_summary(&response);
+            }
             all.extend(parse::to_raw_movements(response));
             if incomplete {
                 return Err(SafeError::internal());
@@ -807,7 +817,7 @@ impl RawMovementsFetcher for FinecoWorker {
             // Stop on the final page; also stop defensively if a non-final page
             // came back genuinely empty (a misbehaving upstream would otherwise loop).
             if last_page || raw_page_len == 0 {
-                return Ok(all);
+                return Ok((all, summary));
             }
             offset = offset.saturating_add(MOVEMENTS_PAGE_SIZE);
         }

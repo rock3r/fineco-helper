@@ -24,8 +24,8 @@ use fineco_refresh::{
     TaxFetcher,
 };
 use fineco_store::{
-    NewAsset, NewMovement, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
-    RawMovement, RawOrder, Store,
+    MovementsSummary, NewAsset, NewMovement, NewPortfolioSnapshot, NewTaxCarryForward,
+    NewTaxMinusByYear, RawMovement, RawOrder, Store,
 };
 
 use fineco_core::SafeError;
@@ -187,24 +187,44 @@ impl MarketIndicesLiveFetcher for FakeWorker {
     }
 }
 
+/// The canned per-capture account summary the fake worker returns, so a round-trip
+/// test can prove the envelope fields survive the socket.
+fn fake_movements_summary() -> MovementsSummary {
+    MovementsSummary {
+        balance_at_movement: Some(1234.56),
+        balance_at_search_date: Some(1200.0),
+        current_month_credit_spending: Some(500.0),
+        current_month_debit_spending: Some(-321.0),
+    }
+}
+
 impl RawMovementsFetcher for FakeWorker {
     fn fetch_raw_movements(
         &self,
         _date_from: &str,
         _date_to: &str,
-    ) -> Result<Vec<RawMovement>, SafeError> {
-        Ok(vec![])
+    ) -> Result<(Vec<RawMovement>, MovementsSummary), SafeError> {
+        Ok((vec![], fake_movements_summary()))
     }
 }
 
 impl MovementsFetcher for FakeWorker {
     fn fetch_movements(
         &self,
-        _store: &Store,
-        _date_from: &str,
-        _date_to: &str,
-    ) -> Result<Vec<NewMovement>, SafeError> {
-        Ok(vec![])
+        store: &Store,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
+        let (raw, summary) = self.fetch_raw_movements(date_from, date_to)?;
+        let hashed = raw
+            .iter()
+            .map(|r| {
+                store
+                    .hash_raw_movement(r)
+                    .map_err(|_| SafeError::internal())
+            })
+            .collect::<Result<Vec<NewMovement>, SafeError>>()?;
+        Ok((hashed, summary))
     }
 }
 
@@ -393,6 +413,20 @@ fn orders_cross_raw_and_are_hashed_controller_side() {
     assert_eq!(order.asset.instr_id, "A");
     assert_eq!(order.status.as_deref(), Some("EXECUTED"));
     assert_eq!(order.avg_price, Some(100.0));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn movements_account_summary_survives_the_socket_round_trip() {
+    let (client, path) = serve(FakeWorker::ok());
+    let store = Store::open_in_memory().expect("open store");
+    let (movements, summary) = client
+        .fetch_movements(&store, "2026-03-25", "2026-06-23")
+        .expect("movements fetch");
+    // The fake returns no rows but a populated account summary; the four envelope
+    // fields must cross the socket intact (not silently dropped or zeroed).
+    assert!(movements.is_empty());
+    assert_eq!(summary, fake_movements_summary());
     let _ = std::fs::remove_file(&path);
 }
 

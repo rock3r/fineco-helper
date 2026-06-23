@@ -10,8 +10,8 @@ use fineco_core::{
     validate_tax_range,
 };
 use fineco_store::{
-    JobOutcome, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
-    RawMovement, RawOrder, Store,
+    JobOutcome, MovementsSummary, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward,
+    NewTaxMinusByYear, RawMovement, RawOrder, Store,
 };
 
 /// A running refresh older than this is presumed dead (e.g. its finish write
@@ -280,7 +280,8 @@ pub fn refresh_tax(
 /// The fineco-live `LiveClient` implements this; fakes implement it in tests.
 pub trait MovementsFetcher {
     /// Fetch bank account movements for the last `days` days (`date_from` to
-    /// `date_to`, YYYY-MM-DD), mapped to store-ready [`NewMovement`]s.
+    /// `date_to`, YYYY-MM-DD), mapped to store-ready [`NewMovement`]s plus the
+    /// per-capture account [`MovementsSummary`] read from the response envelope.
     ///
     /// # Errors
     /// Returns a [`SafeError`] if the fetch fails (e.g. auth/timeout).
@@ -289,7 +290,7 @@ pub trait MovementsFetcher {
         store: &Store,
         date_from: &str,
         date_to: &str,
-    ) -> Result<Vec<NewMovement>, SafeError>;
+    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError>;
 }
 
 /// Source of fresh movements data, **worker-side**: yields un-hashed
@@ -297,7 +298,9 @@ pub trait MovementsFetcher {
 /// [`fineco_store::Store::hash_raw_movement`].
 pub trait RawMovementsFetcher {
     /// Fetch bank account movements for the `date_from`..`date_to` date range
-    /// (`YYYY-MM-DD`), parsed to [`RawMovement`]s (raw ids, never hashed).
+    /// (`YYYY-MM-DD`), parsed to [`RawMovement`]s (raw ids, never hashed) plus the
+    /// per-capture account [`MovementsSummary`] from the response envelope (read from
+    /// the first page).
     ///
     /// # Errors
     /// Returns a [`SafeError`] if the fetch fails.
@@ -305,7 +308,7 @@ pub trait RawMovementsFetcher {
         &self,
         date_from: &str,
         date_to: &str,
-    ) -> Result<Vec<RawMovement>, SafeError>;
+    ) -> Result<(Vec<RawMovement>, MovementsSummary), SafeError>;
 }
 
 /// Run a local movements refresh: acquire the per-area lock, record a job, fetch,
@@ -337,19 +340,25 @@ pub fn refresh_movements(
     };
 
     match fetcher.fetch_movements(store, date_from, date_to) {
-        Ok(movements) => match store.capture_movements(now_iso, &movements) {
-            Ok(()) => {
-                store
-                    .record_job_finish(job_id, now_iso, JobOutcome::Completed, None)
-                    .map_err(|_| SafeError::internal())?;
-                Ok(movements.len())
+        Ok((movements, summary)) => {
+            match store.capture_movements(now_iso, &movements, Some(&summary)) {
+                Ok(()) => {
+                    store
+                        .record_job_finish(job_id, now_iso, JobOutcome::Completed, None)
+                        .map_err(|_| SafeError::internal())?;
+                    Ok(movements.len())
+                }
+                Err(_) => {
+                    let _ = store.record_job_finish(
+                        job_id,
+                        now_iso,
+                        JobOutcome::Failed,
+                        Some("internal"),
+                    );
+                    Err(SafeError::internal())
+                }
             }
-            Err(_) => {
-                let _ =
-                    store.record_job_finish(job_id, now_iso, JobOutcome::Failed, Some("internal"));
-                Err(SafeError::internal())
-            }
-        },
+        }
         Err(fetch_err) => {
             let _ = store.record_job_finish(
                 job_id,
@@ -624,7 +633,7 @@ impl<F: MovementsFetcher + ?Sized> MovementsFetcher for Retrying<'_, F> {
         store: &Store,
         date_from: &str,
         date_to: &str,
-    ) -> Result<Vec<NewMovement>, SafeError> {
+    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
         with_retry(&self.policy, || {
             self.inner.fetch_movements(store, date_from, date_to)
         })
@@ -640,8 +649,8 @@ mod tests {
     };
     use fineco_core::SafeError;
     use fineco_store::{
-        JobOutcome, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward,
-        NewTaxMinusByYear, Store,
+        JobOutcome, MovementsSummary, NewMovement, NewOrder, NewPortfolioSnapshot,
+        NewTaxCarryForward, NewTaxMinusByYear, Store,
     };
     use std::cell::Cell;
 
@@ -1292,15 +1301,24 @@ mod tests {
         assert_eq!(err.code(), "already_refreshing");
     }
 
-    struct FakeMovementsFetcher(Result<Vec<NewMovement>, SafeError>);
+    struct FakeMovementsFetcher(Result<(Vec<NewMovement>, MovementsSummary), SafeError>);
     impl MovementsFetcher for FakeMovementsFetcher {
         fn fetch_movements(
             &self,
             _store: &Store,
             _date_from: &str,
             _date_to: &str,
-        ) -> Result<Vec<NewMovement>, SafeError> {
+        ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
             self.0.clone()
+        }
+    }
+
+    fn a_summary() -> MovementsSummary {
+        MovementsSummary {
+            balance_at_movement: Some(1234.56),
+            balance_at_search_date: Some(1200.0),
+            current_month_credit_spending: Some(500.0),
+            current_month_debit_spending: Some(-321.0),
         }
     }
 
@@ -1324,7 +1342,7 @@ mod tests {
     #[test]
     fn movements_refresh_captures_and_completes() {
         let mut store = Store::open_in_memory().expect("open");
-        let fetcher = FakeMovementsFetcher(Ok(vec![a_movement()]));
+        let fetcher = FakeMovementsFetcher(Ok((vec![a_movement()], a_summary())));
         let count = refresh_movements(
             &mut store,
             &fetcher,
@@ -1340,6 +1358,11 @@ mod tests {
         assert_eq!(job.status, "completed");
         assert_eq!(job.safe_error_code, None);
         assert_eq!(store.latest_movements().expect("q").len(), 1);
+        // The per-capture account summary is captured alongside the rows.
+        assert_eq!(
+            store.latest_movements_summary().expect("q"),
+            Some(a_summary())
+        );
         assert_eq!(store.running_job_for("movements").expect("q"), None);
     }
 
@@ -1367,7 +1390,7 @@ mod tests {
     #[test]
     fn movements_refresh_rejects_invalid_days_without_creating_a_job_row() {
         let mut store = Store::open_in_memory().expect("open");
-        let fetcher = FakeMovementsFetcher(Ok(vec![]));
+        let fetcher = FakeMovementsFetcher(Ok((vec![], MovementsSummary::default())));
         let err = refresh_movements(
             &mut store,
             &fetcher,
@@ -1389,7 +1412,7 @@ mod tests {
         store
             .record_job_start("owner", "movements", "2026-01-01T00:00:00Z")
             .expect("start");
-        let fetcher = FakeMovementsFetcher(Ok(vec![]));
+        let fetcher = FakeMovementsFetcher(Ok((vec![], MovementsSummary::default())));
         let err = refresh_movements(
             &mut store,
             &fetcher,

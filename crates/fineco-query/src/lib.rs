@@ -9,11 +9,11 @@
 use fineco_core::SafeError;
 use fineco_ipc::{
     AllocationHistoryDto, AllocationPointDto, FreshnessDto, FreshnessReportDto, FullSnapshotDto,
-    HistoryParams, MovementDto, MovementsDto, OWNER_AUTH_ID, OrderDto, OrdersDto, Policy,
-    PortfolioHistoryDto, PortfolioHistoryPointDto, PortfolioSummaryDto, PositionDto,
-    PositionHistoryDto, PositionHistoryParams, PositionHistoryPointDto, Request, ResponseBody,
-    ShareableReportDto, ShareableRowDto, TaxCarryForwardDto, TaxCarryForwardListDto, TaxMinusDto,
-    TaxMinusListDto,
+    HistoryParams, MovementDto, MovementsAccountSummaryDto, MovementsDto, OWNER_AUTH_ID, OrderDto,
+    OrdersDto, Policy, PortfolioHistoryDto, PortfolioHistoryPointDto, PortfolioSummaryDto,
+    PositionDto, PositionHistoryDto, PositionHistoryParams, PositionHistoryPointDto, Request,
+    ResponseBody, ShareableReportDto, ShareableRowDto, TaxCarryForwardDto, TaxCarryForwardListDto,
+    TaxMinusDto, TaxMinusListDto,
 };
 use fineco_store::{
     AllocationPoint, PortfolioSnapshotRow, PositionHistoryPoint, PositionRow, ShareableRow, Store,
@@ -193,6 +193,16 @@ impl QueryHandler {
             .store
             .latest_capture_at("movements")
             .map_err(|_| SafeError::internal())?;
+        let account_summary = self
+            .store
+            .latest_movements_summary()
+            .map_err(|_| SafeError::internal())?
+            .map(|s| MovementsAccountSummaryDto {
+                balance_at_movement: s.balance_at_movement,
+                balance_at_search_date: s.balance_at_search_date,
+                current_month_credit_spending: s.current_month_credit_spending,
+                current_month_debit_spending: s.current_month_debit_spending,
+            });
         let movements = rows
             .into_iter()
             .map(|row| MovementDto {
@@ -212,6 +222,7 @@ impl QueryHandler {
             .collect();
         Ok(ResponseBody::Movements(MovementsDto {
             captured_at,
+            account_summary,
             movements,
         }))
     }
