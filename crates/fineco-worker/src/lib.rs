@@ -150,6 +150,27 @@ struct FinecoSession {
     expires_in_secs: Option<u64>,
 }
 
+/// The outcome of a login attempt. The seam SCA Tier 2 plugs into: Tier 1's
+/// [`FinecoWorker::login`] collapses [`LoginOutcome::StepUp`] to a payload-free
+/// `step_up_required` error, while Tier 2 will branch on the outcome to drive
+/// interactive SCA completion. Introduced behavior-preserving — every current
+/// caller goes through `login()`, whose external contract is unchanged.
+enum LoginOutcome {
+    /// A usable session (the normal success path).
+    Session(FinecoSession),
+    /// Fineco demanded step-up (strong customer authentication) on the login
+    /// itself — a 2xx with no session cookie whose body carried SCA markers.
+    StepUp(StepUpChallenge),
+}
+
+/// A login-time step-up challenge. Intentionally a payload-free placeholder for
+/// now: it must **never** carry the Fineco `authorisationId` or any body fragment
+/// into a log or the safe-error envelope. Tier 2 will extend it with the real,
+/// non-sensitive challenge facts (offered method labels) once the web-login
+/// challenge envelope is captured live — its exact shape is unverified today (see
+/// `.plans/sca-login-adaptation-plan.md` Part A) and `.plans/worklogs/sca-tier2.md`.
+struct StepUpChallenge;
+
 /// A market session the worker is holding for possible cross-call reuse.
 struct HeldMarketSession {
     cookie: Zeroizing<String>,
@@ -245,7 +266,27 @@ impl FinecoWorker {
     /// Log in and return the session `Cookie` header value (in memory only),
     /// merged with any preflight cookies the reads then replay, plus status-only
     /// lifetime metadata from `Set-Cookie` attributes.
+    ///
+    /// Thin wrapper over [`FinecoWorker::login_outcome`]: a step-up challenge
+    /// collapses to the distinct, payload-free `step_up_required` (Tier 1
+    /// behavior). The external contract is unchanged, so every existing caller is
+    /// untouched; Tier 2 will call `login_outcome` directly to branch on the
+    /// challenge instead of erroring.
     fn login(&self) -> Result<FinecoSession, SafeError> {
+        match self.login_outcome()? {
+            LoginOutcome::Session(session) => Ok(session),
+            // The challenge facts are intentionally dropped here — Tier 1 never
+            // surfaces them. Tier 2 consumes `LoginOutcome::StepUp` instead.
+            LoginOutcome::StepUp(_) => Err(SafeError::step_up_required()),
+        }
+    }
+
+    /// Perform the login exchange and classify the result into a [`LoginOutcome`].
+    /// This is the SCA seam: a 2xx with no session cookie is either a step-up
+    /// challenge (→ [`LoginOutcome::StepUp`]) or a plain auth failure (→ the
+    /// `auth_required` error). The challenge/login body is scanned for markers
+    /// only and never surfaced.
+    fn login_outcome(&self) -> Result<LoginOutcome, SafeError> {
         // Never send the credential over cleartext to a non-loopback host.
         ensure_secure_transport(&self.endpoints.login)?;
         let preflight_cookie = self.preflight()?;
@@ -311,18 +352,18 @@ impl FinecoWorker {
                 .read_to_string()
                 .map(|body| login_body_signals_step_up(&body))
                 .unwrap_or(false);
-            return Err(if step_up {
-                SafeError::step_up_required()
+            return if step_up {
+                Ok(LoginOutcome::StepUp(StepUpChallenge))
             } else {
-                SafeError::auth_required()
-            });
+                Err(SafeError::auth_required())
+            };
         }
         // The reads replay the full jar the browser would carry: the login
         // context (preflight or synthetic) plus the freshly minted session.
-        Ok(FinecoSession {
+        Ok(LoginOutcome::Session(FinecoSession {
             cookie: merge_cookies(&login_cookie, &session_cookie),
             expires_in_secs: session_expires_in_secs,
-        })
+        }))
     }
 
     /// Run one authenticated market read under the held-session lifecycle (plan
