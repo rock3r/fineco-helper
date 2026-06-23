@@ -100,6 +100,49 @@ fn private(req: &Request, body: &str) -> Response {
     Response::json(200, body)
 }
 
+/// Synthetic paginating movements endpoint. Honors the `offset`/`limit` in the
+/// POST body and sets `lastPage` once the window is exhausted, so the worker's
+/// pagination loop is exercised end to end against a multi-page result. There are
+/// `TOTAL` synthetic movements; each carries a unique `progressivoMovimento` so a
+/// test can prove every page was accumulated with no drops or duplicates.
+fn movements_page(req: &Request) -> Response {
+    if !is_authenticated(req) {
+        return Response::json(401, "{\"error\":\"unauthenticated\"}");
+    }
+    const TOTAL: i64 = 23;
+    let offset = json_int(&req.body, "offset").unwrap_or(0).max(0);
+    let limit = json_int(&req.body, "limit").unwrap_or(15).max(1);
+    let end = (offset + limit).min(TOTAL);
+    let items: Vec<String> = (offset..end)
+        .map(|i| {
+            format!(
+                "{{\"progressivoMovimento\":\"MOV-{i}\",\"importo\":1.0,\
+                 \"descrizione\":\"synthetic\",\"tipoMovimento\":\"MOVIMENTO_CONTO\"}}"
+            )
+        })
+        .collect();
+    let last_page = end >= TOTAL;
+    let body = format!(
+        "{{\"movimenti\":[{}],\"lastPage\":{last_page},\
+         \"limitedResult\":false,\"missingData\":[]}}",
+        items.join(",")
+    );
+    Response::json(200, body)
+}
+
+/// Extract a JSON integer value for `key` from a flat request body (synthetic
+/// helper — not a general JSON parser; the worker's bodies are flat objects).
+fn json_int(body: &str, key: &str) -> Option<i64> {
+    let pat = format!("\"{key}\":");
+    let start = body.find(&pat)? + pat.len();
+    let rest = body[start..].trim_start();
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
 /// Route a request to a canned response. Unknown routes return 404. The session
 /// cookie is minted by `POST /…/login` and required on every private read.
 #[must_use]
@@ -206,6 +249,7 @@ pub fn route(req: &Request) -> Response {
         }
         ("GET", "/v1/private/tax-carry-forward/search") => private(req, TAX_CARRY_FORWARD),
         ("GET", "/v1/private/tax-carry-forward/minus") => private(req, TAX_MINUS),
+        ("POST", "/v2/private/accounts-and-cards/movements") => movements_page(req),
 
         // Public — no auth.
         ("GET", ZERO_COMMISSION_ETFS_PATH) => Response::json(200, ZERO_COMMISSION_ETFS),

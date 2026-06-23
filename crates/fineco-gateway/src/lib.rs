@@ -22,10 +22,10 @@ use fineco_ipc::{
     MarketDetailsParams, MarketDetailsSection, MarketEtfExternalEnrichment, MarketEtfsParams,
     MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketField,
     MarketIndicesParams, MarketIndicesResult, MarketSearchParams, MarketSearchResult, MarketSource,
-    MarketWarning, OWNER_AUTH_ID, OrdersDto, OrdersRefreshParams, Policy, PortfolioHistoryDto,
-    PortfolioSummaryDto, PositionHistoryDto, PositionHistoryParams, RefreshClient, RefreshOutcome,
-    RefreshRequest, Request, ResponseBody, SafeErrorDto, ShareableReportDto,
-    TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
+    MarketWarning, MovementsDto, MovementsRefreshParams, OWNER_AUTH_ID, OrdersDto,
+    OrdersRefreshParams, Policy, PortfolioHistoryDto, PortfolioSummaryDto, PositionHistoryDto,
+    PositionHistoryParams, RefreshClient, RefreshOutcome, RefreshRequest, Request, ResponseBody,
+    SafeErrorDto, ShareableReportDto, TaxCarryForwardListDto, TaxMinusListDto, TaxRefreshParams,
 };
 use fineco_market::{EnrichmentReport, EtfEnrichmentReport, MarketClient, ZeroCommissionEtfs};
 use rmcp::handler::server::wrapper::Parameters;
@@ -288,6 +288,18 @@ impl Gateway {
     }
 
     #[tool(
+        name = "movements_get_latest",
+        description = "The latest bank account movements capture (owner-only cached private data). Returns all movement lines from the most recent live refresh, including amounts, descriptions, and dates."
+    )]
+    pub async fn movements_get_latest(&self) -> Result<Json<MovementsDto>, ErrorData> {
+        self.call(Request::MovementsGetLatest, |body| match body {
+            ResponseBody::Movements(dto) => Ok(Json(dto)),
+            _ => Err(unexpected()),
+        })
+        .await
+    }
+
+    #[tool(
         name = "portfolio_get_history",
         description = "Recent portfolio snapshot totals over time (owner-only cached values), chronological, oldest first. `limit` bounds how many recent snapshots to return (1..=1000)."
     )]
@@ -456,6 +468,18 @@ impl Gateway {
         Parameters(params): Parameters<TaxRefreshParams>,
     ) -> Result<Json<RefreshOutcome>, ErrorData> {
         self.refresh_call(RefreshRequest::TaxRefreshLive(params))
+            .await
+    }
+
+    #[tool(
+        name = "private_movements_refresh_live_sensitive",
+        description = "HIGH-SENSITIVITY, owner-only: trigger a LIVE Fineco refresh of bank account movements for the last `days` days (max 90). Logs in to Fineco; rate-limited. Returns operation/snapshot status only — read values via movements_get_latest afterward."
+    )]
+    pub async fn private_movements_refresh_live_sensitive(
+        &self,
+        Parameters(params): Parameters<MovementsRefreshParams>,
+    ) -> Result<Json<RefreshOutcome>, ErrorData> {
+        self.refresh_call(RefreshRequest::MovementsRefreshLive(params))
             .await
     }
 }

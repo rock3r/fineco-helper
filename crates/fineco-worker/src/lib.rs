@@ -34,8 +34,8 @@ pub use endpoints::FinecoEndpoints;
 use std::sync::{Arc, Mutex};
 
 use fineco_core::{
-    SafeError, normalize_expected_isin, parse_iso8601_utc, sanitize_text, validate_order_request,
-    validate_tax_range,
+    SafeError, normalize_expected_isin, parse_iso8601_utc, sanitize_text, validate_movements_range,
+    validate_order_request, validate_tax_range,
 };
 use fineco_ipc::{
     MARKET_SESSION_REUSE_TTL_SECS, MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher,
@@ -45,8 +45,10 @@ use fineco_ipc::{
     MarketSearchCandidate, MarketSearchLiveFetcher, MarketSearchLiveResult, MarketSearchParams,
     MarketSessionStatus, MarketSource,
 };
-use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
-use fineco_store::{NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder};
+use fineco_refresh::{PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher, TaxFetcher};
+use fineco_store::{
+    NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawMovement, RawOrder,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ureq::Agent;
@@ -112,6 +114,7 @@ const PORTFOLIO_REFERER: &str = "https://finecobank.com/pvt/portfolio/trading-su
 const ORDERS_REFERER: &str = "https://finecobank.com/pvt/portfolio/order-monitor/shares";
 const TAX_REFERER: &str =
     "https://finecobank.com/pvt/portfolio/report/tax-carry-forward/current-month";
+const MOVEMENTS_REFERER: &str = "https://finecobank.com/pvt/banking/accounts-and-cards/movements";
 const MARKET_SEARCH_REFERER: &str = "https://finecobank.com/pvt/home";
 const MARKET_DETAILS_REFERER: &str = "https://finecobank.com/pvt/trading/etf/scheda";
 
@@ -732,6 +735,85 @@ impl TaxFetcher for FinecoWorker {
         let response: parse::TaxMinusResponse =
             self.get_json(&self.endpoints.tax_minus, &session.cookie, TAX_REFERER)?;
         Ok(parse::to_tax_minus(response))
+    }
+}
+
+/// Movements page size. The endpoint paginates; the worker pulls this many per
+/// request and walks pages until `lastPage`. Matches the Fineco web app's own
+/// page size (a value confirmed accepted by the live host).
+const MOVEMENTS_PAGE_SIZE: i32 = 15;
+
+/// Hard cap on movements pages per fetch — an infinite-loop guard, not a data
+/// limit. At [`MOVEMENTS_PAGE_SIZE`] this bounds one fetch to a generous number
+/// of movements; exceeding it within the 90-day window is treated as a fault and
+/// fails loudly rather than silently truncating.
+const MAX_MOVEMENTS_PAGES: u32 = 400;
+
+impl RawMovementsFetcher for FinecoWorker {
+    /// Fetch ALL bank account movements for `date_from`..`date_to` (`YYYY-MM-DD`).
+    /// The endpoint is paginated, so the worker logs in once and then walks pages
+    /// (`offset` += [`MOVEMENTS_PAGE_SIZE`]) under that one session, accumulating
+    /// every page until the response's `lastPage` is set. No `type` filter is sent
+    /// (all movement types return). The controller caps the window at 90 days;
+    /// beyond that Fineco returns 451 "Sca di sessione non valida" (the PSD2 SCA
+    /// boundary), which a headless worker cannot satisfy.
+    ///
+    /// # Errors
+    /// Auth/upstream/internal envelopes on login, fetch, or parse failure; or
+    /// [`SafeError::internal`] if pagination exceeds [`MAX_MOVEMENTS_PAGES`] (fail
+    /// loud rather than return a silently-truncated history).
+    fn fetch_raw_movements(
+        &self,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<RawMovement>, SafeError> {
+        // Defense in depth: re-check the resolved range (dates, ordering, and the
+        // 90-day span) worker-side before any Fineco call, as the orders path does.
+        validate_movements_range(date_from, date_to)?;
+
+        let session = self.refresh_login()?;
+        let mut all = Vec::new();
+        let mut offset: i32 = 0;
+        for _ in 0..MAX_MOVEMENTS_PAGES {
+            let body = parse::MovementsApiRequest {
+                date_from: date_from.to_string(),
+                date_to: date_to.to_string(),
+                offset,
+                limit: MOVEMENTS_PAGE_SIZE,
+                keyword: String::new(),
+            };
+            let response: parse::MovementsApiResponse = self.post_json_mapped(
+                &self.endpoints.movements,
+                &body,
+                &session.cookie,
+                MOVEMENTS_REFERER,
+                SafeError::from_upstream_status,
+            )?;
+            let last_page = response.last_page;
+            // If Fineco signals an incomplete result (capped, or some source
+            // missing — e.g. an SCA-gated sub-account), fail loud rather than cache
+            // a partial statement that `movements_get_latest` would present as
+            // complete history.
+            let incomplete = response.limited_result || !response.missing_data.is_empty();
+            // Use the RAW page size (before `to_raw_movements` filters id-less
+            // items) for the defensive empty-page break — otherwise a page whose
+            // items all lacked `progressivoMovimento` would look "empty" and stop
+            // pagination, silently dropping later pages.
+            let raw_page_len = response.movimenti.len();
+            all.extend(parse::to_raw_movements(response));
+            if incomplete {
+                return Err(SafeError::internal());
+            }
+            // Stop on the final page; also stop defensively if a non-final page
+            // came back genuinely empty (a misbehaving upstream would otherwise loop).
+            if last_page || raw_page_len == 0 {
+                return Ok(all);
+            }
+            offset = offset.saturating_add(MOVEMENTS_PAGE_SIZE);
+        }
+        // Ran past the page cap without a `lastPage`: fail loud rather than cache a
+        // partial history.
+        Err(SafeError::internal())
     }
 }
 

@@ -21,6 +21,7 @@ mod hashing;
 mod health;
 mod history;
 mod jobs;
+mod movements;
 mod orders;
 mod report;
 mod tax;
@@ -32,17 +33,19 @@ pub use freshness::DataAreaFreshness;
 pub use health::JobCounts;
 pub use history::{AllocationPoint, MAX_HISTORY_SNAPSHOTS, PositionHistoryPoint};
 pub use jobs::{JobOutcome, JobRunRow};
+pub use movements::{MovementRow, NewMovement, RawMovement};
 pub use orders::{NewOrder, OrderRow, RawOrder};
 pub use report::{ShareableRow, shareable_rows_to_csv};
 pub use tax::{NewTaxCarryForward, NewTaxMinusByYear, TaxCarryForwardRow, TaxMinusByYearRow};
 
 /// Current schema version applied when a store is opened.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &str = include_str!("schema_v1.sql");
 const SCHEMA_V2: &str = include_str!("schema_v2.sql");
 const SCHEMA_V3: &str = include_str!("schema_v3.sql");
 const SCHEMA_V4: &str = include_str!("schema_v4.sql");
+const SCHEMA_V5: &str = include_str!("schema_v5.sql");
 
 /// An error from the store. Opaque by design: the underlying SQLite driver type
 /// is never exposed through the public API, so callers cannot couple to
@@ -162,6 +165,9 @@ impl Store {
         if current < 4 {
             tx.execute_batch(SCHEMA_V4)?;
         }
+        if current < 5 {
+            tx.execute_batch(SCHEMA_V5)?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -231,10 +237,29 @@ mod tests {
         conn.pragma_update(None, "user_version", 3_i64)
             .expect("set v3");
 
-        // Opening runs the v4 migration, which backfills the capture marker.
-        let store = Store::from_connection(conn).expect("migrate to v4");
+        // Opening runs the v4+v5 migrations, which backfill the capture marker
+        // and create the movements table.
+        let store = Store::from_connection(conn).expect("migrate to v5");
         let rows = store.latest_tax_carry_forward().expect("cf");
         assert_eq!(rows.len(), 1, "pre-v4 tax history must remain visible");
         assert_eq!(rows[0].captured_at, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn v5_migration_creates_movements_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch(super::SCHEMA_V1).expect("v1");
+        conn.execute_batch(super::SCHEMA_V2).expect("v2");
+        conn.execute_batch(super::SCHEMA_V3).expect("v3");
+        conn.execute_batch(super::SCHEMA_V4).expect("v4");
+        conn.pragma_update(None, "user_version", 4_i64)
+            .expect("set v4");
+
+        let store = Store::from_connection(conn).expect("migrate to v5");
+        let tables = store.table_names().expect("tables");
+        assert!(
+            tables.contains(&"movements".to_string()),
+            "movements table must exist after v5"
+        );
     }
 }

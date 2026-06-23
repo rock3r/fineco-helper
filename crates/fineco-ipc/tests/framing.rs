@@ -18,6 +18,7 @@ fn report(portfolio: FreshnessDto) -> FreshnessReportDto {
         portfolio,
         orders: missing(),
         tax: missing(),
+        movements: missing(),
     }
 }
 

@@ -81,7 +81,7 @@ impl Store {
             // marker (`data_captures`), not the data tables — so a legitimately
             // empty capture is the current one (instead of re-surfacing the
             // previous non-empty capture). MAX over no rows yields NULL → None.
-            "orders" | "tax" => {
+            "orders" | "tax" | "movements" => {
                 let ts: Option<String> = self.conn.query_row(
                     "SELECT MAX(captured_at) FROM data_captures WHERE data_area = ?1",
                     [data_area],

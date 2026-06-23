@@ -9,10 +9,11 @@
 use fineco_core::SafeError;
 use fineco_ipc::{
     AllocationHistoryDto, AllocationPointDto, FreshnessDto, FreshnessReportDto, FullSnapshotDto,
-    HistoryParams, OWNER_AUTH_ID, OrderDto, OrdersDto, Policy, PortfolioHistoryDto,
-    PortfolioHistoryPointDto, PortfolioSummaryDto, PositionDto, PositionHistoryDto,
-    PositionHistoryParams, PositionHistoryPointDto, Request, ResponseBody, ShareableReportDto,
-    ShareableRowDto, TaxCarryForwardDto, TaxCarryForwardListDto, TaxMinusDto, TaxMinusListDto,
+    HistoryParams, MovementDto, MovementsDto, OWNER_AUTH_ID, OrderDto, OrdersDto, Policy,
+    PortfolioHistoryDto, PortfolioHistoryPointDto, PortfolioSummaryDto, PositionDto,
+    PositionHistoryDto, PositionHistoryParams, PositionHistoryPointDto, Request, ResponseBody,
+    ShareableReportDto, ShareableRowDto, TaxCarryForwardDto, TaxCarryForwardListDto, TaxMinusDto,
+    TaxMinusListDto,
 };
 use fineco_store::{
     AllocationPoint, PortfolioSnapshotRow, PositionHistoryPoint, PositionRow, ShareableRow, Store,
@@ -24,6 +25,7 @@ pub struct FreshnessMaxAge {
     pub portfolio: i64,
     pub orders: i64,
     pub tax: i64,
+    pub movements: i64,
 }
 
 impl Default for FreshnessMaxAge {
@@ -33,6 +35,7 @@ impl Default for FreshnessMaxAge {
             portfolio: 24 * 3600,
             orders: 24 * 3600,
             tax: 7 * 24 * 3600,
+            movements: 24 * 3600,
         }
     }
 }
@@ -82,10 +85,12 @@ impl QueryHandler {
                 portfolio: self.freshness("portfolio", self.max_age.portfolio, now_epoch)?,
                 orders: self.freshness("orders", self.max_age.orders, now_epoch)?,
                 tax: self.freshness("tax", self.max_age.tax, now_epoch)?,
+                movements: self.freshness("movements", self.max_age.movements, now_epoch)?,
             })),
             Request::OrdersGetLatestMonitor => self.latest_orders(),
             Request::TaxGetLatestCarryForward => self.latest_tax_carry_forward(),
             Request::TaxGetLatestMinusByYear => self.latest_tax_minus_by_year(),
+            Request::MovementsGetLatest => self.latest_movements(),
             Request::PortfolioGetLatestSnapshotSummary => self.latest_summary(),
             Request::PortfolioGetLatestFullSnapshot => self.latest_full_snapshot(),
             Request::PortfolioGetLatestShareableReport => self.latest_shareable_report(),
@@ -175,6 +180,39 @@ impl QueryHandler {
         Ok(ResponseBody::TaxMinus(TaxMinusListDto {
             captured_at,
             entries,
+        }))
+    }
+
+    /// The latest bank account movements capture as a wire DTO.
+    fn latest_movements(&self) -> Result<ResponseBody, SafeError> {
+        let rows = self
+            .store
+            .latest_movements()
+            .map_err(|_| SafeError::internal())?;
+        let captured_at = self
+            .store
+            .latest_capture_at("movements")
+            .map_err(|_| SafeError::internal())?;
+        let movements = rows
+            .into_iter()
+            .map(|row| MovementDto {
+                movement_id_hash: row.movement_id_hash,
+                causale: row.causale,
+                descrizione: row.descrizione,
+                descrizione_breve: row.descrizione_breve,
+                importo: row.importo,
+                tipo_movimento: row.tipo_movimento,
+                data_operazione: row.data_operazione,
+                data_registrazione: row.data_registrazione,
+                data_valuta: row.data_valuta,
+                causale_movimento: row.causale_movimento,
+                categoria_id: row.categoria_id,
+                sottocategoria_id: row.sottocategoria_id,
+            })
+            .collect();
+        Ok(ResponseBody::Movements(MovementsDto {
+            captured_at,
+            movements,
         }))
     }
 

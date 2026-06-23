@@ -8,8 +8,8 @@ use std::thread;
 
 use fineco_core::SafeError;
 use fineco_ipc::{
-    Capability, OWNER_AUTH_ID, OrdersRefreshParams, Policy, RefreshClient, RefreshOutcome,
-    RefreshRequest, TaxRefreshParams, serve_refresh_blocking, write_message,
+    Capability, MovementsRefreshParams, OWNER_AUTH_ID, OrdersRefreshParams, Policy, RefreshClient,
+    RefreshOutcome, RefreshRequest, TaxRefreshParams, serve_refresh_blocking, write_message,
 };
 
 const OWNER_LIVE: &str = r#"{
@@ -19,7 +19,8 @@ const OWNER_LIVE: &str = r#"{
             "capabilities": [
                 "portfolio.live.refresh",
                 "orders.live.refresh",
-                "tax.live.refresh"
+                "tax.live.refresh",
+                "movements.live.refresh"
             ]
         }
     }
@@ -32,6 +33,7 @@ fn live_refresh_capabilities_parse_and_are_owner_only() {
         Capability::PortfolioLiveRefresh,
         Capability::OrdersLiveRefresh,
         Capability::TaxLiveRefresh,
+        Capability::MovementsLiveRefresh,
     ] {
         assert!(
             policy.allows(OWNER_AUTH_ID, capability),
@@ -87,6 +89,14 @@ fn orders_and_tax_refresh_carry_their_bounded_params() {
             date_from: "2026-01-01".to_string(),
             date_to: "2026-01-31".to_string(),
         })
+    );
+
+    let movements =
+        RefreshRequest::from_json(r#"{"command":"movements_refresh_live","params":{"days":30}}"#)
+            .expect("parse movements");
+    assert_eq!(
+        movements,
+        RefreshRequest::MovementsRefreshLive(MovementsRefreshParams { days: 30 })
     );
 }
 
@@ -165,6 +175,15 @@ fn out_of_bounds_refresh_params_are_rejected() {
         )
         .is_err()
     );
+    // movements days over the 90-day cap is rejected; exactly the cap is allowed.
+    assert!(
+        RefreshRequest::from_json(r#"{"command":"movements_refresh_live","params":{"days":91}}"#)
+            .is_err()
+    );
+    assert!(
+        RefreshRequest::from_json(r#"{"command":"movements_refresh_live","params":{"days":90}}"#)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -195,6 +214,17 @@ fn each_refresh_maps_to_its_capability_tool_and_area() {
     assert_eq!(tax.required_capability(), Capability::TaxLiveRefresh);
     assert_eq!(tax.audit_tool(), "private_tax_refresh_live_sensitive");
     assert_eq!(tax.data_area(), "tax");
+
+    let movements = RefreshRequest::MovementsRefreshLive(MovementsRefreshParams { days: 30 });
+    assert_eq!(
+        movements.required_capability(),
+        Capability::MovementsLiveRefresh
+    );
+    assert_eq!(
+        movements.audit_tool(),
+        "private_movements_refresh_live_sensitive"
+    );
+    assert_eq!(movements.data_area(), "movements");
 }
 
 /// A unique socket path for this test (the `tag` keeps the two socket tests from

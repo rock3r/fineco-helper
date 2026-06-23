@@ -7,7 +7,7 @@
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-use crate::{NewOrder, RawOrder, Result, Store};
+use crate::{NewMovement, NewOrder, RawMovement, RawOrder, Result, Store};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -30,6 +30,30 @@ impl Store {
             size_filled: raw.size_filled,
             avg_price: raw.avg_price,
             submit_time: raw.submit_time.clone(),
+        })
+    }
+
+    /// Convert a [`RawMovement`] (carrying the raw `movement_id`) into a
+    /// store-ready [`NewMovement`] by HMAC-hashing its id with this database's
+    /// key. Controller-side hashing: the worker returns `RawMovement`s and never
+    /// touches the key. Every other field crosses unchanged.
+    ///
+    /// # Errors
+    /// Returns an error if the per-DB key cannot be read.
+    pub fn hash_raw_movement(&self, raw: &RawMovement) -> Result<NewMovement> {
+        Ok(NewMovement {
+            movement_id_hash: self.hash_id(&raw.movement_id)?,
+            causale: raw.causale.clone(),
+            descrizione: raw.descrizione.clone(),
+            descrizione_breve: raw.descrizione_breve.clone(),
+            importo: raw.importo,
+            tipo_movimento: raw.tipo_movimento.clone(),
+            data_operazione: raw.data_operazione.clone(),
+            data_registrazione: raw.data_registrazione.clone(),
+            data_valuta: raw.data_valuta.clone(),
+            causale_movimento: raw.causale_movimento.clone(),
+            categoria_id: raw.categoria_id.clone(),
+            sottocategoria_id: raw.sottocategoria_id.clone(),
         })
     }
 

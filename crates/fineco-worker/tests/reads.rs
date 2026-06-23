@@ -13,7 +13,7 @@ use fineco_ipc::{
     MarketIndexRegion, MarketIndicesLiveFetcher, MarketIndicesParams, MarketSearchLiveFetcher,
     MarketSearchParams,
 };
-use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
+use fineco_refresh::{PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_worker::{FinecoEndpoints, FinecoWorker, StaticCredentialSource};
 
 const NOW: &str = "2026-06-03T12:00:00Z";
@@ -103,6 +103,28 @@ fn spawn_mock_fineco_search_only() -> String {
             } else {
                 httptiny::Response::json(500, r#"{"error":"details endpoint should not be hit"}"#)
             }
+        });
+    });
+    format!("http://{addr}")
+}
+
+/// Like [`spawn_mock_fineco`], but the movements endpoint reports `limitedResult:
+/// true` (Fineco capped the statement) — so the worker must fail loud rather than
+/// cache a partial history.
+fn spawn_mock_fineco_limited_movements() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v2/private/accounts-and-cards/movements" {
+                return httptiny::Response::json(
+                    200,
+                    "{\"movimenti\":[{\"progressivoMovimento\":\"MOV-0\",\"importo\":1.0}],\
+                     \"lastPage\":true,\"limitedResult\":true,\"missingData\":[]}",
+                );
+            }
+            mock_fineco::route(req)
         });
     });
     format!("http://{addr}")
@@ -291,6 +313,59 @@ fn rejects_non_alphanumeric_instrument_kind() {
     let err = worker_offline()
         .fetch_raw_orders("equity&days=999", 0)
         .expect_err("query-injecting kind must be rejected");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn paginates_movements_until_last_page() {
+    // The mock serves 23 synthetic movements 15 per page; the worker must page by
+    // offset until `lastPage` and accumulate ALL of them — never just the first
+    // page (the silent-truncation bug the date-only body had).
+    let base = spawn_mock_fineco();
+    let movements = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect("movements fetch should succeed");
+
+    assert_eq!(
+        movements.len(),
+        23,
+        "all pages accumulated, not just the first"
+    );
+    // Unique ids across pages — no drops, no duplicates.
+    let mut ids: Vec<&str> = movements.iter().map(|m| m.movement_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 23, "every movement id is distinct across pages");
+}
+
+#[test]
+fn fails_loud_when_upstream_marks_result_limited() {
+    // `limitedResult: true` means Fineco capped/limited the statement; the worker
+    // must error rather than cache a partial history that would later read as
+    // complete via `movements_get_latest`.
+    let base = spawn_mock_fineco_limited_movements();
+    let err = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect_err("a limited/incomplete result must fail loud");
+    assert_eq!(err.code(), "internal");
+}
+
+#[test]
+fn rejects_excessive_movements_window() {
+    // Defense in depth: a range wider than the 90-day cap is rejected worker-side
+    // before any Fineco call (mirrors the orders path), so the dead endpoint that
+    // `worker_offline` points at is never hit.
+    let err = worker_offline()
+        .fetch_raw_movements("2026-01-01", "2026-06-01")
+        .expect_err("a >90-day movements window must be rejected");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn rejects_inverted_movements_range() {
+    let err = worker_offline()
+        .fetch_raw_movements("2026-06-23", "2026-03-25")
+        .expect_err("date_from after date_to must be rejected");
     assert_eq!(err.code(), "invalid_request");
 }
 

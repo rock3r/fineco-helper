@@ -3,7 +3,7 @@
 //! transaction/position identifiers. Hashing is for stable joins, not the primary
 //! confidentiality control (DB-at-rest encryption is — see the plan).
 
-use fineco_store::{NewAsset, RawOrder, Store};
+use fineco_store::{NewAsset, RawMovement, RawOrder, Store};
 
 #[test]
 fn hash_raw_order_hashes_the_trans_id_and_preserves_the_rest() {
@@ -46,6 +46,48 @@ fn hash_raw_order_hashes_the_trans_id_and_preserves_the_rest() {
     assert_eq!(order.order_size, Some(10.0));
     assert_eq!(order.avg_price, Some(1.5));
     assert_eq!(order.submit_time.as_deref(), Some("2026-01-01T09:00:00Z"));
+}
+
+#[test]
+fn hash_raw_movement_hashes_the_movement_id_and_preserves_the_rest() {
+    // Same controller-side conversion contract as orders: the worker returns a
+    // RawMovement with the raw `progressivoMovimento`; the controller HMAC's it
+    // into a NewMovement before capture, leaving every other field unchanged.
+    let store = Store::open_in_memory().expect("open");
+    let raw = RawMovement {
+        movement_id: "SYNTH-MOV-0001".to_string(),
+        causale: Some("BONIFICO".to_string()),
+        descrizione: Some("synthetic line".to_string()),
+        descrizione_breve: Some("synthetic".to_string()),
+        importo: Some(-25.0),
+        tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
+        data_operazione: Some("2026-01-01".to_string()),
+        data_registrazione: Some("2026-01-01".to_string()),
+        data_valuta: Some("2026-01-02".to_string()),
+        causale_movimento: Some("48".to_string()),
+        categoria_id: Some("12".to_string()),
+        sottocategoria_id: Some("34".to_string()),
+    };
+
+    let movement = store.hash_raw_movement(&raw).expect("hash");
+
+    assert_eq!(
+        movement.movement_id_hash,
+        store.hash_id("SYNTH-MOV-0001").expect("h")
+    );
+    // The raw id is not recoverable from the produced movement.
+    assert!(!movement.movement_id_hash.contains("SYNTH-MOV-0001"));
+    assert_eq!(movement.causale.as_deref(), Some("BONIFICO"));
+    assert_eq!(movement.descrizione.as_deref(), Some("synthetic line"));
+    assert_eq!(movement.importo, Some(-25.0));
+    assert_eq!(movement.tipo_movimento.as_deref(), Some("MOVIMENTO_CONTO"));
+    assert_eq!(movement.data_operazione.as_deref(), Some("2026-01-01"));
+    assert_eq!(movement.data_registrazione.as_deref(), Some("2026-01-01"));
+    assert_eq!(movement.data_valuta.as_deref(), Some("2026-01-02"));
+    assert_eq!(movement.causale_movimento.as_deref(), Some("48"));
+    assert_eq!(movement.descrizione_breve.as_deref(), Some("synthetic"));
+    assert_eq!(movement.categoria_id.as_deref(), Some("12"));
+    assert_eq!(movement.sottocategoria_id.as_deref(), Some("34"));
 }
 
 #[test]

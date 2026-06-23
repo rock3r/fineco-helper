@@ -456,6 +456,14 @@ impl std::error::Error for SafeError {}
 /// Maximum order-monitor day window a refresh may request (plan rate-limit bound).
 pub const MAX_ORDER_DAYS: u32 = 30;
 
+/// Maximum movements day window a refresh may request. This is the **PSD2 SCA
+/// boundary**, not an arbitrary rate-limit: Fineco serves up to 90 days of
+/// account history on a plain session, but a window reaching further back returns
+/// HTTP 451 "Unavailable For Legal Reason" / "Sca di sessione non valida" (Strong
+/// Customer Authentication required), which a headless worker cannot satisfy.
+/// Confirmed live (2026-06-23): a 90-day window returns 200; a 1-year window 451.
+pub const MAX_MOVEMENTS_DAYS: u32 = 90;
+
 /// Maximum length of a live-order `instrument_kind`. The cached snapshot-query IPC
 /// path caps every client string at 256 chars; the live-refresh path validates
 /// only through [`validate_order_request`], so it must bound the kind too — else a
@@ -481,6 +489,46 @@ pub fn validate_order_request(instrument_kind: &str, days: u32) -> Result<(), Sa
     {
         return Err(SafeError::invalid_request(
             "instrument type must be 1-256 alphanumeric characters.",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a movements refresh request's `days` bound (controller-side, before
+/// the lock). The worker independently re-checks the *resolved date range* via
+/// [`validate_movements_range`] (defense in depth).
+///
+/// # Errors
+/// [`SafeError::invalid_request`] if `days` exceeds [`MAX_MOVEMENTS_DAYS`].
+pub fn validate_movements_request(days: u32) -> Result<(), SafeError> {
+    if days > MAX_MOVEMENTS_DAYS {
+        return Err(SafeError::invalid_request("days must be <= 90."));
+    }
+    Ok(())
+}
+
+/// Validate a movements refresh's resolved date **range** (`YYYY-MM-DD`,
+/// `from <= to`, span no wider than [`MAX_MOVEMENTS_DAYS`]). The controller bounds
+/// the request as a `days` count via [`validate_movements_request`] before deriving
+/// the range; the worker re-checks the derived range here before any Fineco call —
+/// defense in depth, mirroring how the orders path re-validates worker-side.
+///
+/// # Errors
+/// [`SafeError::invalid_request`] if a date is malformed, `date_from` is after
+/// `date_to`, or the span exceeds [`MAX_MOVEMENTS_DAYS`].
+pub fn validate_movements_range(date_from: &str, date_to: &str) -> Result<(), SafeError> {
+    let from = parse_iso_date(date_from)?;
+    let to = parse_iso_date(date_to)?;
+    if from > to {
+        return Err(SafeError::invalid_request(
+            "date_from must be on or before date_to.",
+        ));
+    }
+    // `from`/`to` are midnight-UTC epochs, so their difference is an exact day count.
+    let span_days = (to - from) / 86_400;
+    if span_days > i64::from(MAX_MOVEMENTS_DAYS) {
+        return Err(SafeError::invalid_request(
+            "movements date range must be <= 90 days.",
         ));
     }
     Ok(())

@@ -57,6 +57,12 @@ pub enum Capability {
     /// Live tax refresh (logs in to Fineco). Owner-only.
     #[serde(rename = "tax.live.refresh")]
     TaxLiveRefresh,
+    /// Cached movements reads.
+    #[serde(rename = "movements.cached.read")]
+    MovementsCachedRead,
+    /// Live movements refresh (logs in to Fineco). Owner-only.
+    #[serde(rename = "movements.live.refresh")]
+    MovementsLiveRefresh,
 }
 
 impl Capability {
@@ -73,6 +79,8 @@ impl Capability {
             Capability::PortfolioLiveRefresh => "portfolio.live.refresh",
             Capability::OrdersLiveRefresh => "orders.live.refresh",
             Capability::TaxLiveRefresh => "tax.live.refresh",
+            Capability::MovementsCachedRead => "movements.cached.read",
+            Capability::MovementsLiveRefresh => "movements.live.refresh",
         }
     }
 
@@ -89,10 +97,12 @@ impl Capability {
             Capability::PortfolioShareableRead => "shareable_private",
             Capability::PortfolioCachedFullRead
             | Capability::OrdersCachedRead
-            | Capability::TaxCachedRead => "sensitive_private_cached",
+            | Capability::TaxCachedRead
+            | Capability::MovementsCachedRead => "sensitive_private_cached",
             Capability::PortfolioLiveRefresh
             | Capability::OrdersLiveRefresh
-            | Capability::TaxLiveRefresh => "credentialed_live",
+            | Capability::TaxLiveRefresh
+            | Capability::MovementsLiveRefresh => "credentialed_live",
         }
     }
 }

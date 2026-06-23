@@ -11,11 +11,12 @@ per-client steps.
 > conversation — a real expansion of the data boundary from *owner-only* to
 > *owner + whichever model provider you use*. To bound that, the connector
 > (email/OAuth) channel is restricted to a **tool allowlist** that, by default,
-> **excludes the four detailed-portfolio tools** that expose absolute € values
-> plus the authenticated Fineco market-read tools
+> **excludes the four detailed-portfolio tools** that expose absolute € values,
+> the authenticated Fineco market-read tools, and the two bank-account-movements
+> tools (raw transaction amounts)
 > (your CLI keeps the full set). Orders, tax, the shareable portfolio report,
 > allocation history, freshness, the public/third-party market tools, and the
-> credentialed live-refresh tools
+> portfolio/orders/tax live-refresh tools
 > *are* reachable by default — the allowlist is configurable (see
 > [Connector tool scoping](#connector-tool-scoping-configurable)). Decide, per
 > provider, whether you are comfortable before enabling.
@@ -73,11 +74,12 @@ On a **dual-pin** deployment the two Access channels are scoped differently:
 - The **CLI** channel (service token → `common_name`) always sees **every** tool.
 - The **connector** channel (OAuth → `email`) is restricted to a tool
   **allowlist** — by default, every tool **except** the four detailed-portfolio
-  tools that expose absolute € values and the authenticated Fineco market-read
-  tools:
+  tools that expose absolute € values, the authenticated Fineco market-read tools,
+  and the two bank-account-movements tools (which expose raw transaction amounts):
   `portfolio_get_latest_snapshot_summary`, `portfolio_get_latest_full_snapshot`,
   `portfolio_get_history`, `portfolio_get_position_history`,
-  `market_search_asset`, `market_get_asset_details`, `market_get_indices`.
+  `market_search_asset`, `market_get_asset_details`, `market_get_indices`,
+  `movements_get_latest`, `private_movements_refresh_live_sensitive`.
   Those are hidden from `tools/list` and refused by `tools/call` on the connector
   channel. This also hides the `external_enrichment` details section by default
   (both the stock `external_enrichment` and the ETF `etf_external_enrichment`
@@ -90,8 +92,10 @@ On a **dual-pin** deployment the two Access channels are scoped differently:
 
 Everything else — `portfolio_get_freshness`, `portfolio_get_latest_shareable_report`,
 `portfolio_get_allocation_history`, `orders_get_latest_monitor`, both tax tools,
-the public market tool (`market_get_zero_commission_etfs`), and all three
-`private_*_refresh_live_sensitive` tools — is in the default connector set.
+the public market tool (`market_get_zero_commission_etfs`), and the portfolio,
+orders, and tax `private_*_refresh_live_sensitive` tools — is in the default
+connector set. (The **movements** refresh tool and `movements_get_latest` are the
+exception among the private/refresh tools: they are blocked by default, as above.)
 
 Override it per deployment with `FINECO_CONNECTOR_TOOLS` in `/etc/fineco/access.env`:
 

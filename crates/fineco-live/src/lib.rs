@@ -38,9 +38,13 @@ use fineco_ipc::{
     MarketAssetDetailsLiveResult, MarketDetailsParams, MarketIndicesLiveResult,
     MarketIndicesParams, MarketLiveError, MarketSearchLiveResult, MarketSearchParams, SafeErrorDto,
 };
-use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
+use fineco_refresh::{
+    MovementsFetcher, OrdersFetcher, PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher,
+    TaxFetcher,
+};
 use fineco_store::{
-    NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder, Store,
+    NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
+    RawMovement, RawOrder, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +76,15 @@ const LIVE_MARKET_SEARCH_CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
 /// the worker is still making bounded Fineco reads.
 const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(960);
 
+/// A movements refresh logs in once and then **paginates** — up to many sequential
+/// page POSTs under one worker-held session (each bounded by the worker's own
+/// per-request HTTP timeout). The generic 120s budget can be too short for a busy
+/// 90-day statement, which would make the controller record a failed refresh while
+/// the worker is still legitimately paging. This covers a realistically large
+/// paginated fetch (login + the page loop); a true runaway is still bounded by the
+/// worker's own page cap.
+const LIVE_MOVEMENTS_CLIENT_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// A command from the refresh controller to the private worker. Adjacently tagged
 /// as `{"command": "...", "params": {...}}` (commands without params omit it).
 /// Command-enum only — there is no generic proxy, URL, or raw field.
@@ -92,6 +105,8 @@ pub enum LiveRequest {
     MarketAssetDetails(LiveMarketDetailsParams),
     /// Fetch Fineco headline index-bar cards, stamped with controller time.
     MarketIndices(LiveMarketIndicesParams),
+    /// Fetch bank account movements for a date range.
+    Movements(LiveMovementsParams),
 }
 
 /// Parameters for [`LiveRequest::Portfolio`].
@@ -146,6 +161,14 @@ pub struct LiveMarketIndicesParams {
     pub now_iso: String,
 }
 
+/// Parameters for [`LiveRequest::Movements`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveMovementsParams {
+    pub date_from: String,
+    pub date_to: String,
+}
+
 /// A successful worker result, typed per command (the plan forbids generic raw
 /// JSON for private payloads). Orders are [`RawOrder`]s — the worker holds no DB
 /// key — and are hashed by the controller after they cross the socket.
@@ -159,6 +182,7 @@ pub enum LiveResponse {
     MarketSearch(MarketSearchLiveResult),
     MarketAssetDetails(Box<MarketAssetDetailsLiveResult>),
     MarketIndices(MarketIndicesLiveResult),
+    Movements(Vec<RawMovement>),
 }
 
 /// The worker's reply: a typed result or the safe error envelope. Every worker
@@ -236,6 +260,7 @@ fn handle_live_request<F>(fetcher: &F, request: LiveRequest) -> Result<LiveRespo
 where
     F: PortfolioFetcher
         + RawOrdersFetcher
+        + RawMovementsFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
@@ -271,6 +296,10 @@ where
             .fetch_market_indices(&p.indices, &p.now_iso)
             .map_err(LiveError::from)
             .map(LiveResponse::MarketIndices),
+        LiveRequest::Movements(p) => fetcher
+            .fetch_raw_movements(&p.date_from, &p.date_to)
+            .map_err(LiveError::from)
+            .map(LiveResponse::Movements),
     }
 }
 
@@ -286,6 +315,7 @@ pub fn serve_live_blocking<F>(listener: &UnixListener, fetcher: &F) -> std::io::
 where
     F: PortfolioFetcher
         + RawOrdersFetcher
+        + RawMovementsFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
@@ -304,6 +334,7 @@ fn serve_one<F>(stream: &mut UnixStream, fetcher: &F) -> std::io::Result<()>
 where
     F: PortfolioFetcher
         + RawOrdersFetcher
+        + RawMovementsFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
@@ -401,6 +432,7 @@ fn client_timeout_for(request: &LiveRequest) -> Duration {
             LIVE_MARKET_SEARCH_CLIENT_TIMEOUT
         }
         LiveRequest::MarketAssetDetails(_) => LIVE_MARKET_DETAILS_CLIENT_TIMEOUT,
+        LiveRequest::Movements(_) => LIVE_MOVEMENTS_CLIENT_TIMEOUT,
         LiveRequest::Portfolio(_)
         | LiveRequest::Orders(_)
         | LiveRequest::TaxCarryForward(_)
@@ -549,6 +581,43 @@ impl OrdersFetcher for LiveClient {
     }
 }
 
+impl RawMovementsFetcher for LiveClient {
+    fn fetch_raw_movements(
+        &self,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<RawMovement>, SafeError> {
+        match self
+            .call(&LiveRequest::Movements(LiveMovementsParams {
+                date_from: date_from.to_string(),
+                date_to: date_to.to_string(),
+            }))
+            .map_err(LiveCallError::into_safe_error)?
+        {
+            LiveResponse::Movements(raw_movements) => Ok(raw_movements),
+            _ => Err(SafeError::internal()),
+        }
+    }
+}
+
+impl MovementsFetcher for LiveClient {
+    fn fetch_movements(
+        &self,
+        store: &Store,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<NewMovement>, SafeError> {
+        let raw = self.fetch_raw_movements(date_from, date_to)?;
+        raw.iter()
+            .map(|r| {
+                store
+                    .hash_raw_movement(r)
+                    .map_err(|_| SafeError::internal())
+            })
+            .collect()
+    }
+}
+
 impl TaxFetcher for LiveClient {
     fn fetch_tax_carry_forward(
         &self,
@@ -623,8 +692,8 @@ mod tests {
 
     use super::{
         LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LIVE_MARKET_SEARCH_CLIENT_TIMEOUT,
-        LiveClient, LiveMarketDetailsParams, LiveMarketSearchParams, LiveRequest,
-        client_timeout_for,
+        LIVE_MOVEMENTS_CLIENT_TIMEOUT, LiveClient, LiveMarketDetailsParams, LiveMarketSearchParams,
+        LiveMovementsParams, LiveRequest, client_timeout_for,
     };
     use fineco_ipc::{MarketDetailsParams, MarketSearchParams};
 
@@ -664,6 +733,18 @@ mod tests {
         );
         assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
         assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT >= Duration::from_secs(180));
+    }
+
+    #[test]
+    fn movements_uses_a_pagination_sized_client_timeout() {
+        let request = LiveRequest::Movements(LiveMovementsParams {
+            date_from: "2026-03-25".to_string(),
+            date_to: "2026-06-23".to_string(),
+        });
+
+        assert_eq!(client_timeout_for(&request), LIVE_MOVEMENTS_CLIENT_TIMEOUT);
+        assert!(LIVE_MOVEMENTS_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
+        assert!(LIVE_MOVEMENTS_CLIENT_TIMEOUT >= Duration::from_secs(900));
     }
 
     #[test]

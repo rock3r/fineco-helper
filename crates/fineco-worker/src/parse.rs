@@ -3389,9 +3389,173 @@ pub(crate) fn to_tax_minus(resp: TaxMinusResponse) -> Vec<NewTaxMinusByYear> {
         .collect()
 }
 
+// ---- Bank account movements ------------------------------------------------
+
+/// The JSON body POSTed to the movements endpoint:
+/// `{ "dateFrom", "dateTo", "offset", "limit", "keyword": "" }`.
+///
+/// The endpoint is **paginated**: it returns at most `limit` movements starting
+/// at `offset`, with `lastPage` in the response signalling the final page. The
+/// worker walks the pages (see `fetch_raw_movements`). `keyword` must be an empty
+/// **string** and `limit` a **positive** integer — `keyword: null` or `limit: -1`
+/// make the `private-api` host return 500 (confirmed against the live endpoint and
+/// the Fineco web app's own request shape). No `type` filter is sent, so all
+/// movement types are returned.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MovementsApiRequest {
+    pub date_from: String,
+    pub date_to: String,
+    pub offset: i32,
+    pub limit: i32,
+    pub keyword: String,
+}
+
+/// Top-level response from the movements endpoint.
+#[derive(Deserialize)]
+pub(crate) struct MovementsApiResponse {
+    #[serde(default, rename = "movimenti")]
+    pub movimenti: Vec<RawMovementItem>,
+    /// `true` on the final page of a date range; the worker pages until it sees it.
+    #[serde(default, rename = "lastPage")]
+    pub last_page: bool,
+    /// `true` when Fineco capped/limited the result set; the worker treats this as
+    /// an incomplete statement and fails loud rather than caching a partial one.
+    #[serde(default, rename = "limitedResult")]
+    pub limited_result: bool,
+    /// Non-empty when Fineco couldn't return some data (e.g. an SCA-gated source).
+    /// Elements are counted only (contents ignored) to detect an incomplete result.
+    #[serde(default, rename = "missingData")]
+    pub missing_data: Vec<serde::de::IgnoredAny>,
+}
+
+/// A single item as returned by Fineco (camelCase, all optional for resilience).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawMovementItem {
+    #[serde(default)]
+    progressivo_movimento: Option<String>,
+    #[serde(default)]
+    causale: Option<String>,
+    #[serde(default)]
+    descrizione: Option<String>,
+    #[serde(default, rename = "descrizioneBreve")]
+    descrizione_breve: Option<String>,
+    #[serde(default)]
+    importo: Option<f64>,
+    #[serde(default)]
+    tipo_movimento: Option<String>,
+    #[serde(default)]
+    data_operazione: Option<String>,
+    #[serde(default)]
+    data_registrazione: Option<String>,
+    #[serde(default)]
+    data_valuta: Option<String>,
+    #[serde(default)]
+    causale_movimento: Option<String>,
+    /// Fineco MoneyMap category / subcategory IDs (`bfCategoria`/`bfSottocategoria`).
+    /// Stored as the raw opaque IDs; a later MoneyMap-categories slice resolves them
+    /// to human-readable names via `GET banking/moneymap/categories`.
+    #[serde(default, rename = "bfCategoria")]
+    categoria_id: Option<String>,
+    #[serde(default, rename = "bfSottocategoria")]
+    sottocategoria_id: Option<String>,
+}
+
+/// Convert a [`MovementsApiResponse`] into [`RawMovement`]s, skipping items
+/// that have no `progressivoMovimento` (the mandatory unique id). All text
+/// fields are sanitized with [`sanitize_text`] before returning.
+pub(crate) fn to_raw_movements(resp: MovementsApiResponse) -> Vec<fineco_store::RawMovement> {
+    resp.movimenti
+        .into_iter()
+        .filter_map(|item| {
+            // Skip items with no usable id: `None`, empty, or whitespace-only.
+            // An empty `progressivoMovimento` would otherwise hash to a stable bogus
+            // value, and two such rows in one capture would collide on the unique
+            // (captured_at, movement_id_hash) key and fail the whole capture.
+            let movement_id = item
+                .progressivo_movimento
+                .filter(|id| !id.trim().is_empty())?;
+            Some(fineco_store::RawMovement {
+                movement_id,
+                causale: item.causale.as_deref().map(sanitize_text),
+                descrizione: item.descrizione.as_deref().map(sanitize_text),
+                descrizione_breve: item.descrizione_breve.as_deref().map(sanitize_text),
+                importo: item.importo,
+                tipo_movimento: item.tipo_movimento.as_deref().map(sanitize_text),
+                data_operazione: item.data_operazione,
+                data_registrazione: item.data_registrazione,
+                data_valuta: item.data_valuta,
+                causale_movimento: item.causale_movimento.as_deref().map(sanitize_text),
+                categoria_id: item.categoria_id.as_deref().map(sanitize_text),
+                sottocategoria_id: item.sottocategoria_id.as_deref().map(sanitize_text),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn movements_parse_skips_idless_items_and_sanitizes_text() {
+        // Two items: one with the mandatory `progressivoMovimento`, one without.
+        // The id-less item is dropped; the kept item's free text is sanitized
+        // (whitespace collapsed and trimmed by `sanitize_text`) and its amount
+        // preserved. Control-char stripping itself is unit-tested in fineco-core.
+        let json = r#"{
+            "movimenti": [
+                {
+                    "progressivoMovimento": "MOV-1",
+                    "causale": "BONIFICO",
+                    "descrizione": "  line   with    spaces  ",
+                    "descrizioneBreve": "short desc",
+                    "importo": -25.5,
+                    "tipoMovimento": "MOVIMENTO_CONTO",
+                    "dataOperazione": "2026-01-01",
+                    "dataRegistrazione": "2026-01-01",
+                    "dataValuta": "2026-01-02",
+                    "causaleMovimento": "48",
+                    "bfCategoria": "12",
+                    "bfSottocategoria": "34"
+                },
+                {
+                    "causale": "NO ID — must be skipped",
+                    "importo": 999.0
+                },
+                {
+                    "progressivoMovimento": "   ",
+                    "causale": "BLANK ID — must be skipped",
+                    "importo": 7.0
+                }
+            ]
+        }"#;
+        let resp: MovementsApiResponse = serde_json::from_str(json).expect("parse");
+        let raws = to_raw_movements(resp);
+
+        assert_eq!(raws.len(), 1, "the id-less and blank-id items are dropped");
+        assert_eq!(raws[0].movement_id, "MOV-1");
+        assert_eq!(
+            raws[0].descrizione.as_deref(),
+            Some("line with spaces"),
+            "leading/trailing trimmed and runs of whitespace collapse"
+        );
+        assert_eq!(raws[0].importo, Some(-25.5));
+        assert_eq!(raws[0].tipo_movimento.as_deref(), Some("MOVIMENTO_CONTO"));
+        assert_eq!(raws[0].data_valuta.as_deref(), Some("2026-01-02"));
+        // The richer fields parse from their `bf*`/camelCase keys.
+        assert_eq!(raws[0].descrizione_breve.as_deref(), Some("short desc"));
+        assert_eq!(raws[0].categoria_id.as_deref(), Some("12"));
+        assert_eq!(raws[0].sottocategoria_id.as_deref(), Some("34"));
+    }
+
+    #[test]
+    fn movements_parse_tolerates_a_missing_movimenti_array() {
+        // A response with no `movimenti` key yields an empty list, not an error.
+        let resp: MovementsApiResponse = serde_json::from_str("{}").expect("parse");
+        assert!(to_raw_movements(resp).is_empty());
+    }
 
     #[test]
     fn empty_show_falls_back_to_total() {

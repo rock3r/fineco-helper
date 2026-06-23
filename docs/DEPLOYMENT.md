@@ -181,10 +181,11 @@ fail immediately with `live_transport_failure`. Always include the worker in bot
 The capability policy (`/etc/fineco/policy.json`) is **required** — both roles
 fail closed without it. Grant `owner` only the capabilities for the tools you
 expose (`market.read`, `portfolio.cached.full_read`, `portfolio.shareable.read`,
-`orders.cached.read`, `tax.cached.read`). Keep `market.authenticated.read`
-ungranted until the market live-session gate has been reviewed clean and the
-owner intentionally wants on-demand authenticated Fineco market reads.
-`*.live.refresh` stays grant-only-if-needed.
+`orders.cached.read`, `tax.cached.read`, `movements.cached.read`). Keep
+`market.authenticated.read` ungranted until the market live-session gate has been
+reviewed clean and the owner intentionally wants on-demand authenticated Fineco
+market reads. `*.live.refresh` (including `movements.live.refresh`) stays
+grant-only-if-needed.
 
 > Order matters: the gateway and cloudflared each need their `/etc/fineco/`
 > EnvironmentFiles present before `enable --now` — the gateway refuses to start

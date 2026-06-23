@@ -27,6 +27,7 @@ fn handle(request: Request) -> Result<ResponseBody, SafeError> {
             portfolio: area("fresh"),
             orders: area("stale"),
             tax: area("missing"),
+            movements: area("missing"),
         })),
         _ => Err(SafeError::auth_required()),
     }
