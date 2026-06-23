@@ -76,6 +76,15 @@ const LIVE_MARKET_SEARCH_CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
 /// the worker is still making bounded Fineco reads.
 const LIVE_MARKET_DETAILS_CLIENT_TIMEOUT: Duration = Duration::from_secs(960);
 
+/// A movements refresh logs in once and then **paginates** — up to many sequential
+/// page POSTs under one worker-held session (each bounded by the worker's own
+/// per-request HTTP timeout). The generic 120s budget can be too short for a busy
+/// 90-day statement, which would make the controller record a failed refresh while
+/// the worker is still legitimately paging. This covers a realistically large
+/// paginated fetch (login + the page loop); a true runaway is still bounded by the
+/// worker's own page cap.
+const LIVE_MOVEMENTS_CLIENT_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// A command from the refresh controller to the private worker. Adjacently tagged
 /// as `{"command": "...", "params": {...}}` (commands without params omit it).
 /// Command-enum only — there is no generic proxy, URL, or raw field.
@@ -423,11 +432,11 @@ fn client_timeout_for(request: &LiveRequest) -> Duration {
             LIVE_MARKET_SEARCH_CLIENT_TIMEOUT
         }
         LiveRequest::MarketAssetDetails(_) => LIVE_MARKET_DETAILS_CLIENT_TIMEOUT,
+        LiveRequest::Movements(_) => LIVE_MOVEMENTS_CLIENT_TIMEOUT,
         LiveRequest::Portfolio(_)
         | LiveRequest::Orders(_)
         | LiveRequest::TaxCarryForward(_)
-        | LiveRequest::TaxMinusByYear
-        | LiveRequest::Movements(_) => LIVE_CLIENT_TIMEOUT,
+        | LiveRequest::TaxMinusByYear => LIVE_CLIENT_TIMEOUT,
     }
 }
 
@@ -683,8 +692,8 @@ mod tests {
 
     use super::{
         LIVE_CLIENT_TIMEOUT, LIVE_MARKET_DETAILS_CLIENT_TIMEOUT, LIVE_MARKET_SEARCH_CLIENT_TIMEOUT,
-        LiveClient, LiveMarketDetailsParams, LiveMarketSearchParams, LiveRequest,
-        client_timeout_for,
+        LIVE_MOVEMENTS_CLIENT_TIMEOUT, LiveClient, LiveMarketDetailsParams, LiveMarketSearchParams,
+        LiveMovementsParams, LiveRequest, client_timeout_for,
     };
     use fineco_ipc::{MarketDetailsParams, MarketSearchParams};
 
@@ -724,6 +733,18 @@ mod tests {
         );
         assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
         assert!(LIVE_MARKET_SEARCH_CLIENT_TIMEOUT >= Duration::from_secs(180));
+    }
+
+    #[test]
+    fn movements_uses_a_pagination_sized_client_timeout() {
+        let request = LiveRequest::Movements(LiveMovementsParams {
+            date_from: "2026-03-25".to_string(),
+            date_to: "2026-06-23".to_string(),
+        });
+
+        assert_eq!(client_timeout_for(&request), LIVE_MOVEMENTS_CLIENT_TIMEOUT);
+        assert!(LIVE_MOVEMENTS_CLIENT_TIMEOUT > LIVE_CLIENT_TIMEOUT);
+        assert!(LIVE_MOVEMENTS_CLIENT_TIMEOUT >= Duration::from_secs(900));
     }
 
     #[test]

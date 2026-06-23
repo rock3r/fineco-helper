@@ -3469,7 +3469,13 @@ pub(crate) fn to_raw_movements(resp: MovementsApiResponse) -> Vec<fineco_store::
     resp.movimenti
         .into_iter()
         .filter_map(|item| {
-            let movement_id = item.progressivo_movimento?;
+            // Skip items with no usable id: `None`, empty, or whitespace-only.
+            // An empty `progressivoMovimento` would otherwise hash to a stable bogus
+            // value, and two such rows in one capture would collide on the unique
+            // (captured_at, movement_id_hash) key and fail the whole capture.
+            let movement_id = item
+                .progressivo_movimento
+                .filter(|id| !id.trim().is_empty())?;
             Some(fineco_store::RawMovement {
                 movement_id,
                 causale: item.causale.as_deref().map(sanitize_text),
@@ -3517,13 +3523,18 @@ mod tests {
                 {
                     "causale": "NO ID — must be skipped",
                     "importo": 999.0
+                },
+                {
+                    "progressivoMovimento": "   ",
+                    "causale": "BLANK ID — must be skipped",
+                    "importo": 7.0
                 }
             ]
         }"#;
         let resp: MovementsApiResponse = serde_json::from_str(json).expect("parse");
         let raws = to_raw_movements(resp);
 
-        assert_eq!(raws.len(), 1, "the id-less item is dropped");
+        assert_eq!(raws.len(), 1, "the id-less and blank-id items are dropped");
         assert_eq!(raws[0].movement_id, "MOV-1");
         assert_eq!(
             raws[0].descrizione.as_deref(),
