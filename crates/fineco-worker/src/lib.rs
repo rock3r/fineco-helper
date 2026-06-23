@@ -789,12 +789,15 @@ impl RawMovementsFetcher for FinecoWorker {
                 SafeError::from_upstream_status,
             )?;
             let last_page = response.last_page;
-            let page = parse::to_raw_movements(response);
-            let page_len = page.len();
-            all.extend(page);
+            // Use the RAW page size (before `to_raw_movements` filters id-less
+            // items) for the defensive empty-page break — otherwise a page whose
+            // items all lacked `progressivoMovimento` would look "empty" and stop
+            // pagination, silently dropping later pages.
+            let raw_page_len = response.movimenti.len();
+            all.extend(parse::to_raw_movements(response));
             // Stop on the final page; also stop defensively if a non-final page
-            // came back empty (a misbehaving upstream would otherwise loop).
-            if last_page || page_len == 0 {
+            // came back genuinely empty (a misbehaving upstream would otherwise loop).
+            if last_page || raw_page_len == 0 {
                 return Ok(all);
             }
             offset = offset.saturating_add(MOVEMENTS_PAGE_SIZE);
