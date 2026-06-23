@@ -1581,12 +1581,21 @@ pub struct MovementDto {
     pub data_valuta: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causale_movimento: Option<String>,
-    /// Fineco MoneyMap category / subcategory IDs. Raw opaque IDs for now; a
-    /// later slice resolves them to names via `GET banking/moneymap/categories`.
+    /// Fineco MoneyMap category / subcategory IDs (the raw opaque ids stored on
+    /// the movement). Kept alongside the resolved `*_name` fields so a newly-created
+    /// or not-yet-cached id still surfaces even when its name can't be resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub categoria_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sottocategoria_id: Option<String>,
+    /// Human-readable category / subcategory names, resolved at read time from the
+    /// cached MoneyMap taxonomy (`GET banking/moneymap/categories`, captured
+    /// best-effort on each movements refresh). Absent when the id is unset or not
+    /// present in the latest cached taxonomy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categoria_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sottocategoria_name: Option<String>,
 }
 
 /// Freshness of all data areas, as returned by `portfolio_get_freshness`.

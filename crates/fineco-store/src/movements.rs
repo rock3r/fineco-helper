@@ -5,7 +5,23 @@
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::{Result, Store};
+use crate::{MoneyMapCategory, Result, Store};
+
+/// What a single credentialed movements refresh yields from the worker: the bank
+/// statement lines, the per-capture account `summary` (from the response envelope),
+/// and the account's MoneyMap taxonomy, fetched best-effort in the same login
+/// session to resolve the lines' raw category ids to names.
+///
+/// `categories` is `None` when the best-effort taxonomy fetch failed — the
+/// movements are still authoritative, and the previously-cached taxonomy is left
+/// untouched (a transient failure must not wipe resolved names). `Some` means the
+/// taxonomy was fetched (and should replace the cache, even if legitimately empty).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RawMovementsBundle {
+    pub movements: Vec<RawMovement>,
+    pub summary: MovementsSummary,
+    pub categories: Option<Vec<MoneyMapCategory>>,
+}
 
 /// A movement to capture, with its hashed id.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

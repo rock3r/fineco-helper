@@ -203,21 +203,43 @@ impl QueryHandler {
                 current_month_credit_spending: s.current_month_credit_spending,
                 current_month_debit_spending: s.current_month_debit_spending,
             });
+        // Resolve the raw MoneyMap ids to names from the latest cached taxonomy.
+        // Built once per read; an unresolved id yields no name (the raw id still
+        // surfaces). The subcategory name is scoped to its parent category id.
+        let taxonomy = self
+            .store
+            .latest_categories()
+            .map_err(|_| SafeError::internal())?;
         let movements = rows
             .into_iter()
-            .map(|row| MovementDto {
-                movement_id_hash: row.movement_id_hash,
-                causale: row.causale,
-                descrizione: row.descrizione,
-                descrizione_breve: row.descrizione_breve,
-                importo: row.importo,
-                tipo_movimento: row.tipo_movimento,
-                data_operazione: row.data_operazione,
-                data_registrazione: row.data_registrazione,
-                data_valuta: row.data_valuta,
-                causale_movimento: row.causale_movimento,
-                categoria_id: row.categoria_id,
-                sottocategoria_id: row.sottocategoria_id,
+            .map(|row| {
+                let categoria_name = row
+                    .categoria_id
+                    .as_deref()
+                    .and_then(|id| taxonomy.category_name(id))
+                    .map(str::to_string);
+                let sottocategoria_name = match (&row.categoria_id, &row.sottocategoria_id) {
+                    (Some(cat), Some(sub)) => {
+                        taxonomy.subcategory_name(cat, sub).map(str::to_string)
+                    }
+                    _ => None,
+                };
+                MovementDto {
+                    movement_id_hash: row.movement_id_hash,
+                    causale: row.causale,
+                    descrizione: row.descrizione,
+                    descrizione_breve: row.descrizione_breve,
+                    importo: row.importo,
+                    tipo_movimento: row.tipo_movimento,
+                    data_operazione: row.data_operazione,
+                    data_registrazione: row.data_registrazione,
+                    data_valuta: row.data_valuta,
+                    causale_movimento: row.causale_movimento,
+                    categoria_id: row.categoria_id,
+                    sottocategoria_id: row.sottocategoria_id,
+                    categoria_name,
+                    sottocategoria_name,
+                }
             })
             .collect();
         Ok(ResponseBody::Movements(MovementsDto {

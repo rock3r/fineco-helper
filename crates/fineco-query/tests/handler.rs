@@ -8,8 +8,8 @@ use fineco_core::parse_iso8601_utc;
 use fineco_ipc::{Client, Policy, Request, ResponseBody, serve_blocking};
 use fineco_query::{FreshnessMaxAge, QueryHandler};
 use fineco_store::{
-    MovementsSummary, NewAsset, NewMovement, NewOrder, NewPortfolioSnapshot, NewPosition,
-    NewTaxCarryForward, NewTaxMinusByYear, Store,
+    MoneyMapCategory, MovementsSummary, NewAsset, NewMovement, NewOrder, NewPortfolioSnapshot,
+    NewPosition, NewTaxCarryForward, NewTaxMinusByYear, Store,
 };
 
 fn epoch(iso: &str) -> i64 {
@@ -241,6 +241,123 @@ fn latest_orders_and_tax_are_served() {
         }
         other => panic!("expected tax minus, got {other:?}"),
     }
+}
+
+fn movement_with_ids(
+    id_hash: &str,
+    categoria_id: Option<&str>,
+    sottocategoria_id: Option<&str>,
+) -> NewMovement {
+    NewMovement {
+        movement_id_hash: id_hash.to_string(),
+        causale: Some("BONIFICO".to_string()),
+        descrizione: Some("synthetic".to_string()),
+        descrizione_breve: None,
+        importo: Some(-25.0),
+        tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
+        data_operazione: Some("2026-01-01".to_string()),
+        data_registrazione: None,
+        data_valuta: Some("2026-01-02".to_string()),
+        causale_movimento: Some("48".to_string()),
+        categoria_id: categoria_id.map(str::to_string),
+        sottocategoria_id: sottocategoria_id.map(str::to_string),
+    }
+}
+
+#[test]
+fn latest_movements_resolves_category_names_from_the_cached_taxonomy() {
+    let mut store = Store::open_in_memory().expect("open");
+    store
+        .capture_movements(
+            "2026-06-03T10:00:00Z",
+            &[
+                // Fully resolvable: category + subcategory both in the taxonomy.
+                movement_with_ids("H1", Some("12"), Some("34")),
+                // Unknown category id: name unresolved, but the raw id still surfaces.
+                movement_with_ids("H2", Some("404"), None),
+                // No category ids at all.
+                movement_with_ids("H3", None, None),
+            ],
+            None,
+        )
+        .expect("capture movements");
+    store
+        .capture_categories(
+            "2026-06-03T10:00:00Z",
+            &[
+                MoneyMapCategory {
+                    category_id: "12".to_string(),
+                    subcategory_id: None,
+                    name: Some("Shopping".to_string()),
+                    flag_spesa_ricavo: Some("S".to_string()),
+                },
+                MoneyMapCategory {
+                    category_id: "12".to_string(),
+                    subcategory_id: Some("34".to_string()),
+                    name: Some("Clothes".to_string()),
+                    flag_spesa_ricavo: None,
+                },
+            ],
+        )
+        .expect("capture taxonomy");
+
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), owner_policy());
+    let ResponseBody::Movements(dto) = handler
+        .handle(Request::MovementsGetLatest, 0)
+        .expect("movements")
+    else {
+        panic!("expected movements");
+    };
+
+    let by_hash = |h: &str| {
+        dto.movements
+            .iter()
+            .find(|m| m.movement_id_hash == h)
+            .unwrap_or_else(|| panic!("missing {h}"))
+            .clone()
+    };
+
+    let m1 = by_hash("H1");
+    assert_eq!(m1.categoria_id.as_deref(), Some("12"));
+    assert_eq!(m1.categoria_name.as_deref(), Some("Shopping"));
+    assert_eq!(m1.sottocategoria_id.as_deref(), Some("34"));
+    assert_eq!(m1.sottocategoria_name.as_deref(), Some("Clothes"));
+
+    let m2 = by_hash("H2");
+    assert_eq!(
+        m2.categoria_id.as_deref(),
+        Some("404"),
+        "raw id still surfaces"
+    );
+    assert_eq!(m2.categoria_name, None, "unknown id has no name");
+
+    let m3 = by_hash("H3");
+    assert_eq!(m3.categoria_name, None);
+    assert_eq!(m3.sottocategoria_name, None);
+}
+
+#[test]
+fn latest_movements_without_a_taxonomy_capture_leaves_names_unresolved() {
+    // Movements captured but no taxonomy yet: raw ids surface, names are absent.
+    let mut store = Store::open_in_memory().expect("open");
+    store
+        .capture_movements(
+            "2026-06-03T10:00:00Z",
+            &[movement_with_ids("H1", Some("12"), Some("34"))],
+            None,
+        )
+        .expect("capture movements");
+
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), owner_policy());
+    let ResponseBody::Movements(dto) = handler
+        .handle(Request::MovementsGetLatest, 0)
+        .expect("movements")
+    else {
+        panic!("expected movements");
+    };
+    assert_eq!(dto.movements[0].categoria_id.as_deref(), Some("12"));
+    assert_eq!(dto.movements[0].categoria_name, None);
+    assert_eq!(dto.movements[0].sottocategoria_name, None);
 }
 
 #[test]

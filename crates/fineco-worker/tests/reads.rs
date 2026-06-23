@@ -213,6 +213,25 @@ fn spawn_mock_fineco_read_451_non_sca() -> String {
     format!("http://{addr}")
 }
 
+/// Like [`spawn_mock_fineco`], but the MoneyMap categories endpoint 503s — to
+/// prove the best-effort taxonomy fetch never fails the movements refresh.
+fn spawn_mock_fineco_broken_moneymap() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST"
+                && path == "/conto-e-carte/bilancio-familiare/widget-home/preload-data"
+            {
+                return httptiny::Response::json(503, "{\"error\":\"moneymap unavailable\"}");
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
 fn worker_for(base: &str) -> FinecoWorker {
     FinecoWorker::new(
         FinecoEndpoints::for_base(base),
@@ -413,25 +432,84 @@ fn paginates_movements_until_last_page() {
     // offset until `lastPage` and accumulate ALL of them — never just the first
     // page (the silent-truncation bug the date-only body had).
     let base = spawn_mock_fineco();
-    let (movements, summary) = worker_for(&base)
+    let bundle = worker_for(&base)
         .fetch_raw_movements("2026-03-25", "2026-06-23")
         .expect("movements fetch should succeed");
 
     assert_eq!(
-        movements.len(),
+        bundle.movements.len(),
         23,
         "all pages accumulated, not just the first"
     );
     // Unique ids across pages — no drops, no duplicates.
-    let mut ids: Vec<&str> = movements.iter().map(|m| m.movement_id.as_str()).collect();
+    let mut ids: Vec<&str> = bundle
+        .movements
+        .iter()
+        .map(|m| m.movement_id.as_str())
+        .collect();
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), 23, "every movement id is distinct across pages");
     // The per-fetch account summary is read from the first page's top-level fields.
-    assert_eq!(summary.balance_at_movement, Some(1234.56));
-    assert_eq!(summary.balance_at_search_date, Some(1200.0));
-    assert_eq!(summary.current_month_credit_spending, Some(500.0));
-    assert_eq!(summary.current_month_debit_spending, Some(-321.0));
+    assert_eq!(bundle.summary.balance_at_movement, Some(1234.56));
+    assert_eq!(bundle.summary.balance_at_search_date, Some(1200.0));
+    assert_eq!(bundle.summary.current_month_credit_spending, Some(500.0));
+    assert_eq!(bundle.summary.current_month_debit_spending, Some(-321.0));
+}
+
+#[test]
+fn movements_fetch_piggybacks_the_moneymap_taxonomy() {
+    // The same refresh fetches the MoneyMap taxonomy in the same session; the
+    // bundle carries flattened category + subcategory rows from the legacy endpoint.
+    let base = spawn_mock_fineco();
+    let bundle = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect("movements fetch should succeed");
+
+    let categories = bundle
+        .categories
+        .expect("taxonomy fetched alongside movements");
+    // 3 categories (003, 099, 999) + 2 subcategories under 003 = 5 flattened rows.
+    // 999 ("Cointestatari") carries `"sottocategorie": null` — it must parse as a
+    // bare category, not break the whole response.
+    assert_eq!(categories.len(), 5);
+    let shopping = categories
+        .iter()
+        .find(|c| c.category_id == "003" && c.subcategory_id.is_none())
+        .expect("category 003");
+    assert_eq!(shopping.name.as_deref(), Some("Shopping"));
+    assert_eq!(shopping.flag_spesa_ricavo.as_deref(), Some("S"));
+    let cointestatari = categories
+        .iter()
+        .find(|c| c.category_id == "999")
+        .expect("category 999 (null sottocategorie)");
+    assert!(cointestatari.subcategory_id.is_none());
+    assert_eq!(cointestatari.name.as_deref(), Some("Cointestatari"));
+    let clothes = categories
+        .iter()
+        .find(|c| c.subcategory_id.as_deref() == Some("034"))
+        .expect("subcategory 034");
+    assert_eq!(
+        clothes.category_id, "003",
+        "subcategory carries its parent id"
+    );
+    assert_eq!(clothes.name.as_deref(), Some("Clothes"));
+}
+
+#[test]
+fn movements_fetch_succeeds_when_the_taxonomy_endpoint_fails() {
+    // Best-effort: a failing taxonomy endpoint must NOT fail the movements fetch.
+    // The bundle still carries the movements; categories is `None` (don't touch the
+    // cache) rather than an empty list (which would wipe it).
+    let base = spawn_mock_fineco_broken_moneymap();
+    let bundle = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect("movements still succeed despite a taxonomy failure");
+    assert_eq!(bundle.movements.len(), 23);
+    assert!(
+        bundle.categories.is_none(),
+        "a failed best-effort taxonomy fetch yields None, not an empty list"
+    );
 }
 
 #[test]

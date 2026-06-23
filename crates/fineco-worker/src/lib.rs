@@ -47,7 +47,8 @@ use fineco_ipc::{
 };
 use fineco_refresh::{PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::{
-    NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawMovement, RawOrder,
+    MoneyMapCategory, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawMovement,
+    RawMovementsBundle, RawOrder,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -115,6 +116,7 @@ const ORDERS_REFERER: &str = "https://finecobank.com/pvt/portfolio/order-monitor
 const TAX_REFERER: &str =
     "https://finecobank.com/pvt/portfolio/report/tax-carry-forward/current-month";
 const MOVEMENTS_REFERER: &str = "https://finecobank.com/pvt/banking/accounts-and-cards/movements";
+const MONEYMAP_REFERER: &str = "https://finecobank.com/pvt/banking";
 const MARKET_SEARCH_REFERER: &str = "https://finecobank.com/pvt/home";
 const MARKET_DETAILS_REFERER: &str = "https://finecobank.com/pvt/trading/etf/scheda";
 
@@ -783,12 +785,40 @@ impl RawMovementsFetcher for FinecoWorker {
         &self,
         date_from: &str,
         date_to: &str,
-    ) -> Result<(Vec<RawMovement>, fineco_store::MovementsSummary), SafeError> {
+    ) -> Result<RawMovementsBundle, SafeError> {
         // Defense in depth: re-check the resolved range (dates, ordering, and the
         // 90-day span) worker-side before any Fineco call, as the orders path does.
         validate_movements_range(date_from, date_to)?;
 
+        // One login, reused for both the (required) movements pages and the
+        // (best-effort) MoneyMap taxonomy fetch below.
         let session = self.refresh_login()?;
+        // The account-level summary rides the movements pages (first page envelope).
+        let (movements, summary) =
+            self.fetch_movement_pages(&session.cookie, date_from, date_to)?;
+        // Piggyback the taxonomy on the same session, best-effort: its failure
+        // yields `None` so the controller leaves the cached taxonomy untouched and
+        // the movements refresh still succeeds (names just stay unresolved).
+        let categories = self.fetch_moneymap_categories_best_effort(&session.cookie);
+        Ok(RawMovementsBundle {
+            movements,
+            summary,
+            categories,
+        })
+    }
+}
+
+impl FinecoWorker {
+    /// Walk the paginated movements endpoint under an existing session, returning
+    /// the accumulated raw movements plus the per-fetch account summary (read once
+    /// from the first page). Fails loud (rather than truncating) on an incomplete
+    /// result or past the page cap.
+    fn fetch_movement_pages(
+        &self,
+        cookie: &str,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<(Vec<RawMovement>, fineco_store::MovementsSummary), SafeError> {
         let mut all = Vec::new();
         // The account-level summary is per fetch (response top level), not per page,
         // so it is read once from the first page (offset 0) and held for the walk.
@@ -805,7 +835,7 @@ impl RawMovementsFetcher for FinecoWorker {
             let response: parse::MovementsApiResponse = self.post_json_mapped(
                 &self.endpoints.movements,
                 &body,
-                &session.cookie,
+                cookie,
                 MOVEMENTS_REFERER,
                 SafeError::from_upstream_status,
             )?;
@@ -839,6 +869,26 @@ impl RawMovementsFetcher for FinecoWorker {
         // Ran past the page cap without a `lastPage`: fail loud rather than cache a
         // partial history.
         Err(SafeError::internal())
+    }
+
+    /// Fetch + flatten the account's MoneyMap (bilancio familiare) taxonomy under
+    /// an existing session. The web endpoint is a POST with an empty `{}` body
+    /// (the server builds the response; no client-supplied fields). **Best-effort:**
+    /// returns `None` on ANY failure (transport, non-2xx, parse) — the caller has
+    /// already captured the movements, and a taxonomy hiccup must never fail the
+    /// refresh or wipe the previously-cached names. `Some` (even an empty map)
+    /// means the taxonomy was successfully fetched.
+    fn fetch_moneymap_categories_best_effort(&self, cookie: &str) -> Option<Vec<MoneyMapCategory>> {
+        let response: parse::MoneyMapCategoriesResponse = self
+            .post_json_mapped(
+                &self.endpoints.moneymap_categories,
+                &serde_json::json!({}),
+                cookie,
+                MONEYMAP_REFERER,
+                SafeError::from_upstream_status,
+            )
+            .ok()?;
+        Some(parse::to_category_rows(response))
     }
 }
 

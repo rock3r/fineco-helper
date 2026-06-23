@@ -16,6 +16,7 @@ use rusqlite::Connection;
 
 mod backup;
 mod capture;
+mod categories;
 mod freshness;
 mod hashing;
 mod health;
@@ -28,18 +29,19 @@ mod tax;
 pub use capture::{
     NewAsset, NewFxRate, NewPortfolioSnapshot, NewPosition, PortfolioSnapshotRow, PositionRow,
 };
+pub use categories::{CategoryLookup, MoneyMapCategory};
 pub use fineco_core::FreshnessState;
 pub use freshness::DataAreaFreshness;
 pub use health::JobCounts;
 pub use history::{AllocationPoint, MAX_HISTORY_SNAPSHOTS, PositionHistoryPoint};
 pub use jobs::{JobOutcome, JobRunRow};
-pub use movements::{MovementRow, MovementsSummary, NewMovement, RawMovement};
+pub use movements::{MovementRow, MovementsSummary, NewMovement, RawMovement, RawMovementsBundle};
 pub use orders::{NewOrder, OrderRow, RawOrder};
 pub use report::{ShareableRow, shareable_rows_to_csv};
 pub use tax::{NewTaxCarryForward, NewTaxMinusByYear, TaxCarryForwardRow, TaxMinusByYearRow};
 
 /// Current schema version applied when a store is opened.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_V1: &str = include_str!("schema_v1.sql");
 const SCHEMA_V2: &str = include_str!("schema_v2.sql");
@@ -47,6 +49,7 @@ const SCHEMA_V3: &str = include_str!("schema_v3.sql");
 const SCHEMA_V4: &str = include_str!("schema_v4.sql");
 const SCHEMA_V5: &str = include_str!("schema_v5.sql");
 const SCHEMA_V6: &str = include_str!("schema_v6.sql");
+const SCHEMA_V7: &str = include_str!("schema_v7.sql");
 
 /// An error from the store. Opaque by design: the underlying SQLite driver type
 /// is never exposed through the public API, so callers cannot couple to
@@ -171,6 +174,9 @@ impl Store {
         }
         if current < 6 {
             tx.execute_batch(SCHEMA_V6)?;
+        }
+        if current < 7 {
+            tx.execute_batch(SCHEMA_V7)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;

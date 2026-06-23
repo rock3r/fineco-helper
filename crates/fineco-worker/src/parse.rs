@@ -3541,6 +3541,150 @@ pub(crate) fn to_movements_summary(resp: &MovementsApiResponse) -> fineco_store:
     }
 }
 
+/// Top-level response from the web MoneyMap taxonomy endpoint
+/// (`conto-e-carte/bilancio-familiare/widget-home/preload-data`, POST `{}`): a
+/// JSON object **keyed by category id** (e.g. `"003"`), each value a category
+/// whose `sottocategorie` is itself an object **keyed by subcategory id**. The
+/// keys are the same opaque ids movements carry as `bfCategoria`/`bfSottocategoria`
+/// (the join key). Fields are snake_case. All value fields default for resilience.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub(crate) struct MoneyMapCategoriesResponse {
+    categories: std::collections::HashMap<String, RawCategoryItem>,
+}
+
+/// A MoneyMap category value. Only the join-relevant fields are modelled
+/// (`categoria` is the human name); decorative ones (`icona`/`personalizzabile`/
+/// `utilizzata`) are ignored. `sottocategorie` is a map keyed by subcategory id —
+/// modelled as `Option` because Fineco sends `null` (not just an absent key) for a
+/// category with no subcategories (e.g. "Cointestatari"); a plain `HashMap` would
+/// fail to deserialize `null` and reject the WHOLE taxonomy response.
+#[derive(Deserialize)]
+struct RawCategoryItem {
+    #[serde(default)]
+    categoria: Option<String>,
+    #[serde(default)]
+    flag_spesa_ricavo: Option<String>,
+    #[serde(default)]
+    sottocategorie: Option<std::collections::HashMap<String, RawSubcategoryItem>>,
+}
+
+/// A MoneyMap subcategory value; `sottocategoria` is the human name (the ids come
+/// from the enclosing map keys).
+#[derive(Deserialize)]
+struct RawSubcategoryItem {
+    #[serde(default)]
+    sottocategoria: Option<String>,
+}
+
+/// Decode the HTML entities Fineco embeds in MoneyMap names (real taxonomy carries
+/// e.g. `Attivit&agrave;`, `Universit&agrave;`): the standard XML entities, the
+/// Italian-accent named entities, and numeric `&#nn;` / `&#xhh;`. Unknown entities
+/// are left literal. Safe here — the value is a JSON string field for an MCP client,
+/// never rendered as HTML — and entity decoding runs BEFORE [`sanitize_text`], so any
+/// control char a numeric entity might decode to is then stripped.
+fn decode_html_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        // An entity is `&name;` with a short name; bound the `;` search so a far-off
+        // semicolon in ordinary text isn't mistaken for an entity terminator.
+        if let Some(semi) = after.find(';').filter(|&s| s <= 10)
+            && let Some(decoded) = decode_one_entity(&after[..semi])
+        {
+            out.push(decoded);
+            rest = &after[semi + 1..];
+            continue;
+        }
+        // Not a recognized entity: keep the `&` literal and resume after it.
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode a single entity body (the text between `&` and `;`). `None` if unrecognized.
+fn decode_one_entity(entity: &str) -> Option<char> {
+    if let Some(num) = entity.strip_prefix('#') {
+        let code = match num.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse::<u32>().ok()?,
+        };
+        return char::from_u32(code);
+    }
+    Some(match entity {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{00A0}',
+        "agrave" => 'à',
+        "egrave" => 'è',
+        "eacute" => 'é',
+        "igrave" => 'ì',
+        "ograve" => 'ò',
+        "ugrave" => 'ù',
+        "Agrave" => 'À',
+        "Egrave" => 'È',
+        "Eacute" => 'É',
+        "Igrave" => 'Ì',
+        "Ograve" => 'Ò',
+        "Ugrave" => 'Ù',
+        "ccedil" => 'ç',
+        "Ccedil" => 'Ç',
+        _ => return None,
+    })
+}
+
+/// Flatten a [`MoneyMapCategoriesResponse`] into store-ready taxonomy rows: one
+/// row per category (`subcategory_id = None`, carrying `flag_spesa_ricavo`) and
+/// one per subcategory (`subcategory_id = Some`, parent id in `category_id`). The
+/// ids are the **map keys** (always present; the authoritative join key against
+/// movements). Blank-id entries are skipped. Names are HTML-entity-decoded then
+/// sanitized with [`sanitize_text`]. Output is sorted by `(category_id,
+/// subcategory_id)` so the capture order is deterministic (the source maps are unordered).
+pub(crate) fn to_category_rows(
+    resp: MoneyMapCategoriesResponse,
+) -> Vec<fineco_store::MoneyMapCategory> {
+    let clean_name = |s: &str| sanitize_text(&decode_html_entities(s));
+    let mut rows = Vec::new();
+    for (category_id, cat) in resp.categories {
+        if category_id.trim().is_empty() {
+            // No usable id: skip the category and its subcategories (nothing to
+            // join against).
+            continue;
+        }
+        rows.push(fineco_store::MoneyMapCategory {
+            category_id: category_id.clone(),
+            subcategory_id: None,
+            name: cat.categoria.as_deref().map(clean_name),
+            flag_spesa_ricavo: cat.flag_spesa_ricavo.as_deref().map(sanitize_text),
+        });
+        for (subcategory_id, sub) in cat.sottocategorie.unwrap_or_default() {
+            if subcategory_id.trim().is_empty() {
+                continue;
+            }
+            rows.push(fineco_store::MoneyMapCategory {
+                category_id: category_id.clone(),
+                subcategory_id: Some(subcategory_id),
+                name: sub.sottocategoria.as_deref().map(clean_name),
+                flag_spesa_ricavo: None,
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        (&a.category_id, &a.subcategory_id).cmp(&(&b.category_id, &b.subcategory_id))
+    });
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3649,6 +3793,156 @@ mod tests {
             to_movements_summary(&resp),
             fineco_store::MovementsSummary::default()
         );
+    }
+
+    #[test]
+    fn categories_parse_flattens_and_sanitizes() {
+        // The web taxonomy is a map keyed by category id; each category's
+        // `sottocategorie` is a map keyed by subcategory id. Flattening yields one
+        // category row + one row per subcategory, sorted by (cat, sub) so the
+        // category row precedes its subcategories. Names sanitized; parent id
+        // carried onto each subcategory; flag only on category rows.
+        let json = r#"{
+            "003": {
+                "id_categoria": "003",
+                "categoria": "  Shopping   spree  ",
+                "flag_spesa_ricavo": "S",
+                "icona": "bag",
+                "personalizzabile": false,
+                "utilizzata": true,
+                "sottocategorie": {
+                    "034": { "id_categoria": "003", "id_sottocategoria": "034", "sottocategoria": "Clothes" },
+                    "035": { "id_categoria": "003", "id_sottocategoria": "035", "sottocategoria": "Shoes" }
+                }
+            },
+            "099": {
+                "id_categoria": "099",
+                "categoria": "Income",
+                "flag_spesa_ricavo": "R",
+                "sottocategorie": {}
+            }
+        }"#;
+        let resp: MoneyMapCategoriesResponse = serde_json::from_str(json).expect("parse");
+        let rows = to_category_rows(resp);
+
+        assert_eq!(rows.len(), 4, "2 categories + 2 subcategories");
+        // Sorted: 003 (cat), 003/034, 003/035, 099 (cat).
+        assert_eq!(rows[0].category_id, "003");
+        assert!(rows[0].subcategory_id.is_none());
+        assert_eq!(
+            rows[0].name.as_deref(),
+            Some("Shopping spree"),
+            "whitespace collapsed/trimmed"
+        );
+        assert_eq!(rows[0].flag_spesa_ricavo.as_deref(), Some("S"));
+        assert_eq!(rows[1].category_id, "003");
+        assert_eq!(rows[1].subcategory_id.as_deref(), Some("034"));
+        assert_eq!(rows[1].name.as_deref(), Some("Clothes"));
+        assert!(rows[1].flag_spesa_ricavo.is_none());
+        assert_eq!(rows[2].subcategory_id.as_deref(), Some("035"));
+        assert_eq!(rows[3].category_id, "099");
+        assert!(rows[3].subcategory_id.is_none());
+        assert_eq!(rows[3].flag_spesa_ricavo.as_deref(), Some("R"));
+    }
+
+    #[test]
+    fn categories_parse_skips_blank_ids() {
+        // A blank category key drops it (and its subcategories — nothing to join
+        // against). A blank subcategory key is dropped while its parent is kept.
+        let json = r#"{
+            "   ": {
+                "categoria": "blank id",
+                "sottocategorie": { "001": { "sottocategoria": "x" } }
+            },
+            "012": {
+                "categoria": "Kept",
+                "sottocategorie": {
+                    "  ": { "sottocategoria": "blank sub id" },
+                    "034": { "sottocategoria": "ok" }
+                }
+            }
+        }"#;
+        let resp: MoneyMapCategoriesResponse = serde_json::from_str(json).expect("parse");
+        let rows = to_category_rows(resp);
+        assert_eq!(rows.len(), 2, "kept category + its one valid subcategory");
+        assert_eq!(rows[0].category_id, "012");
+        assert!(rows[0].subcategory_id.is_none());
+        assert_eq!(rows[1].subcategory_id.as_deref(), Some("034"));
+    }
+
+    #[test]
+    fn categories_parse_tolerates_an_empty_object() {
+        let resp: MoneyMapCategoriesResponse = serde_json::from_str("{}").expect("parse");
+        assert!(to_category_rows(resp).is_empty());
+    }
+
+    #[test]
+    fn categories_parse_handles_null_sottocategorie() {
+        // Live regression: a real category ("Cointestatari") sends
+        // `"sottocategorie": null` (not an absent key). A non-Option map would fail
+        // to deserialize null and reject the WHOLE response; we must parse it as a
+        // category with no subcategories, and the sibling category must survive.
+        let json = r#"{
+            "999": {
+                "id_categoria": "999",
+                "categoria": "Cointestatari",
+                "flag_spesa_ricavo": "S",
+                "sottocategorie": null,
+                "icona": null
+            },
+            "003": {
+                "id_categoria": "003",
+                "categoria": "Shopping",
+                "flag_spesa_ricavo": "S",
+                "sottocategorie": {
+                    "034": { "sottocategoria": "Clothes" }
+                }
+            }
+        }"#;
+        let resp: MoneyMapCategoriesResponse = serde_json::from_str(json).expect("parse");
+        let rows = to_category_rows(resp);
+        // 003 (cat) + 003/034 (sub) + 999 (cat, no subs) = 3 rows.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].category_id, "003");
+        assert_eq!(rows[1].subcategory_id.as_deref(), Some("034"));
+        assert_eq!(rows[2].category_id, "999");
+        assert!(rows[2].subcategory_id.is_none());
+        assert_eq!(rows[2].name.as_deref(), Some("Cointestatari"));
+    }
+
+    #[test]
+    fn decodes_html_entities() {
+        // Named (XML + Italian accents), numeric decimal + hex, and pass-through.
+        assert_eq!(
+            decode_html_entities("Attivit&agrave; Professionali"),
+            "Attività Professionali"
+        );
+        assert_eq!(decode_html_entities("Universit&agrave;"), "Università");
+        assert_eq!(decode_html_entities("A &amp; B"), "A & B");
+        assert_eq!(decode_html_entities("&#224;"), "à");
+        assert_eq!(decode_html_entities("&#xE0;"), "à");
+        // No entities / unknown entity / lone ampersand: left intact.
+        assert_eq!(decode_html_entities("Shopping"), "Shopping");
+        assert_eq!(decode_html_entities("R&D &notreal; x"), "R&D &notreal; x");
+        assert_eq!(decode_html_entities("Tom & Jerry"), "Tom & Jerry");
+    }
+
+    #[test]
+    fn categories_parse_decodes_entities_in_names() {
+        let json = r#"{
+            "003": {
+                "id_categoria": "003",
+                "categoria": "Attivit&agrave; Professionali",
+                "flag_spesa_ricavo": "S",
+                "sottocategorie": {
+                    "034": { "sottocategoria": "Universit&agrave;" }
+                }
+            }
+        }"#;
+        let resp: MoneyMapCategoriesResponse = serde_json::from_str(json).expect("parse");
+        let rows = to_category_rows(resp);
+        assert_eq!(rows[0].name.as_deref(), Some("Attività Professionali"));
+        assert_eq!(rows[1].name.as_deref(), Some("Università"));
     }
 
     #[test]

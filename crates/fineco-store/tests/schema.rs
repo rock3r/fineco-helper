@@ -5,12 +5,14 @@ use fineco_store::{SCHEMA_VERSION, Store};
 
 /// All tables a fully-migrated store has, sorted (8 plan data tables + the v3
 /// `store_meta` + the v4 `data_captures` + the v5 `movements` + the v6
-/// `movements_summary`). Exact set so an accidental table addition is caught.
+/// `movements_summary` + the v7 `moneymap_categories`). Exact set so an
+/// accidental table addition is caught.
 const ALL_TABLES: &[&str] = &[
     "assets",
     "data_captures",
     "fx_rates",
     "job_runs",
+    "moneymap_categories",
     "movements",
     "movements_summary",
     "orders",

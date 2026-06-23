@@ -29,6 +29,11 @@ pub struct FinecoEndpoints {
     pub(crate) tax_carry_forward: String,
     pub(crate) tax_minus: String,
     pub(crate) movements: String,
+    /// MoneyMap (bilancio familiare) category taxonomy. The WEB front door posts
+    /// an empty `{}` body to this `finecobank.com` widget endpoint and gets back a
+    /// map keyed by category id (not the mobile APK's `evl.../banking/moneymap`
+    /// GET — same web-vs-mobile split as movements). Confirmed via the owner's HAR.
+    pub(crate) moneymap_categories: String,
 }
 
 impl FinecoEndpoints {
@@ -64,6 +69,9 @@ impl FinecoEndpoints {
                 .to_string(),
             movements: "https://private-api.finecobank.com/v2/private/accounts-and-cards/movements"
                 .to_string(),
+            moneymap_categories:
+                "https://finecobank.com/conto-e-carte/bilancio-familiare/widget-home/preload-data"
+                    .to_string(),
         }
     }
 
@@ -87,6 +95,9 @@ impl FinecoEndpoints {
             tax_carry_forward: format!("{base}/v1/private/tax-carry-forward/search"),
             tax_minus: format!("{base}/v1/private/tax-carry-forward/minus"),
             movements: format!("{base}/v2/private/accounts-and-cards/movements"),
+            moneymap_categories: format!(
+                "{base}/conto-e-carte/bilancio-familiare/widget-home/preload-data"
+            ),
         }
     }
 }
