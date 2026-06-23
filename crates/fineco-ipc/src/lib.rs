@@ -2066,6 +2066,26 @@ impl MarketControlClient {
 /// cached tools. A generous hang-stop, not a latency budget.
 const REFRESH_REPLY_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Read timeout for a **movements** refresh reply. Movements paginates — the
+/// controller's worker fetch logs in once and then walks many pages (the live
+/// socket allows it up to 900s), so this outer gateway→controller budget must
+/// exceed that, plus margin for the controller's own preflight/bookkeeping; else
+/// the gateway aborts and audits a failed refresh while the controller is still
+/// legitimately paging. Mirrors the market-control reply timeouts (live timeout +
+/// ~60s).
+const MOVEMENTS_REFRESH_REPLY_TIMEOUT: Duration = Duration::from_secs(960);
+
+/// Per-command gateway→controller reply timeout: movements gets the paginated
+/// budget, every other refresh keeps the standard one.
+fn refresh_reply_timeout_for(request: &RefreshRequest) -> Duration {
+    match request {
+        RefreshRequest::MovementsRefreshLive(_) => MOVEMENTS_REFRESH_REPLY_TIMEOUT,
+        RefreshRequest::PortfolioRefreshLive
+        | RefreshRequest::OrdersRefreshLive(_)
+        | RefreshRequest::TaxRefreshLive(_) => REFRESH_REPLY_TIMEOUT,
+    }
+}
+
 /// A live-refresh command from the gateway to the refresh controller. Adjacently
 /// tagged `{"command": "...", "params": {...}}` (commands without params omit
 /// `params`). Command-enum only — no generic proxy. Each maps to a
@@ -2316,8 +2336,8 @@ impl RefreshClient {
         let internal = || SafeErrorDto::from(&SafeError::internal());
         let mut stream = UnixStream::connect(&self.path).map_err(|_| internal())?;
         // Generous read timeout: a live refresh (login + fetch + bounded retries)
-        // far exceeds a cached read.
-        let _ = stream.set_read_timeout(Some(REFRESH_REPLY_TIMEOUT));
+        // far exceeds a cached read; movements paginates and needs longer still.
+        let _ = stream.set_read_timeout(Some(refresh_reply_timeout_for(request)));
         let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
         write_message(&mut stream, request).map_err(|_| internal())?;
         let reply: RefreshWireReply = read_message(&mut stream).map_err(|_| internal())?;
@@ -2423,5 +2443,21 @@ mod tests {
         assert!(MARKET_SEARCH_REPLY_TIMEOUT >= Duration::from_secs(240));
         assert!(MARKET_DETAILS_REPLY_TIMEOUT > MARKET_SEARCH_REPLY_TIMEOUT);
         assert!(MARKET_DETAILS_REPLY_TIMEOUT >= Duration::from_secs(1020));
+    }
+
+    #[test]
+    fn movements_refresh_uses_a_pagination_sized_reply_timeout() {
+        let movements = RefreshRequest::MovementsRefreshLive(MovementsRefreshParams { days: 90 });
+        let portfolio = RefreshRequest::PortfolioRefreshLive;
+
+        assert_eq!(
+            refresh_reply_timeout_for(&movements),
+            MOVEMENTS_REFRESH_REPLY_TIMEOUT
+        );
+        assert_eq!(refresh_reply_timeout_for(&portfolio), REFRESH_REPLY_TIMEOUT);
+        // Must exceed the standard refresh budget and the live-socket movements
+        // timeout (900s) it wraps, with margin for controller overhead.
+        assert!(MOVEMENTS_REFRESH_REPLY_TIMEOUT > REFRESH_REPLY_TIMEOUT);
+        assert!(MOVEMENTS_REFRESH_REPLY_TIMEOUT >= Duration::from_secs(960));
     }
 }
