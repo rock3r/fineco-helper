@@ -1535,7 +1535,27 @@ pub struct TaxMinusDto {
 pub struct MovementsDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured_at: Option<String>,
+    /// Per-capture account-level summary (balances + current-month spending). Absent
+    /// when the capture stored no summary (e.g. pre-v6 history, or a fetch that
+    /// carried no account-level fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_summary: Option<MovementsAccountSummaryDto>,
     pub movements: Vec<MovementDto>,
+}
+
+/// Account-level fields the movements endpoint returns once per fetch (not per
+/// movement): the account balance at the latest movement and as of the search date,
+/// and the current month's credit/debit spending totals. Absolute € amounts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MovementsAccountSummaryDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_at_movement: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_at_search_date: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_month_credit_spending: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_month_debit_spending: Option<f64>,
 }
 
 /// A single bank statement line in [`MovementsDto`]. The movement id is the stored

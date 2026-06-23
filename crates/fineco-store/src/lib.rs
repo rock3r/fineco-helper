@@ -33,19 +33,20 @@ pub use freshness::DataAreaFreshness;
 pub use health::JobCounts;
 pub use history::{AllocationPoint, MAX_HISTORY_SNAPSHOTS, PositionHistoryPoint};
 pub use jobs::{JobOutcome, JobRunRow};
-pub use movements::{MovementRow, NewMovement, RawMovement};
+pub use movements::{MovementRow, MovementsSummary, NewMovement, RawMovement};
 pub use orders::{NewOrder, OrderRow, RawOrder};
 pub use report::{ShareableRow, shareable_rows_to_csv};
 pub use tax::{NewTaxCarryForward, NewTaxMinusByYear, TaxCarryForwardRow, TaxMinusByYearRow};
 
 /// Current schema version applied when a store is opened.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_V1: &str = include_str!("schema_v1.sql");
 const SCHEMA_V2: &str = include_str!("schema_v2.sql");
 const SCHEMA_V3: &str = include_str!("schema_v3.sql");
 const SCHEMA_V4: &str = include_str!("schema_v4.sql");
 const SCHEMA_V5: &str = include_str!("schema_v5.sql");
+const SCHEMA_V6: &str = include_str!("schema_v6.sql");
 
 /// An error from the store. Opaque by design: the underlying SQLite driver type
 /// is never exposed through the public API, so callers cannot couple to
@@ -168,6 +169,9 @@ impl Store {
         if current < 5 {
             tx.execute_batch(SCHEMA_V5)?;
         }
+        if current < 6 {
+            tx.execute_batch(SCHEMA_V6)?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -255,11 +259,37 @@ mod tests {
         conn.pragma_update(None, "user_version", 4_i64)
             .expect("set v4");
 
-        let store = Store::from_connection(conn).expect("migrate to v5");
+        let store = Store::from_connection(conn).expect("migrate to v6");
         let tables = store.table_names().expect("tables");
         assert!(
             tables.contains(&"movements".to_string()),
             "movements table must exist after v5"
+        );
+    }
+
+    #[test]
+    fn v6_migration_creates_movements_summary_table() {
+        // A store at v5 (movements rows, no per-capture summary) gains the
+        // movements_summary table on the v6 upgrade, without losing the movements
+        // table or its data.
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch(super::SCHEMA_V1).expect("v1");
+        conn.execute_batch(super::SCHEMA_V2).expect("v2");
+        conn.execute_batch(super::SCHEMA_V3).expect("v3");
+        conn.execute_batch(super::SCHEMA_V4).expect("v4");
+        conn.execute_batch(super::SCHEMA_V5).expect("v5");
+        conn.pragma_update(None, "user_version", 5_i64)
+            .expect("set v5");
+
+        let store = Store::from_connection(conn).expect("migrate to v6");
+        let tables = store.table_names().expect("tables");
+        assert!(
+            tables.contains(&"movements".to_string()),
+            "movements table must survive the v6 upgrade"
+        );
+        assert!(
+            tables.contains(&"movements_summary".to_string()),
+            "movements_summary table must exist after v6"
         );
     }
 }

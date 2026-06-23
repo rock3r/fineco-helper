@@ -465,9 +465,12 @@ handle.
   `assets`, `portfolio_snapshots`, `position_snapshots`, `fx_rates`, `orders`,
   `tax_carry_forward`, `tax_minus_by_year`) plus `store_meta` (schema v3,
   `src/schema_v3.sql`) holding the per-DB HMAC key, plus `data_captures` (schema
-  v4) — a per-area `(data_area, captured_at)` capture marker. Column types/keys
-  are chosen here (the plan lists columns): timestamps ISO-8601 UTC `TEXT`,
-  values `REAL`, hashed ids stored as the hash `TEXT` only.
+  v4) — a per-area `(data_area, captured_at)` capture marker — plus `movements`
+  (schema v5) and `movements_summary` (schema v6): bank-account movement lines
+  keyed by `(captured_at, movement_id_hash)`, and one per-capture account summary
+  row keyed by `captured_at` (balances + current-month spending, all nullable).
+  Column types/keys are chosen here (the plan lists columns): timestamps ISO-8601
+  UTC `TEXT`, values `REAL`, hashed ids stored as the hash `TEXT` only.
 - **Empty-capture observability.** Orders/tax are flat tables keyed by
   `captured_at`, so a legitimately empty capture (no open orders, no carried
   losses) inserts no data row. `data_captures` records one marker per capture, so

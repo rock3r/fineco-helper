@@ -3,7 +3,7 @@
 //! lines at a point in time. `movement_id_hash` is the HMAC-SHA256 of the raw
 //! `progressivoMovimento` id (hashed by the controller; the worker never sees the key).
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::{Result, Store};
 
@@ -45,6 +45,34 @@ pub struct RawMovement {
     pub sottocategoria_id: Option<String>,
 }
 
+/// Account-level summary for one movements capture. These are fields the movements
+/// endpoint returns at the response **top level** (one set per fetch, not per
+/// movement): the account balance at the latest movement and as of the search date,
+/// and the current month's credit/debit spending totals. All optional — a capture may
+/// omit any of them. Numeric (€ amounts), so unlike [`RawMovement`] there is no id to
+/// hash; the same struct crosses the worker socket and is stored verbatim.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MovementsSummary {
+    pub balance_at_movement: Option<f64>,
+    pub balance_at_search_date: Option<f64>,
+    pub current_month_credit_spending: Option<f64>,
+    pub current_month_debit_spending: Option<f64>,
+}
+
+impl MovementsSummary {
+    /// `true` when no account-level field was present (all `None`) — i.e. the fetch
+    /// carried no summary. The orchestrator does not persist such a summary, so
+    /// `movements_get_latest` omits `account_summary` entirely rather than emitting an
+    /// empty `{}` object that callers couldn't distinguish from "no summary returned".
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.balance_at_movement.is_none()
+            && self.balance_at_search_date.is_none()
+            && self.current_month_credit_spending.is_none()
+            && self.current_month_debit_spending.is_none()
+    }
+}
+
 /// A movement read back from the store.
 #[derive(Debug, Clone)]
 pub struct MovementRow {
@@ -64,8 +92,11 @@ pub struct MovementRow {
 }
 
 impl Store {
-    /// Capture movements at `captured_at`. Atomic: inserts all movement rows then
-    /// stamps the capture marker, even when the list is empty.
+    /// Capture movements at `captured_at`. Atomic: inserts all movement rows, the
+    /// optional per-capture account summary, then stamps the capture marker — even
+    /// when the list is empty. `summary` is `None` when the fetch carried no
+    /// account-level fields; passing `Some` always writes a summary row (so the four
+    /// fields are observable together with the capture).
     ///
     /// # Errors
     /// Returns an error if any insert fails.
@@ -73,6 +104,7 @@ impl Store {
         &mut self,
         captured_at: &str,
         movements: &[NewMovement],
+        summary: Option<&MovementsSummary>,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         for m in movements {
@@ -96,6 +128,21 @@ impl Store {
                     m.causale_movimento,
                     m.categoria_id,
                     m.sottocategoria_id,
+                ],
+            )?;
+        }
+        if let Some(s) = summary {
+            tx.execute(
+                "INSERT OR REPLACE INTO movements_summary \
+                   (captured_at, balance_at_movement, balance_at_search_date, \
+                    current_month_credit_spending, current_month_debit_spending) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    captured_at,
+                    s.balance_at_movement,
+                    s.balance_at_search_date,
+                    s.current_month_credit_spending,
+                    s.current_month_debit_spending,
                 ],
             )?;
         }
@@ -144,5 +191,32 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// The account-level summary captured with the most recent movements capture, or
+    /// `None` if that capture stored no summary row (e.g. pre-v6 history, or a fetch
+    /// that carried no account-level fields).
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
+    pub fn latest_movements_summary(&self) -> Result<Option<MovementsSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT balance_at_movement, balance_at_search_date, \
+                    current_month_credit_spending, current_month_debit_spending \
+             FROM movements_summary \
+             WHERE captured_at = \
+                   (SELECT MAX(captured_at) FROM data_captures WHERE data_area = 'movements')",
+        )?;
+        let summary = stmt
+            .query_row([], |r| {
+                Ok(MovementsSummary {
+                    balance_at_movement: r.get(0)?,
+                    balance_at_search_date: r.get(1)?,
+                    current_month_credit_spending: r.get(2)?,
+                    current_month_debit_spending: r.get(3)?,
+                })
+            })
+            .optional()?;
+        Ok(summary)
     }
 }

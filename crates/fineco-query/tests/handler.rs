@@ -8,8 +8,8 @@ use fineco_core::parse_iso8601_utc;
 use fineco_ipc::{Client, Policy, Request, ResponseBody, serve_blocking};
 use fineco_query::{FreshnessMaxAge, QueryHandler};
 use fineco_store::{
-    NewAsset, NewOrder, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward, NewTaxMinusByYear,
-    Store,
+    MovementsSummary, NewAsset, NewMovement, NewOrder, NewPortfolioSnapshot, NewPosition,
+    NewTaxCarryForward, NewTaxMinusByYear, Store,
 };
 
 fn epoch(iso: &str) -> i64 {
@@ -21,7 +21,7 @@ fn owner_policy() -> Policy {
     Policy::from_json(
         r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
             "market.read","portfolio.cached.full_read","portfolio.shareable.read",
-            "orders.cached.read","tax.cached.read"]}}}"#,
+            "orders.cached.read","tax.cached.read","movements.cached.read"]}}}"#,
     )
     .expect("valid owner policy")
 }
@@ -240,6 +240,69 @@ fn latest_orders_and_tax_are_served() {
             assert_eq!(dto.entries[0].minus_residue, Some(500.0));
         }
         other => panic!("expected tax minus, got {other:?}"),
+    }
+}
+
+#[test]
+fn latest_movements_serves_the_account_summary() {
+    let mut store = Store::open_in_memory().expect("open");
+    let movement = NewMovement {
+        movement_id_hash: "H1".to_string(),
+        causale: Some("BONIFICO".to_string()),
+        descrizione: Some("synthetic".to_string()),
+        descrizione_breve: None,
+        importo: Some(-25.0),
+        tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
+        data_operazione: Some("2026-06-01".to_string()),
+        data_registrazione: None,
+        data_valuta: Some("2026-06-02".to_string()),
+        causale_movimento: None,
+        categoria_id: None,
+        sottocategoria_id: None,
+    };
+    let summary = MovementsSummary {
+        balance_at_movement: Some(1234.56),
+        balance_at_search_date: Some(1200.0),
+        current_month_credit_spending: Some(500.0),
+        current_month_debit_spending: Some(-321.0),
+    };
+    store
+        .capture_movements("2026-06-03T10:00:00Z", &[movement], Some(&summary))
+        .expect("capture");
+
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), owner_policy());
+    match handler
+        .handle(Request::MovementsGetLatest, 0)
+        .expect("movements served")
+    {
+        ResponseBody::Movements(dto) => {
+            assert_eq!(dto.captured_at.as_deref(), Some("2026-06-03T10:00:00Z"));
+            assert_eq!(dto.movements.len(), 1);
+            let s = dto.account_summary.expect("an account summary");
+            assert_eq!(s.balance_at_movement, Some(1234.56));
+            assert_eq!(s.balance_at_search_date, Some(1200.0));
+            assert_eq!(s.current_month_credit_spending, Some(500.0));
+            assert_eq!(s.current_month_debit_spending, Some(-321.0));
+        }
+        other => panic!("expected movements, got {other:?}"),
+    }
+}
+
+#[test]
+fn latest_movements_omits_the_summary_when_none_was_captured() {
+    let mut store = Store::open_in_memory().expect("open");
+    // A capture with no account summary (e.g. pre-v6 history): the DTO omits it.
+    store
+        .capture_movements("2026-06-03T10:00:00Z", &[], None)
+        .expect("capture");
+
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), owner_policy());
+    match handler
+        .handle(Request::MovementsGetLatest, 0)
+        .expect("movements served")
+    {
+        ResponseBody::Movements(dto) => assert!(dto.account_summary.is_none()),
+        other => panic!("expected movements, got {other:?}"),
     }
 }
 

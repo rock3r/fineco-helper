@@ -3427,6 +3427,18 @@ pub(crate) struct MovementsApiResponse {
     /// Elements are counted only (contents ignored) to detect an incomplete result.
     #[serde(default, rename = "missingData")]
     pub missing_data: Vec<serde::de::IgnoredAny>,
+    /// Account-level summary fields, present at the response **top level** (one set
+    /// per fetch, not per movement). The worker reads them from the first page only.
+    /// Numeric € amounts, so no sanitisation applies. Fineco spells the debit field
+    /// `currentMonthDebtSpending`; the odd spelling is isolated to this rename.
+    #[serde(default, rename = "balanceAccountAtMovement")]
+    pub balance_at_movement: Option<f64>,
+    #[serde(default, rename = "balanceAccountAtSearchDate")]
+    pub balance_at_search_date: Option<f64>,
+    #[serde(default, rename = "currentMonthCreditSpending")]
+    pub current_month_credit_spending: Option<f64>,
+    #[serde(default, rename = "currentMonthDebtSpending")]
+    pub current_month_debit_spending: Option<f64>,
 }
 
 /// A single item as returned by Fineco (camelCase, all optional for resilience).
@@ -3494,6 +3506,18 @@ pub(crate) fn to_raw_movements(resp: MovementsApiResponse) -> Vec<fineco_store::
         .collect()
 }
 
+/// Extract the per-capture account summary from a [`MovementsApiResponse`]. Borrows
+/// (the four fields are `Copy`) so it can run before [`to_raw_movements`] consumes the
+/// response. All fields are passed through verbatim — they are numeric € amounts.
+pub(crate) fn to_movements_summary(resp: &MovementsApiResponse) -> fineco_store::MovementsSummary {
+    fineco_store::MovementsSummary {
+        balance_at_movement: resp.balance_at_movement,
+        balance_at_search_date: resp.balance_at_search_date,
+        current_month_credit_spending: resp.current_month_credit_spending,
+        current_month_debit_spending: resp.current_month_debit_spending,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3555,6 +3579,37 @@ mod tests {
         // A response with no `movimenti` key yields an empty list, not an error.
         let resp: MovementsApiResponse = serde_json::from_str("{}").expect("parse");
         assert!(to_raw_movements(resp).is_empty());
+    }
+
+    #[test]
+    fn movements_parse_reads_the_account_summary_from_the_envelope() {
+        // The four account-level fields sit at the response top level (Fineco spells
+        // the debit field `currentMonthDebtSpending`); all map to the summary.
+        let json = r#"{
+            "movimenti": [],
+            "lastPage": true,
+            "balanceAccountAtMovement": 1234.56,
+            "balanceAccountAtSearchDate": 1200.0,
+            "currentMonthCreditSpending": 500.0,
+            "currentMonthDebtSpending": -321.0
+        }"#;
+        let resp: MovementsApiResponse = serde_json::from_str(json).expect("parse");
+        let s = to_movements_summary(&resp);
+        assert_eq!(s.balance_at_movement, Some(1234.56));
+        assert_eq!(s.balance_at_search_date, Some(1200.0));
+        assert_eq!(s.current_month_credit_spending, Some(500.0));
+        assert_eq!(s.current_month_debit_spending, Some(-321.0));
+    }
+
+    #[test]
+    fn movements_summary_is_all_none_when_the_envelope_omits_the_fields() {
+        // A response with no summary keys yields an all-None summary, not an error.
+        let resp: MovementsApiResponse =
+            serde_json::from_str(r#"{ "movimenti": [], "lastPage": true }"#).expect("parse");
+        assert_eq!(
+            to_movements_summary(&resp),
+            fineco_store::MovementsSummary::default()
+        );
     }
 
     #[test]
