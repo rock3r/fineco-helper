@@ -456,6 +456,9 @@ impl std::error::Error for SafeError {}
 /// Maximum order-monitor day window a refresh may request (plan rate-limit bound).
 pub const MAX_ORDER_DAYS: u32 = 30;
 
+/// Maximum movements day window a refresh may request.
+pub const MAX_MOVEMENTS_DAYS: u32 = 90;
+
 /// Maximum length of a live-order `instrument_kind`. The cached snapshot-query IPC
 /// path caps every client string at 256 chars; the live-refresh path validates
 /// only through [`validate_order_request`], so it must bound the kind too — else a
@@ -482,6 +485,18 @@ pub fn validate_order_request(instrument_kind: &str, days: u32) -> Result<(), Sa
         return Err(SafeError::invalid_request(
             "instrument type must be 1-256 alphanumeric characters.",
         ));
+    }
+    Ok(())
+}
+
+/// Validate a movements refresh request's `days` bound. Enforced by the controller
+/// before the lock and again by the worker (defense in depth).
+///
+/// # Errors
+/// [`SafeError::invalid_request`] if `days` exceeds [`MAX_MOVEMENTS_DAYS`].
+pub fn validate_movements_request(days: u32) -> Result<(), SafeError> {
+    if days > MAX_MOVEMENTS_DAYS {
+        return Err(SafeError::invalid_request("days must be <= 90."));
     }
     Ok(())
 }

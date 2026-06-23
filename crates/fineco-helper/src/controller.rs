@@ -25,8 +25,8 @@ use fineco_ipc::{
     MarketSessionStatus, OWNER_AUTH_ID, Policy, RefreshOutcome, RefreshRequest,
 };
 use fineco_refresh::{
-    OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher, refresh_orders, refresh_portfolio,
-    refresh_preflight, refresh_tax,
+    MovementsFetcher, OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher,
+    refresh_movements, refresh_orders, refresh_portfolio, refresh_preflight, refresh_tax,
 };
 use fineco_store::Store;
 
@@ -70,12 +70,14 @@ pub struct RefreshLimitsByArea {
     pub portfolio: RefreshLimits,
     pub orders: RefreshLimits,
     pub tax: RefreshLimits,
+    pub movements: RefreshLimits,
 }
 
 impl RefreshLimitsByArea {
     /// The plan-derived defaults. Portfolio: 30-min cooldown, 4/day. Orders:
-    /// 10-min cooldown, 6/day. Tax: 30-min cooldown, 6/day. All: open the circuit
-    /// after 3 consecutive upstream/timeout failures, half-open after 10 min.
+    /// 10-min cooldown, 6/day. Tax: 30-min cooldown, 6/day. Movements: 15-min
+    /// cooldown, 6/day. All: open the circuit after 3 consecutive upstream/timeout
+    /// failures, half-open after 10 min.
     #[must_use]
     pub fn defaults() -> Self {
         let circuit_failures = 3;
@@ -99,17 +101,24 @@ impl RefreshLimitsByArea {
                 circuit_consecutive_failures: circuit_failures,
                 circuit_cooldown_secs: circuit_cooldown,
             },
+            movements: RefreshLimits {
+                cooldown_secs: 900,
+                daily_budget: 6,
+                circuit_consecutive_failures: circuit_failures,
+                circuit_cooldown_secs: circuit_cooldown,
+            },
         }
     }
 
-    /// The limits for a data area (`portfolio` / `orders` / `tax`). An unknown
-    /// area falls back to the strictest (portfolio) limits — defensive, though the
-    /// typed [`RefreshRequest`] never yields an unknown area.
+    /// The limits for a data area (`portfolio` / `orders` / `tax` / `movements`).
+    /// An unknown area falls back to the strictest (portfolio) limits — defensive,
+    /// though the typed [`RefreshRequest`] never yields an unknown area.
     #[must_use]
     fn for_area(&self, area: &str) -> RefreshLimits {
         match area {
             "orders" => self.orders,
             "tax" => self.tax,
+            "movements" => self.movements,
             _ => self.portfolio,
         }
     }
@@ -143,6 +152,39 @@ struct LiveLoginState {
 
 /// The reuse window ending at `now_epoch + MARKET_SESSION_REUSE_TTL_SECS`, or
 /// `None` when cross-call reuse is disabled.
+/// Compute `(date_from, date_to)` as YYYY-MM-DD strings for a look-back of
+/// `days` from the current `now_iso` timestamp. Returns `None` if `now_iso` is
+/// not a valid ISO-8601 UTC timestamp.
+fn days_to_date_range(now_iso: &str, days: u32) -> Option<(String, String)> {
+    let now_epoch = parse_iso8601_utc(now_iso)?;
+    let today = epoch_to_ymd(now_epoch);
+    let from_epoch = now_epoch.saturating_sub(i64::from(days) * 86_400);
+    let date_from = epoch_to_ymd(from_epoch);
+    Some((date_from, today))
+}
+
+fn epoch_to_ymd(epoch: i64) -> String {
+    // Gregorian calendar, UTC midnight. No external date library needed.
+    let days_since_epoch = epoch / 86_400;
+    let (year, month, day) = days_since_epoch_to_ymd(days_since_epoch);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn days_since_epoch_to_ymd(z: i64) -> (i64, u8, u8) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u8, d as u8)
+}
+
 fn reuse_window_from(now_epoch: i64) -> Option<i64> {
     MARKET_SESSION_REUSE_TTL_SECS
         .map(|ttl| now_epoch.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX)))
@@ -408,7 +450,7 @@ impl<F> RefreshController<F> {
 
 impl<F> RefreshController<F>
 where
-    F: PortfolioFetcher + OrdersFetcher + TaxFetcher,
+    F: PortfolioFetcher + OrdersFetcher + TaxFetcher + MovementsFetcher,
 {
     /// Build a controller over `store`, sourcing fresh data from `fetcher`.
     #[must_use]
@@ -513,6 +555,25 @@ where
                 snapshot_id: None,
                 count,
             }),
+            RefreshRequest::MovementsRefreshLive(params) => {
+                let (date_from, date_to) =
+                    days_to_date_range(now_iso, params.days).ok_or_else(SafeError::internal)?;
+                refresh_movements(
+                    &mut store,
+                    &self.fetcher,
+                    OWNER_AUTH_ID,
+                    params.days,
+                    &date_from,
+                    &date_to,
+                    now_iso,
+                )
+                .map(|count| RefreshOutcome {
+                    data_area: area.to_string(),
+                    captured_at: now_iso.to_string(),
+                    snapshot_id: None,
+                    count,
+                })
+            }
         };
         permit.finish_recording(false)?;
         result
@@ -653,10 +714,12 @@ mod tests {
         MarketSearchResult, MarketSessionStatus, OrdersRefreshParams, Policy, RefreshRequest,
         TaxRefreshParams,
     };
-    use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher};
+    use fineco_refresh::{
+        MovementsFetcher, OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher,
+    };
     use fineco_store::{
-        NewAsset, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward, NewTaxMinusByYear,
-        RawOrder, Store,
+        NewAsset, NewMovement, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward,
+        NewTaxMinusByYear, RawOrder, Store,
     };
     use std::cell::Cell;
     use std::rc::Rc;
@@ -849,6 +912,17 @@ mod tests {
         }
     }
 
+    impl MovementsFetcher for FakeWorker {
+        fn fetch_movements(
+            &self,
+            _store: &Store,
+            _date_from: &str,
+            _date_to: &str,
+        ) -> Result<Vec<NewMovement>, SafeError> {
+            Ok(vec![])
+        }
+    }
+
     impl fineco_ipc::MarketIndicesLiveFetcher for FakeWorker {
         fn fetch_market_indices(
             &self,
@@ -1010,6 +1084,7 @@ mod tests {
             portfolio: area,
             orders: area,
             tax: area,
+            movements: area,
         }
     }
 

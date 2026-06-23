@@ -272,11 +272,13 @@ Product (`crates/`):
   `ureq` pinned to the same backend (`fineco_tls::tls_config()`). Depends on
   `fineco-core` + `fineco-ipc` + `fineco-market` + `fineco-tls` +
   `rmcp` — **never** `fineco-store`/`fineco-worker`/`fineco-live` (enforced
-  structurally; see below). Tool surface: 17 read-only tools (cached reads,
-  credential-free market reads, authenticated Fineco market reads, and the 3
-  live-refresh tools); `portfolio_get_charts` stays **deferred** (no
-  chart/time-series data is captured yet — the store holds
-  snapshots/positions/orders/tax only).
+  structurally; see below). Tool surface: 19 read-only tools (cached reads,
+  credential-free market reads, authenticated Fineco market reads, and the 4
+  live-refresh tools — portfolio, orders, tax, and bank account movements);
+  `portfolio_get_charts` stays **deferred** (no chart/time-series data is
+  captured yet). Bank account movements (`movements_get_latest` /
+  `private_movements_refresh_live_sensitive`) are excluded from the default
+  connector allowlist (fail-safe; expose raw transaction amounts).
 - **`crates/fineco-market`** (M3) — **credential-free** market path: stock
   enrichment, ETF reference-data enrichment, and the public zero-commission ETF
   list. Reaches **no** authenticated Fineco endpoint and holds **no** credentials.

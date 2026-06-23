@@ -19,9 +19,13 @@ use fineco_ipc::{
     MarketSearchParams, MarketSearchResult, MarketSessionStatus,
 };
 use fineco_live::{LiveClient, MarketSearchLiveFetcher, serve_live_blocking};
-use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
+use fineco_refresh::{
+    MovementsFetcher, OrdersFetcher, PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher,
+    TaxFetcher,
+};
 use fineco_store::{
-    NewAsset, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder, Store,
+    NewAsset, NewMovement, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
+    RawMovement, RawOrder, Store,
 };
 
 use fineco_core::SafeError;
@@ -180,6 +184,27 @@ impl MarketIndicesLiveFetcher for FakeWorker {
                 result.result.captured_at = now_iso.to_string();
                 result
             })
+    }
+}
+
+impl RawMovementsFetcher for FakeWorker {
+    fn fetch_raw_movements(
+        &self,
+        _date_from: &str,
+        _date_to: &str,
+    ) -> Result<Vec<RawMovement>, SafeError> {
+        Ok(vec![])
+    }
+}
+
+impl MovementsFetcher for FakeWorker {
+    fn fetch_movements(
+        &self,
+        _store: &Store,
+        _date_from: &str,
+        _date_to: &str,
+    ) -> Result<Vec<NewMovement>, SafeError> {
+        Ok(vec![])
     }
 }
 

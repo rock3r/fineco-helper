@@ -28,6 +28,7 @@ pub struct FinecoEndpoints {
     pub(crate) stock_reports: String,
     pub(crate) tax_carry_forward: String,
     pub(crate) tax_minus: String,
+    pub(crate) movements: String,
 }
 
 impl FinecoEndpoints {
@@ -61,6 +62,8 @@ impl FinecoEndpoints {
                 "https://private-api.finecobank.com/v1/private/tax-carry-forward/search".to_string(),
             tax_minus: "https://private-api.finecobank.com/v1/private/tax-carry-forward/minus"
                 .to_string(),
+            movements: "https://private-api.finecobank.com/v2/private/accounts-and-cards/movements"
+                .to_string(),
         }
     }
 
@@ -83,6 +86,7 @@ impl FinecoEndpoints {
             stock_reports: format!("{base}/v1/private/snapshot/reports"),
             tax_carry_forward: format!("{base}/v1/private/tax-carry-forward/search"),
             tax_minus: format!("{base}/v1/private/tax-carry-forward/minus"),
+            movements: format!("{base}/v2/private/accounts-and-cards/movements"),
         }
     }
 }

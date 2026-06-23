@@ -29,7 +29,7 @@ use fineco_ipc::{MarketControlClient, Policy, RefreshClient, RefreshRequest};
 use fineco_live::{LiveClient, MarketAssetDetailsLiveFetcher, MarketSearchLiveFetcher};
 use fineco_market::{DEFAULT_ZERO_COMMISSION_ETFS_URL, EnrichmentHostAllowlist, MarketClient};
 use fineco_query::{FreshnessMaxAge, QueryHandler};
-use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
+use fineco_refresh::{PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_store::Store;
 use fineco_worker::{EnvCredentialSource, FinecoEndpoints, FinecoWorker};
 
@@ -934,6 +934,7 @@ pub fn serve_live<W>(worker: &W, socket_path: &Path, socket_mode: u32) -> Result
 where
     W: PortfolioFetcher
         + RawOrdersFetcher
+        + RawMovementsFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher

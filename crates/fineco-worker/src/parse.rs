@@ -3389,6 +3389,75 @@ pub(crate) fn to_tax_minus(resp: TaxMinusResponse) -> Vec<NewTaxMinusByYear> {
         .collect()
 }
 
+// ---- Bank account movements ------------------------------------------------
+
+/// The JSON body POSTed to the movements endpoint.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MovementsApiRequest {
+    pub date_from: String,
+    pub date_to: String,
+    pub offset: i32,
+    pub limit: i32,
+    #[serde(rename = "type")]
+    pub movement_types: Vec<&'static str>,
+    pub keyword: Option<String>,
+}
+
+/// Top-level response from the movements endpoint.
+#[derive(Deserialize)]
+pub(crate) struct MovementsApiResponse {
+    #[serde(default, rename = "movimenti")]
+    pub movimenti: Vec<RawMovementItem>,
+}
+
+/// A single item as returned by Fineco (camelCase, all optional for resilience).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawMovementItem {
+    #[serde(default)]
+    progressivo_movimento: Option<String>,
+    #[serde(default)]
+    causale: Option<String>,
+    #[serde(default)]
+    descrizione: Option<String>,
+    #[serde(default)]
+    importo: Option<f64>,
+    #[serde(default)]
+    tipo_movimento: Option<String>,
+    #[serde(default)]
+    data_operazione: Option<String>,
+    #[serde(default)]
+    data_registrazione: Option<String>,
+    #[serde(default)]
+    data_valuta: Option<String>,
+    #[serde(default)]
+    causale_movimento: Option<String>,
+}
+
+/// Convert a [`MovementsApiResponse`] into [`RawMovement`]s, skipping items
+/// that have no `progressivoMovimento` (the mandatory unique id). All text
+/// fields are sanitized with [`sanitize_text`] before returning.
+pub(crate) fn to_raw_movements(resp: MovementsApiResponse) -> Vec<fineco_store::RawMovement> {
+    resp.movimenti
+        .into_iter()
+        .filter_map(|item| {
+            let movement_id = item.progressivo_movimento?;
+            Some(fineco_store::RawMovement {
+                movement_id,
+                causale: item.causale.as_deref().map(sanitize_text),
+                descrizione: item.descrizione.as_deref().map(sanitize_text),
+                importo: item.importo,
+                tipo_movimento: item.tipo_movimento.as_deref().map(sanitize_text),
+                data_operazione: item.data_operazione,
+                data_registrazione: item.data_registrazione,
+                data_valuta: item.data_valuta,
+                causale_movimento: item.causale_movimento.as_deref().map(sanitize_text),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

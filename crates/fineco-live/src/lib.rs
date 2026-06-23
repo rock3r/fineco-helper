@@ -38,9 +38,13 @@ use fineco_ipc::{
     MarketAssetDetailsLiveResult, MarketDetailsParams, MarketIndicesLiveResult,
     MarketIndicesParams, MarketLiveError, MarketSearchLiveResult, MarketSearchParams, SafeErrorDto,
 };
-use fineco_refresh::{OrdersFetcher, PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
+use fineco_refresh::{
+    MovementsFetcher, OrdersFetcher, PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher,
+    TaxFetcher,
+};
 use fineco_store::{
-    NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder, Store,
+    NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
+    RawMovement, RawOrder, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +96,8 @@ pub enum LiveRequest {
     MarketAssetDetails(LiveMarketDetailsParams),
     /// Fetch Fineco headline index-bar cards, stamped with controller time.
     MarketIndices(LiveMarketIndicesParams),
+    /// Fetch bank account movements for a date range.
+    Movements(LiveMovementsParams),
 }
 
 /// Parameters for [`LiveRequest::Portfolio`].
@@ -146,6 +152,14 @@ pub struct LiveMarketIndicesParams {
     pub now_iso: String,
 }
 
+/// Parameters for [`LiveRequest::Movements`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveMovementsParams {
+    pub date_from: String,
+    pub date_to: String,
+}
+
 /// A successful worker result, typed per command (the plan forbids generic raw
 /// JSON for private payloads). Orders are [`RawOrder`]s — the worker holds no DB
 /// key — and are hashed by the controller after they cross the socket.
@@ -159,6 +173,7 @@ pub enum LiveResponse {
     MarketSearch(MarketSearchLiveResult),
     MarketAssetDetails(Box<MarketAssetDetailsLiveResult>),
     MarketIndices(MarketIndicesLiveResult),
+    Movements(Vec<RawMovement>),
 }
 
 /// The worker's reply: a typed result or the safe error envelope. Every worker
@@ -236,6 +251,7 @@ fn handle_live_request<F>(fetcher: &F, request: LiveRequest) -> Result<LiveRespo
 where
     F: PortfolioFetcher
         + RawOrdersFetcher
+        + RawMovementsFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
@@ -271,6 +287,10 @@ where
             .fetch_market_indices(&p.indices, &p.now_iso)
             .map_err(LiveError::from)
             .map(LiveResponse::MarketIndices),
+        LiveRequest::Movements(p) => fetcher
+            .fetch_raw_movements(&p.date_from, &p.date_to)
+            .map_err(LiveError::from)
+            .map(LiveResponse::Movements),
     }
 }
 
@@ -286,6 +306,7 @@ pub fn serve_live_blocking<F>(listener: &UnixListener, fetcher: &F) -> std::io::
 where
     F: PortfolioFetcher
         + RawOrdersFetcher
+        + RawMovementsFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
@@ -304,6 +325,7 @@ fn serve_one<F>(stream: &mut UnixStream, fetcher: &F) -> std::io::Result<()>
 where
     F: PortfolioFetcher
         + RawOrdersFetcher
+        + RawMovementsFetcher
         + TaxFetcher
         + MarketSearchLiveFetcher
         + MarketAssetDetailsLiveFetcher
@@ -404,7 +426,8 @@ fn client_timeout_for(request: &LiveRequest) -> Duration {
         LiveRequest::Portfolio(_)
         | LiveRequest::Orders(_)
         | LiveRequest::TaxCarryForward(_)
-        | LiveRequest::TaxMinusByYear => LIVE_CLIENT_TIMEOUT,
+        | LiveRequest::TaxMinusByYear
+        | LiveRequest::Movements(_) => LIVE_CLIENT_TIMEOUT,
     }
 }
 
@@ -546,6 +569,43 @@ impl OrdersFetcher for LiveClient {
                 .collect(),
             _ => Err(SafeError::internal()),
         }
+    }
+}
+
+impl RawMovementsFetcher for LiveClient {
+    fn fetch_raw_movements(
+        &self,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<RawMovement>, SafeError> {
+        match self
+            .call(&LiveRequest::Movements(LiveMovementsParams {
+                date_from: date_from.to_string(),
+                date_to: date_to.to_string(),
+            }))
+            .map_err(LiveCallError::into_safe_error)?
+        {
+            LiveResponse::Movements(raw_movements) => Ok(raw_movements),
+            _ => Err(SafeError::internal()),
+        }
+    }
+}
+
+impl MovementsFetcher for LiveClient {
+    fn fetch_movements(
+        &self,
+        store: &Store,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<NewMovement>, SafeError> {
+        let raw = self.fetch_raw_movements(date_from, date_to)?;
+        raw.iter()
+            .map(|r| {
+                store
+                    .hash_raw_movement(r)
+                    .map_err(|_| SafeError::internal())
+            })
+            .collect()
     }
 }
 

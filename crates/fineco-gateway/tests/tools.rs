@@ -274,6 +274,10 @@ fn default_connector_allowlist_is_valid_and_excludes_default_blocked_tools() {
         "market_search_asset",
         "market_get_asset_details",
         "market_get_indices",
+        // Bank movements expose raw transaction amounts — excluded from connectors
+        // by default (fail-safe; owner grants access by configuring an allowlist).
+        "movements_get_latest",
+        "private_movements_refresh_live_sensitive",
     ] {
         assert!(
             all.contains(blocked),
@@ -301,7 +305,7 @@ fn default_connector_allowlist_is_valid_and_excludes_default_blocked_tools() {
     // absent from the resolved allowlist is hidden), so the posture is fail-safe.
     assert_eq!(
         DEFAULT_CONNECTOR_TOOLS.len(),
-        all.len() - 7,
+        all.len() - 9,
         "the default allowlist should be every tool except the default-blocked tools"
     );
 }

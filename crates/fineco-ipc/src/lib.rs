@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fineco_core::{
-    SafeError, normalize_expected_isin, sanitize_text, validate_order_request, validate_tax_range,
+    SafeError, normalize_expected_isin, sanitize_text, validate_movements_request,
+    validate_order_request, validate_tax_range,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,7 @@ pub enum Request {
     PortfolioGetAllocationHistory,
     PortfolioGetPositionHistory(PositionHistoryParams),
     MarketGetZeroCommissionEtfs(MarketEtfsParams),
+    MovementsGetLatest,
 }
 
 impl Request {
@@ -153,6 +155,7 @@ impl Request {
                 Capability::TaxCachedRead
             }
             Request::MarketGetZeroCommissionEtfs(_) => Capability::MarketRead,
+            Request::MovementsGetLatest => Capability::MovementsCachedRead,
         }
     }
 
@@ -172,6 +175,7 @@ impl Request {
             Request::PortfolioGetAllocationHistory => "portfolio_get_allocation_history",
             Request::PortfolioGetPositionHistory(_) => "portfolio_get_position_history",
             Request::MarketGetZeroCommissionEtfs(_) => "market_get_zero_commission_etfs",
+            Request::MovementsGetLatest => "movements_get_latest",
         }
     }
 }
@@ -1309,6 +1313,8 @@ pub enum ResponseBody {
     AllocationHistory(AllocationHistoryDto),
     /// `portfolio_get_position_history`: one instrument's history over time.
     PositionHistory(PositionHistoryDto),
+    /// `movements_get_latest`: the latest bank account movements capture.
+    Movements(MovementsDto),
 }
 
 impl ResponseBody {
@@ -1327,6 +1333,7 @@ impl ResponseBody {
             ResponseBody::PortfolioHistory(dto) => Some(dto.points.len()),
             ResponseBody::AllocationHistory(dto) => Some(dto.points.len()),
             ResponseBody::PositionHistory(dto) => Some(dto.points.len()),
+            ResponseBody::Movements(dto) => Some(dto.movements.len()),
         }
     }
 }
@@ -1523,12 +1530,44 @@ pub struct TaxMinusDto {
     pub expiration_date: Option<String>,
 }
 
+/// The latest bank account movements capture (owner-only cached private data).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MovementsDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<String>,
+    pub movements: Vec<MovementDto>,
+}
+
+/// A single bank statement line in [`MovementsDto`]. The movement id is the stored
+/// HMAC hash, never the raw `progressivoMovimento`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MovementDto {
+    pub movement_id_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descrizione: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub importo: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tipo_movimento: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_operazione: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_registrazione: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_valuta: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causale_movimento: Option<String>,
+}
+
 /// Freshness of all data areas, as returned by `portfolio_get_freshness`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FreshnessReportDto {
     pub portfolio: FreshnessDto,
     pub orders: FreshnessDto,
     pub tax: FreshnessDto,
+    pub movements: FreshnessDto,
 }
 
 /// Freshness of a single data area, as carried on the wire.
@@ -2029,6 +2068,14 @@ pub enum RefreshRequest {
     PortfolioRefreshLive,
     OrdersRefreshLive(OrdersRefreshParams),
     TaxRefreshLive(TaxRefreshParams),
+    MovementsRefreshLive(MovementsRefreshParams),
+}
+
+/// Parameters for `private_movements_refresh_live_sensitive`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MovementsRefreshParams {
+    pub days: u32,
 }
 
 /// Parameters for `private_orders_refresh_live_sensitive`.
@@ -2056,6 +2103,7 @@ impl RefreshRequest {
             RefreshRequest::PortfolioRefreshLive => Capability::PortfolioLiveRefresh,
             RefreshRequest::OrdersRefreshLive(_) => Capability::OrdersLiveRefresh,
             RefreshRequest::TaxRefreshLive(_) => Capability::TaxLiveRefresh,
+            RefreshRequest::MovementsRefreshLive(_) => Capability::MovementsLiveRefresh,
         }
     }
 
@@ -2067,17 +2115,20 @@ impl RefreshRequest {
             RefreshRequest::PortfolioRefreshLive => "private_portfolio_refresh_live_sensitive",
             RefreshRequest::OrdersRefreshLive(_) => "private_orders_refresh_live_sensitive",
             RefreshRequest::TaxRefreshLive(_) => "private_tax_refresh_live_sensitive",
+            RefreshRequest::MovementsRefreshLive(_) => "private_movements_refresh_live_sensitive",
         }
     }
 
-    /// The data area this refresh targets (`portfolio` / `orders` / `tax`) — the
-    /// key for the per-area lock, cooldown, budget, and circuit breaker.
+    /// The data area this refresh targets (`portfolio` / `orders` / `tax` /
+    /// `movements`) — the key for the per-area lock, cooldown, budget, and circuit
+    /// breaker.
     #[must_use]
     pub fn data_area(&self) -> &'static str {
         match self {
             RefreshRequest::PortfolioRefreshLive => "portfolio",
             RefreshRequest::OrdersRefreshLive(_) => "orders",
             RefreshRequest::TaxRefreshLive(_) => "tax",
+            RefreshRequest::MovementsRefreshLive(_) => "movements",
         }
     }
 
@@ -2119,6 +2170,7 @@ impl RefreshRequest {
                 validate_order_request(&p.instrument_kind, p.days)
             }
             RefreshRequest::TaxRefreshLive(p) => validate_tax_range(&p.date_from, &p.date_to),
+            RefreshRequest::MovementsRefreshLive(p) => validate_movements_request(p.days),
         }
     }
 }

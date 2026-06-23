@@ -1524,6 +1524,16 @@ impl fineco_live::MarketIndicesLiveFetcher for FakeLiveWorker {
     }
 }
 
+impl fineco_refresh::RawMovementsFetcher for FakeLiveWorker {
+    fn fetch_raw_movements(
+        &self,
+        _date_from: &str,
+        _date_to: &str,
+    ) -> Result<Vec<fineco_store::RawMovement>, fineco_core::SafeError> {
+        Ok(vec![])
+    }
+}
+
 #[test]
 fn private_worker_serves_a_live_fetch_and_keeps_the_socket_owner_only() {
     use fineco_refresh::PortfolioFetcher;

@@ -5,10 +5,13 @@
 //! injected [`PortfolioFetcher`] trait, so the real Fineco fetch can live in the
 //! M3 private worker while this crate stays credential-free and testable.
 
-use fineco_core::{SafeError, parse_iso8601_utc, validate_order_request, validate_tax_range};
+use fineco_core::{
+    SafeError, parse_iso8601_utc, validate_movements_request, validate_order_request,
+    validate_tax_range,
+};
 use fineco_store::{
-    JobOutcome, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawOrder,
-    Store,
+    JobOutcome, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
+    RawMovement, RawOrder, Store,
 };
 
 /// A running refresh older than this is presumed dead (e.g. its finish write
@@ -260,6 +263,93 @@ pub fn refresh_tax(
                 }
             }
         }
+        Err(fetch_err) => {
+            let _ = store.record_job_finish(
+                job_id,
+                now_iso,
+                JobOutcome::Failed,
+                Some(fetch_err.code()),
+            );
+            Err(fetch_err)
+        }
+    }
+}
+
+/// Source of fresh movements data, **controller-side**: yields store-ready
+/// [`NewMovement`]s, takes `store` for HMAC-hashing the raw movement ids.
+/// The fineco-live `LiveClient` implements this; fakes implement it in tests.
+pub trait MovementsFetcher {
+    /// Fetch bank account movements for the last `days` days (`date_from` to
+    /// `date_to`, YYYY-MM-DD), mapped to store-ready [`NewMovement`]s.
+    ///
+    /// # Errors
+    /// Returns a [`SafeError`] if the fetch fails (e.g. auth/timeout).
+    fn fetch_movements(
+        &self,
+        store: &Store,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<NewMovement>, SafeError>;
+}
+
+/// Source of fresh movements data, **worker-side**: yields un-hashed
+/// [`RawMovement`]s with no DB key. The controller hashes them via
+/// [`fineco_store::Store::hash_raw_movement`].
+pub trait RawMovementsFetcher {
+    /// Fetch bank account movements for the `date_from`..`date_to` date range
+    /// (`YYYY-MM-DD`), parsed to [`RawMovement`]s (raw ids, never hashed).
+    ///
+    /// # Errors
+    /// Returns a [`SafeError`] if the fetch fails.
+    fn fetch_raw_movements(
+        &self,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<RawMovement>, SafeError>;
+}
+
+/// Run a local movements refresh: acquire the per-area lock, record a job, fetch,
+/// capture the movements, and record the outcome. Returns the number of movements
+/// captured (a count, never the values). `date_from`/`date_to` are YYYY-MM-DD
+/// strings already derived from the validated `days` param by the controller.
+///
+/// # Errors
+/// - [`SafeError::already_refreshing`] if a movements refresh is already running.
+/// - The fetcher's [`SafeError`] on fetch failure.
+/// - [`SafeError::internal`] on a storage failure.
+pub fn refresh_movements(
+    store: &mut Store,
+    fetcher: &dyn MovementsFetcher,
+    auth_id: &str,
+    days: u32,
+    date_from: &str,
+    date_to: &str,
+    now_iso: &str,
+) -> Result<usize, SafeError> {
+    validate_movements_request(days)?;
+
+    let job_id = match store
+        .try_begin_job(auth_id, "movements", now_iso, STALE_REFRESH_SECS)
+        .map_err(|_| SafeError::internal())?
+    {
+        Some(id) => id,
+        None => return Err(SafeError::already_refreshing()),
+    };
+
+    match fetcher.fetch_movements(store, date_from, date_to) {
+        Ok(movements) => match store.capture_movements(now_iso, &movements) {
+            Ok(()) => {
+                store
+                    .record_job_finish(job_id, now_iso, JobOutcome::Completed, None)
+                    .map_err(|_| SafeError::internal())?;
+                Ok(movements.len())
+            }
+            Err(_) => {
+                let _ =
+                    store.record_job_finish(job_id, now_iso, JobOutcome::Failed, Some("internal"));
+                Err(SafeError::internal())
+            }
+        },
         Err(fetch_err) => {
             let _ = store.record_job_finish(
                 job_id,
@@ -525,6 +615,19 @@ impl<F: TaxFetcher + ?Sized> TaxFetcher for Retrying<'_, F> {
 
     fn fetch_tax_minus_by_year(&self) -> Result<Vec<NewTaxMinusByYear>, SafeError> {
         with_retry(&self.policy, || self.inner.fetch_tax_minus_by_year())
+    }
+}
+
+impl<F: MovementsFetcher + ?Sized> MovementsFetcher for Retrying<'_, F> {
+    fn fetch_movements(
+        &self,
+        store: &Store,
+        date_from: &str,
+        date_to: &str,
+    ) -> Result<Vec<NewMovement>, SafeError> {
+        with_retry(&self.policy, || {
+            self.inner.fetch_movements(store, date_from, date_to)
+        })
     }
 }
 
