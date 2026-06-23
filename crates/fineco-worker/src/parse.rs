@@ -3463,6 +3463,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn movements_parse_skips_idless_items_and_sanitizes_text() {
+        // Two items: one with the mandatory `progressivoMovimento`, one without.
+        // The id-less item is dropped; the kept item's free text is sanitized
+        // (whitespace collapsed and trimmed by `sanitize_text`) and its amount
+        // preserved. Control-char stripping itself is unit-tested in fineco-core.
+        let json = r#"{
+            "movimenti": [
+                {
+                    "progressivoMovimento": "MOV-1",
+                    "causale": "BONIFICO",
+                    "descrizione": "  line   with    spaces  ",
+                    "importo": -25.5,
+                    "tipoMovimento": "MOVIMENTO_CONTO",
+                    "dataOperazione": "2026-01-01",
+                    "dataRegistrazione": "2026-01-01",
+                    "dataValuta": "2026-01-02",
+                    "causaleMovimento": "48"
+                },
+                {
+                    "causale": "NO ID — must be skipped",
+                    "importo": 999.0
+                }
+            ]
+        }"#;
+        let resp: MovementsApiResponse = serde_json::from_str(json).expect("parse");
+        let raws = to_raw_movements(resp);
+
+        assert_eq!(raws.len(), 1, "the id-less item is dropped");
+        assert_eq!(raws[0].movement_id, "MOV-1");
+        assert_eq!(
+            raws[0].descrizione.as_deref(),
+            Some("line with spaces"),
+            "leading/trailing trimmed and runs of whitespace collapse"
+        );
+        assert_eq!(raws[0].importo, Some(-25.5));
+        assert_eq!(raws[0].tipo_movimento.as_deref(), Some("MOVIMENTO_CONTO"));
+        assert_eq!(raws[0].data_valuta.as_deref(), Some("2026-01-02"));
+    }
+
+    #[test]
+    fn movements_parse_tolerates_a_missing_movimenti_array() {
+        // A response with no `movimenti` key yields an empty list, not an error.
+        let resp: MovementsApiResponse = serde_json::from_str("{}").expect("parse");
+        assert!(to_raw_movements(resp).is_empty());
+    }
+
+    #[test]
     fn empty_show_falls_back_to_total() {
         // `summary.show` is present but empty; `summary.total` carries the data.
         let json = r#"{

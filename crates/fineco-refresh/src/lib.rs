@@ -634,12 +634,14 @@ impl<F: MovementsFetcher + ?Sized> MovementsFetcher for Retrying<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OrdersFetcher, PortfolioFetcher, RefreshLimits, RetryPolicy, Retrying, TaxFetcher,
-        refresh_orders, refresh_portfolio, refresh_preflight, refresh_tax, with_retry,
+        MovementsFetcher, OrdersFetcher, PortfolioFetcher, RefreshLimits, RetryPolicy, Retrying,
+        TaxFetcher, refresh_movements, refresh_orders, refresh_portfolio, refresh_preflight,
+        refresh_tax, with_retry,
     };
     use fineco_core::SafeError;
     use fineco_store::{
-        JobOutcome, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, Store,
+        JobOutcome, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward,
+        NewTaxMinusByYear, Store,
     };
     use std::cell::Cell;
 
@@ -1284,6 +1286,114 @@ mod tests {
             "owner",
             "2026-01-01",
             "2026-12-31",
+            "2026-01-01T00:01:00Z",
+        )
+        .expect_err("should be locked");
+        assert_eq!(err.code(), "already_refreshing");
+    }
+
+    struct FakeMovementsFetcher(Result<Vec<NewMovement>, SafeError>);
+    impl MovementsFetcher for FakeMovementsFetcher {
+        fn fetch_movements(
+            &self,
+            _store: &Store,
+            _date_from: &str,
+            _date_to: &str,
+        ) -> Result<Vec<NewMovement>, SafeError> {
+            self.0.clone()
+        }
+    }
+
+    fn a_movement() -> NewMovement {
+        NewMovement {
+            movement_id_hash: "H1".to_string(),
+            causale: Some("BONIFICO".to_string()),
+            descrizione: Some("synthetic".to_string()),
+            importo: Some(-25.0),
+            tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
+            data_operazione: Some("2026-01-01".to_string()),
+            data_registrazione: Some("2026-01-01".to_string()),
+            data_valuta: Some("2026-01-02".to_string()),
+            causale_movimento: Some("48".to_string()),
+        }
+    }
+
+    #[test]
+    fn movements_refresh_captures_and_completes() {
+        let mut store = Store::open_in_memory().expect("open");
+        let fetcher = FakeMovementsFetcher(Ok(vec![a_movement()]));
+        let count = refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            30,
+            "2025-12-02",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("refresh");
+        assert_eq!(count, 1);
+        let job = store.latest_job_run("movements").expect("q").expect("job");
+        assert_eq!(job.status, "completed");
+        assert_eq!(job.safe_error_code, None);
+        assert_eq!(store.latest_movements().expect("q").len(), 1);
+        assert_eq!(store.running_job_for("movements").expect("q"), None);
+    }
+
+    #[test]
+    fn movements_refresh_failure_records_safe_code_and_propagates() {
+        let mut store = Store::open_in_memory().expect("open");
+        let fetcher = FakeMovementsFetcher(Err(SafeError::auth_required()));
+        let err = refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            30,
+            "2025-12-02",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect_err("should fail");
+        assert_eq!(err.code(), "auth_required");
+        let job = store.latest_job_run("movements").expect("q").expect("job");
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.safe_error_code.as_deref(), Some("auth_required"));
+        assert!(store.latest_movements().expect("q").is_empty());
+    }
+
+    #[test]
+    fn movements_refresh_rejects_invalid_days_without_creating_a_job_row() {
+        let mut store = Store::open_in_memory().expect("open");
+        let fetcher = FakeMovementsFetcher(Ok(vec![]));
+        let err = refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            91, // over the 90-day cap
+            "2025-10-03",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect_err("should reject");
+        assert_eq!(err.code(), "invalid_request");
+        // No job row created — the cap is a pre-lock gate.
+        assert!(store.latest_job_run("movements").expect("q").is_none());
+    }
+
+    #[test]
+    fn movements_refresh_rejects_when_already_running() {
+        let mut store = Store::open_in_memory().expect("open");
+        store
+            .record_job_start("owner", "movements", "2026-01-01T00:00:00Z")
+            .expect("start");
+        let fetcher = FakeMovementsFetcher(Ok(vec![]));
+        let err = refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            30,
+            "2025-12-02",
+            "2026-01-01",
             "2026-01-01T00:01:00Z",
         )
         .expect_err("should be locked");

@@ -278,7 +278,7 @@ Product (`crates/`):
   `portfolio_get_charts` stays **deferred** (no chart/time-series data is
   captured yet). Bank account movements (`movements_get_latest` /
   `private_movements_refresh_live_sensitive`) are excluded from the default
-  connector allowlist (fail-safe; expose raw transaction amounts).
+  connector allowlist (fail-safe; they expose raw transaction amounts).
 - **`crates/fineco-market`** (M3) — **credential-free** market path: stock
   enrichment, ETF reference-data enrichment, and the public zero-commission ETF
   list. Reaches **no** authenticated Fineco endpoint and holds **no** credentials.

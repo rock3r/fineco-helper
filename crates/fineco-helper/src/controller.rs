@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use fineco_core::{SafeError, parse_iso8601_utc};
+use fineco_core::{SafeError, epoch_to_iso8601_utc, parse_iso8601_utc};
 use fineco_ipc::{
     MARKET_SESSION_REUSE_TTL_SECS, MarketAssetDetailsLiveFetcher, MarketControlOutcome,
     MarketControlRequest, MarketIndicesLiveFetcher, MarketLiveError, MarketSearchLiveFetcher,
@@ -157,32 +157,13 @@ struct LiveLoginState {
 /// not a valid ISO-8601 UTC timestamp.
 fn days_to_date_range(now_iso: &str, days: u32) -> Option<(String, String)> {
     let now_epoch = parse_iso8601_utc(now_iso)?;
-    let today = epoch_to_ymd(now_epoch);
     let from_epoch = now_epoch.saturating_sub(i64::from(days) * 86_400);
-    let date_from = epoch_to_ymd(from_epoch);
-    Some((date_from, today))
-}
-
-fn epoch_to_ymd(epoch: i64) -> String {
-    // Gregorian calendar, UTC midnight. No external date library needed.
-    let days_since_epoch = epoch / 86_400;
-    let (year, month, day) = days_since_epoch_to_ymd(days_since_epoch);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-fn days_since_epoch_to_ymd(z: i64) -> (i64, u8, u8) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u8, d as u8)
+    // Reuse fineco-core's tested epoch→ISO conversion (UTC, floor division) and
+    // keep the YYYY-MM-DD date prefix, so the movements range agrees with the
+    // freshness clock and needs no second copy of the calendar algorithm.
+    let date_to = epoch_to_iso8601_utc(now_epoch)[..10].to_string();
+    let date_from = epoch_to_iso8601_utc(from_epoch)[..10].to_string();
+    Some((date_from, date_to))
 }
 
 fn reuse_window_from(now_epoch: i64) -> Option<i64> {
@@ -702,7 +683,7 @@ mod tests {
         MARKET_LOGIN_BUDGET_PER_ACCOUNT_PER_HOUR, MARKET_LOGIN_MIN_COOLDOWN_SECS,
         MARKET_MAX_CONCURRENT_LIVE_SESSION_OPS_PER_ACCOUNT,
         MARKET_REUSED_SESSION_401_RELOGIN_ATTEMPTS, MARKET_SESSION_REUSE_TTL_SECS,
-        RefreshController, RefreshLimitsByArea, parse_iso8601_utc,
+        RefreshController, RefreshLimitsByArea, days_to_date_range, parse_iso8601_utc,
     };
     use fineco_core::SafeError;
     use fineco_ipc::{
@@ -725,6 +706,27 @@ mod tests {
     use std::rc::Rc;
 
     const NOW: &str = "2026-06-05T10:00:00Z";
+
+    #[test]
+    fn days_to_date_range_computes_a_utc_day_lookback() {
+        // 30-day look-back from 2026-06-05 lands on 2026-05-06; date_to is today.
+        let (from, to) = days_to_date_range("2026-06-05T10:00:00Z", 30).expect("range");
+        assert_eq!(to, "2026-06-05");
+        assert_eq!(from, "2026-05-06");
+
+        // A look-back crossing a month boundary with differing month lengths.
+        let (from, to) = days_to_date_range("2026-03-01T00:00:00Z", 1).expect("range");
+        assert_eq!(to, "2026-03-01");
+        assert_eq!(from, "2026-02-28");
+
+        // days = 0 collapses to a single day (today..today).
+        let (from, to) = days_to_date_range("2026-06-05T23:59:59Z", 0).expect("range");
+        assert_eq!(from, "2026-06-05");
+        assert_eq!(to, "2026-06-05");
+
+        // A malformed timestamp yields None (the controller maps this to internal).
+        assert!(days_to_date_range("not-a-timestamp", 7).is_none());
+    }
 
     /// A fake worker the controller drives. Each fetch returns a canned result; a
     /// `Cell` counts portfolio fetches so tests can prove the controller does not
