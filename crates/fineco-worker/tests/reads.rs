@@ -317,6 +317,25 @@ fn paginates_movements_until_last_page() {
 }
 
 #[test]
+fn rejects_excessive_movements_window() {
+    // Defense in depth: a range wider than the 90-day cap is rejected worker-side
+    // before any Fineco call (mirrors the orders path), so the dead endpoint that
+    // `worker_offline` points at is never hit.
+    let err = worker_offline()
+        .fetch_raw_movements("2026-01-01", "2026-06-01")
+        .expect_err("a >90-day movements window must be rejected");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn rejects_inverted_movements_range() {
+    let err = worker_offline()
+        .fetch_raw_movements("2026-06-23", "2026-03-25")
+        .expect_err("date_from after date_to must be rejected");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
 fn fetches_tax_carry_forward() {
     let base = spawn_mock_fineco();
     let carry_forward = worker_for(&base)

@@ -494,14 +494,42 @@ pub fn validate_order_request(instrument_kind: &str, days: u32) -> Result<(), Sa
     Ok(())
 }
 
-/// Validate a movements refresh request's `days` bound. Enforced by the controller
-/// before the lock and again by the worker (defense in depth).
+/// Validate a movements refresh request's `days` bound (controller-side, before
+/// the lock). The worker independently re-checks the *resolved date range* via
+/// [`validate_movements_range`] (defense in depth).
 ///
 /// # Errors
 /// [`SafeError::invalid_request`] if `days` exceeds [`MAX_MOVEMENTS_DAYS`].
 pub fn validate_movements_request(days: u32) -> Result<(), SafeError> {
     if days > MAX_MOVEMENTS_DAYS {
         return Err(SafeError::invalid_request("days must be <= 90."));
+    }
+    Ok(())
+}
+
+/// Validate a movements refresh's resolved date **range** (`YYYY-MM-DD`,
+/// `from <= to`, span no wider than [`MAX_MOVEMENTS_DAYS`]). The controller bounds
+/// the request as a `days` count via [`validate_movements_request`] before deriving
+/// the range; the worker re-checks the derived range here before any Fineco call —
+/// defense in depth, mirroring how the orders path re-validates worker-side.
+///
+/// # Errors
+/// [`SafeError::invalid_request`] if a date is malformed, `date_from` is after
+/// `date_to`, or the span exceeds [`MAX_MOVEMENTS_DAYS`].
+pub fn validate_movements_range(date_from: &str, date_to: &str) -> Result<(), SafeError> {
+    let from = parse_iso_date(date_from)?;
+    let to = parse_iso_date(date_to)?;
+    if from > to {
+        return Err(SafeError::invalid_request(
+            "date_from must be on or before date_to.",
+        ));
+    }
+    // `from`/`to` are midnight-UTC epochs, so their difference is an exact day count.
+    let span_days = (to - from) / 86_400;
+    if span_days > i64::from(MAX_MOVEMENTS_DAYS) {
+        return Err(SafeError::invalid_request(
+            "movements date range must be <= 90 days.",
+        ));
     }
     Ok(())
 }

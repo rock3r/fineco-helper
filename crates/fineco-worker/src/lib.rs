@@ -34,8 +34,8 @@ pub use endpoints::FinecoEndpoints;
 use std::sync::{Arc, Mutex};
 
 use fineco_core::{
-    SafeError, normalize_expected_isin, parse_iso8601_utc, sanitize_text, validate_order_request,
-    validate_tax_range,
+    SafeError, normalize_expected_isin, parse_iso8601_utc, sanitize_text, validate_movements_range,
+    validate_order_request, validate_tax_range,
 };
 use fineco_ipc::{
     MARKET_SESSION_REUSE_TTL_SECS, MAX_AMBIGUITY_SUGGESTIONS, MarketAssetDetailsLiveFetcher,
@@ -767,8 +767,9 @@ impl RawMovementsFetcher for FinecoWorker {
         date_from: &str,
         date_to: &str,
     ) -> Result<Vec<RawMovement>, SafeError> {
-        // Defense in depth: same date-ordering check the controller ran pre-lock.
-        validate_tax_range(date_from, date_to)?;
+        // Defense in depth: re-check the resolved range (dates, ordering, and the
+        // 90-day span) worker-side before any Fineco call, as the orders path does.
+        validate_movements_range(date_from, date_to)?;
 
         let session = self.refresh_login()?;
         let mut all = Vec::new();
