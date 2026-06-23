@@ -199,12 +199,15 @@ impl QueryHandler {
                 movement_id_hash: row.movement_id_hash,
                 causale: row.causale,
                 descrizione: row.descrizione,
+                descrizione_breve: row.descrizione_breve,
                 importo: row.importo,
                 tipo_movimento: row.tipo_movimento,
                 data_operazione: row.data_operazione,
                 data_registrazione: row.data_registrazione,
                 data_valuta: row.data_valuta,
                 causale_movimento: row.causale_movimento,
+                categoria_id: row.categoria_id,
+                sottocategoria_id: row.sottocategoria_id,
             })
             .collect();
         Ok(ResponseBody::Movements(MovementsDto {

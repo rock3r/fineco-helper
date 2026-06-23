@@ -1309,12 +1309,15 @@ mod tests {
             movement_id_hash: "H1".to_string(),
             causale: Some("BONIFICO".to_string()),
             descrizione: Some("synthetic".to_string()),
+            descrizione_breve: Some("synthetic".to_string()),
             importo: Some(-25.0),
             tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
             data_operazione: Some("2026-01-01".to_string()),
             data_registrazione: Some("2026-01-01".to_string()),
             data_valuta: Some("2026-01-02".to_string()),
             causale_movimento: Some("48".to_string()),
+            categoria_id: Some("12".to_string()),
+            sottocategoria_id: Some("34".to_string()),
         }
     }
 

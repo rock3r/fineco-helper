@@ -8,11 +8,14 @@ CREATE TABLE movements (
     movement_id_hash    TEXT NOT NULL,
     causale             TEXT,
     descrizione         TEXT,
+    descrizione_breve   TEXT,
     importo             REAL,
     tipo_movimento      TEXT,
     data_operazione     TEXT,
     data_registrazione  TEXT,
     data_valuta         TEXT,
     causale_movimento   TEXT,
+    categoria_id        TEXT,
+    sottocategoria_id   TEXT,
     PRIMARY KEY (captured_at, movement_id_hash)
 );

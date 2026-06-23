@@ -9,12 +9,15 @@ fn movement(id_hash: &str, importo: f64) -> NewMovement {
         movement_id_hash: id_hash.to_string(),
         causale: Some("BONIFICO".to_string()),
         descrizione: Some("synthetic line".to_string()),
+        descrizione_breve: Some("synthetic".to_string()),
         importo: Some(importo),
         tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
         data_operazione: Some("2026-01-01".to_string()),
         data_registrazione: Some("2026-01-01".to_string()),
         data_valuta: Some("2026-01-02".to_string()),
         causale_movimento: Some("48".to_string()),
+        categoria_id: Some("12".to_string()),
+        sottocategoria_id: Some("34".to_string()),
     }
 }
 
@@ -37,6 +40,9 @@ fn capture_and_read_back_movements() {
     assert_eq!(rows[0].causale.as_deref(), Some("BONIFICO"));
     assert_eq!(rows[0].tipo_movimento.as_deref(), Some("MOVIMENTO_CONTO"));
     assert_eq!(rows[0].data_valuta.as_deref(), Some("2026-01-02"));
+    assert_eq!(rows[0].descrizione_breve.as_deref(), Some("synthetic"));
+    assert_eq!(rows[0].categoria_id.as_deref(), Some("12"));
+    assert_eq!(rows[0].sottocategoria_id.as_deref(), Some("34"));
     assert_eq!(rows[1].movement_id_hash, "H2");
     assert_eq!(rows[1].importo, Some(1000.0));
 }

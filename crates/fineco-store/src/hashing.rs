@@ -45,12 +45,15 @@ impl Store {
             movement_id_hash: self.hash_id(&raw.movement_id)?,
             causale: raw.causale.clone(),
             descrizione: raw.descrizione.clone(),
+            descrizione_breve: raw.descrizione_breve.clone(),
             importo: raw.importo,
             tipo_movimento: raw.tipo_movimento.clone(),
             data_operazione: raw.data_operazione.clone(),
             data_registrazione: raw.data_registrazione.clone(),
             data_valuta: raw.data_valuta.clone(),
             causale_movimento: raw.causale_movimento.clone(),
+            categoria_id: raw.categoria_id.clone(),
+            sottocategoria_id: raw.sottocategoria_id.clone(),
         })
     }
 

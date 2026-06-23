@@ -1548,6 +1548,8 @@ pub struct MovementDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descrizione: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descrizione_breve: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub importo: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tipo_movimento: Option<String>,
@@ -1559,6 +1561,12 @@ pub struct MovementDto {
     pub data_valuta: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causale_movimento: Option<String>,
+    /// Fineco MoneyMap category / subcategory IDs. Raw opaque IDs for now; a
+    /// later slice resolves them to names via `GET banking/moneymap/categories`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categoria_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sottocategoria_id: Option<String>,
 }
 
 /// Freshness of all data areas, as returned by `portfolio_get_freshness`.

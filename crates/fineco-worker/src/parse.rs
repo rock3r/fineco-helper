@@ -3423,6 +3423,8 @@ pub(crate) struct RawMovementItem {
     causale: Option<String>,
     #[serde(default)]
     descrizione: Option<String>,
+    #[serde(default, rename = "descrizioneBreve")]
+    descrizione_breve: Option<String>,
     #[serde(default)]
     importo: Option<f64>,
     #[serde(default)]
@@ -3435,6 +3437,13 @@ pub(crate) struct RawMovementItem {
     data_valuta: Option<String>,
     #[serde(default)]
     causale_movimento: Option<String>,
+    /// Fineco MoneyMap category / subcategory IDs (`bfCategoria`/`bfSottocategoria`).
+    /// Stored as the raw opaque IDs; a later MoneyMap-categories slice resolves them
+    /// to human-readable names via `GET banking/moneymap/categories`.
+    #[serde(default, rename = "bfCategoria")]
+    categoria_id: Option<String>,
+    #[serde(default, rename = "bfSottocategoria")]
+    sottocategoria_id: Option<String>,
 }
 
 /// Convert a [`MovementsApiResponse`] into [`RawMovement`]s, skipping items
@@ -3449,12 +3458,15 @@ pub(crate) fn to_raw_movements(resp: MovementsApiResponse) -> Vec<fineco_store::
                 movement_id,
                 causale: item.causale.as_deref().map(sanitize_text),
                 descrizione: item.descrizione.as_deref().map(sanitize_text),
+                descrizione_breve: item.descrizione_breve.as_deref().map(sanitize_text),
                 importo: item.importo,
                 tipo_movimento: item.tipo_movimento.as_deref().map(sanitize_text),
                 data_operazione: item.data_operazione,
                 data_registrazione: item.data_registrazione,
                 data_valuta: item.data_valuta,
                 causale_movimento: item.causale_movimento.as_deref().map(sanitize_text),
+                categoria_id: item.categoria_id.as_deref().map(sanitize_text),
+                sottocategoria_id: item.sottocategoria_id.as_deref().map(sanitize_text),
             })
         })
         .collect()
@@ -3476,12 +3488,15 @@ mod tests {
                     "progressivoMovimento": "MOV-1",
                     "causale": "BONIFICO",
                     "descrizione": "  line   with    spaces  ",
+                    "descrizioneBreve": "short desc",
                     "importo": -25.5,
                     "tipoMovimento": "MOVIMENTO_CONTO",
                     "dataOperazione": "2026-01-01",
                     "dataRegistrazione": "2026-01-01",
                     "dataValuta": "2026-01-02",
-                    "causaleMovimento": "48"
+                    "causaleMovimento": "48",
+                    "bfCategoria": "12",
+                    "bfSottocategoria": "34"
                 },
                 {
                     "causale": "NO ID — must be skipped",
@@ -3502,6 +3517,10 @@ mod tests {
         assert_eq!(raws[0].importo, Some(-25.5));
         assert_eq!(raws[0].tipo_movimento.as_deref(), Some("MOVIMENTO_CONTO"));
         assert_eq!(raws[0].data_valuta.as_deref(), Some("2026-01-02"));
+        // The richer fields parse from their `bf*`/camelCase keys.
+        assert_eq!(raws[0].descrizione_breve.as_deref(), Some("short desc"));
+        assert_eq!(raws[0].categoria_id.as_deref(), Some("12"));
+        assert_eq!(raws[0].sottocategoria_id.as_deref(), Some("34"));
     }
 
     #[test]

@@ -58,12 +58,15 @@ fn hash_raw_movement_hashes_the_movement_id_and_preserves_the_rest() {
         movement_id: "SYNTH-MOV-0001".to_string(),
         causale: Some("BONIFICO".to_string()),
         descrizione: Some("synthetic line".to_string()),
+        descrizione_breve: Some("synthetic".to_string()),
         importo: Some(-25.0),
         tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
         data_operazione: Some("2026-01-01".to_string()),
         data_registrazione: Some("2026-01-01".to_string()),
         data_valuta: Some("2026-01-02".to_string()),
         causale_movimento: Some("48".to_string()),
+        categoria_id: Some("12".to_string()),
+        sottocategoria_id: Some("34".to_string()),
     };
 
     let movement = store.hash_raw_movement(&raw).expect("hash");
@@ -82,6 +85,9 @@ fn hash_raw_movement_hashes_the_movement_id_and_preserves_the_rest() {
     assert_eq!(movement.data_registrazione.as_deref(), Some("2026-01-01"));
     assert_eq!(movement.data_valuta.as_deref(), Some("2026-01-02"));
     assert_eq!(movement.causale_movimento.as_deref(), Some("48"));
+    assert_eq!(movement.descrizione_breve.as_deref(), Some("synthetic"));
+    assert_eq!(movement.categoria_id.as_deref(), Some("12"));
+    assert_eq!(movement.sottocategoria_id.as_deref(), Some("34"));
 }
 
 #[test]
