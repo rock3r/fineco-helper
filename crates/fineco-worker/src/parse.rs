@@ -3391,17 +3391,19 @@ pub(crate) fn to_tax_minus(resp: TaxMinusResponse) -> Vec<NewTaxMinusByYear> {
 
 // ---- Bank account movements ------------------------------------------------
 
-/// The JSON body POSTed to the movements endpoint.
+/// The JSON body POSTed to the movements endpoint: `{ "dateFrom", "dateTo" }`.
+///
+/// Only the date range is sent. Adding the app's other filter fields
+/// (`offset`/`limit`/`type`/`keyword`) makes the `private-api` host return a
+/// 500 "Service Internal Error"; the date-only body is what the Fineco web app
+/// sends, returns the full result set (`limitedResult: false`), and is
+/// confirmed working against the live endpoint. No `type` filter means all
+/// movement types are returned.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MovementsApiRequest {
     pub date_from: String,
     pub date_to: String,
-    pub offset: i32,
-    pub limit: i32,
-    #[serde(rename = "type")]
-    pub movement_types: Vec<&'static str>,
-    pub keyword: Option<String>,
 }
 
 /// Top-level response from the movements endpoint.

@@ -738,20 +738,14 @@ impl TaxFetcher for FinecoWorker {
     }
 }
 
-/// All movement types the mobile app sends to pull the full bank statement.
-const ALL_MOVEMENT_TYPES: &[&str] = &[
-    "MOVIMENTO_CONTO",
-    "MOVIMENTO_CARTE",
-    "PRENOTATA_CARTE_CREDIT",
-    "PRENOTATA_CARTE",
-    "MOVIMENTO_DEBIT",
-    "RICHIEDI_DENARO",
-];
-
 impl RawMovementsFetcher for FinecoWorker {
     /// Fetch bank account movements for `date_from`..`date_to` (`YYYY-MM-DD`).
-    /// Uses `limit=-1` (all results in one call) and all movement types, mirroring
-    /// the mobile app's behavior.
+    /// POSTs a date-only body (the Fineco web app's shape) and returns the full
+    /// result set in one call — the response carries `limitedResult: false`, so
+    /// no pagination is needed. No `type` filter means all movement types come
+    /// back. The controller caps the window at 90 days; beyond that Fineco
+    /// returns 451 "Sca di sessione non valida" (the PSD2 SCA boundary), which a
+    /// headless worker cannot satisfy.
     ///
     /// # Errors
     /// Auth/upstream/internal envelopes on login, fetch, or parse failure.
@@ -767,10 +761,6 @@ impl RawMovementsFetcher for FinecoWorker {
         let body = parse::MovementsApiRequest {
             date_from: date_from.to_string(),
             date_to: date_to.to_string(),
-            offset: 0,
-            limit: -1,
-            movement_types: ALL_MOVEMENT_TYPES.to_vec(),
-            keyword: None,
         };
         let response: parse::MovementsApiResponse = self.post_json_mapped(
             &self.endpoints.movements,

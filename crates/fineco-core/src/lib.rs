@@ -456,7 +456,12 @@ impl std::error::Error for SafeError {}
 /// Maximum order-monitor day window a refresh may request (plan rate-limit bound).
 pub const MAX_ORDER_DAYS: u32 = 30;
 
-/// Maximum movements day window a refresh may request.
+/// Maximum movements day window a refresh may request. This is the **PSD2 SCA
+/// boundary**, not an arbitrary rate-limit: Fineco serves up to 90 days of
+/// account history on a plain session, but a window reaching further back returns
+/// HTTP 451 "Unavailable For Legal Reason" / "Sca di sessione non valida" (Strong
+/// Customer Authentication required), which a headless worker cannot satisfy.
+/// Confirmed live (2026-06-23): a 90-day window returns 200; a 1-year window 451.
 pub const MAX_MOVEMENTS_DAYS: u32 = 90;
 
 /// Maximum length of a live-order `instrument_kind`. The cached snapshot-query IPC
