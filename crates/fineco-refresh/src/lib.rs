@@ -341,7 +341,11 @@ pub fn refresh_movements(
 
     match fetcher.fetch_movements(store, date_from, date_to) {
         Ok((movements, summary)) => {
-            match store.capture_movements(now_iso, &movements, Some(&summary)) {
+            // An all-None summary means the fetch carried no account-level fields;
+            // don't persist a row for it, so `movements_get_latest` omits
+            // `account_summary` rather than emitting an empty object.
+            let summary_ref = (!summary.is_empty()).then_some(&summary);
+            match store.capture_movements(now_iso, &movements, summary_ref) {
                 Ok(()) => {
                     store
                         .record_job_finish(job_id, now_iso, JobOutcome::Completed, None)
@@ -1364,6 +1368,32 @@ mod tests {
             Some(a_summary())
         );
         assert_eq!(store.running_job_for("movements").expect("q"), None);
+    }
+
+    #[test]
+    fn movements_refresh_does_not_persist_an_all_none_summary() {
+        // A fetch that carried no account-level fields yields an all-None summary.
+        // It must NOT be stored as a row — otherwise `movements_get_latest` would
+        // emit `account_summary: {}` instead of omitting it, conflating "no summary
+        // returned" with "an empty summary object".
+        let mut store = Store::open_in_memory().expect("open");
+        let fetcher = FakeMovementsFetcher(Ok((vec![a_movement()], MovementsSummary::default())));
+        refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            30,
+            "2025-12-02",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("refresh");
+        assert_eq!(store.latest_movements().expect("q").len(), 1);
+        assert_eq!(
+            store.latest_movements_summary().expect("q"),
+            None,
+            "an all-None summary is treated as no summary and not persisted"
+        );
     }
 
     #[test]

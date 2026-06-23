@@ -59,6 +59,20 @@ pub struct MovementsSummary {
     pub current_month_debit_spending: Option<f64>,
 }
 
+impl MovementsSummary {
+    /// `true` when no account-level field was present (all `None`) — i.e. the fetch
+    /// carried no summary. The orchestrator does not persist such a summary, so
+    /// `movements_get_latest` omits `account_summary` entirely rather than emitting an
+    /// empty `{}` object that callers couldn't distinguish from "no summary returned".
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.balance_at_movement.is_none()
+            && self.balance_at_search_date.is_none()
+            && self.current_month_credit_spending.is_none()
+            && self.current_month_debit_spending.is_none()
+    }
+}
+
 /// A movement read back from the store.
 #[derive(Debug, Clone)]
 pub struct MovementRow {

@@ -123,6 +123,20 @@ fn movements_freshness_tracks_latest_capture() {
 }
 
 #[test]
+fn movements_summary_is_empty_only_when_all_fields_are_none() {
+    assert!(MovementsSummary::default().is_empty());
+    assert!(
+        !MovementsSummary {
+            balance_at_movement: Some(0.0),
+            ..Default::default()
+        }
+        .is_empty(),
+        "a present zero balance is still a summary, not empty"
+    );
+    assert!(!summary().is_empty());
+}
+
+#[test]
 fn captures_and_reads_back_the_account_summary() {
     let mut store = Store::open_in_memory().expect("open");
     store
