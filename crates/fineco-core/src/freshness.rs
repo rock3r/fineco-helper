@@ -11,6 +11,7 @@ pub enum FreshnessState {
     Refreshing,
     RefreshFailed,
     AuthRequired,
+    StepUpRequired,
     Missing,
 }
 
@@ -24,6 +25,7 @@ impl FreshnessState {
             FreshnessState::Refreshing => "refreshing",
             FreshnessState::RefreshFailed => "refresh_failed",
             FreshnessState::AuthRequired => "auth_required",
+            FreshnessState::StepUpRequired => "step_up_required",
             FreshnessState::Missing => "missing",
         }
     }
@@ -34,7 +36,7 @@ impl FreshnessState {
 /// `None` captured-at → [`FreshnessState::Missing`]; age strictly greater than
 /// `max_age_seconds` → [`FreshnessState::Stale`]; otherwise
 /// [`FreshnessState::Fresh`]. The `Refreshing` / `RefreshFailed` / `AuthRequired`
-/// states are layered in from job state by the caller.
+/// / `StepUpRequired` states are layered in from job state by the caller.
 #[must_use]
 pub fn freshness_from_age(
     captured_at_epoch: Option<i64>,

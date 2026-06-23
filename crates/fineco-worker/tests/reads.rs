@@ -130,6 +130,89 @@ fn spawn_mock_fineco_limited_movements() -> String {
     format!("http://{addr}")
 }
 
+/// Login returns a 2xx step-up *challenge* (carrying SCA markers) and NO session
+/// `Set-Cookie` — Fineco's likely web-login SCA shape. The worker must surface
+/// `step_up_required`, distinct from a plain wrong-password 2xx-no-cookie.
+fn spawn_mock_fineco_login_step_up() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v1/public/authentications/web/login" {
+                // 200 + challenge body + NO Set-Cookie (the cookieless-2xx SCA case).
+                return httptiny::Response::json(
+                    200,
+                    "{\"authorisationId\":\"SYNTH-AUTH-1\",\
+                     \"availableMethods\":[\"MOBILE_CODE\",\"SMS\"],\
+                     \"status\":\"STRONG_AUTH_REQUIRED\"}",
+                );
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
+/// Login returns a 2xx with NO markers and NO session cookie — the plain
+/// wrong-password shape. Must stay `auth_required`, not be misread as step-up.
+fn spawn_mock_fineco_login_no_cookie_no_markers() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v1/public/authentications/web/login" {
+                return httptiny::Response::json(200, "{\"_fixture\":\"SYNTHETIC no session\"}");
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
+/// A read trips Fineco's read-time session step-up: HTTP 451 with the
+/// `Sca di sessione non valida` reason (the movements >90d / PSD2 boundary).
+/// `endpoint` selects which path 451s; login still succeeds.
+fn spawn_mock_fineco_read_step_up(endpoint: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, move |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if path == endpoint {
+                return httptiny::Response::json(
+                    451,
+                    "{\"issues\":[{\"severity\":\"error\",\
+                     \"reason\":\"Sca di sessione non valida\"}]}",
+                );
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
+/// A read returns 451 for some *other* legal reason (no SCA marker). Must stay a
+/// plain upstream error, NOT be misclassified as step-up.
+fn spawn_mock_fineco_read_451_non_sca() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v2/private/accounts-and-cards/movements" {
+                return httptiny::Response::json(
+                    451,
+                    "{\"issues\":[{\"reason\":\"content blocked in your region\"}]}",
+                );
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
 fn worker_for(base: &str) -> FinecoWorker {
     FinecoWorker::new(
         FinecoEndpoints::for_base(base),
@@ -367,6 +450,90 @@ fn rejects_inverted_movements_range() {
         .fetch_raw_movements("2026-06-23", "2026-03-25")
         .expect_err("date_from after date_to must be rejected");
     assert_eq!(err.code(), "invalid_request");
+}
+
+// --- SCA Tier 1: detect & surface step-up -----------------------------------
+
+#[test]
+fn login_step_up_challenge_surfaces_step_up_required() {
+    // A 2xx login with SCA markers but no session cookie must become the distinct
+    // `step_up_required`, and the challenge body must never leak into the message.
+    let base = spawn_mock_fineco_login_step_up();
+    let err = worker_for(&base)
+        .fetch_portfolio(NOW)
+        .expect_err("a login step-up challenge must surface as an error");
+    assert_eq!(err.code(), "step_up_required");
+    assert!(!err.retryable());
+    let msg = err.safe_message();
+    assert!(
+        !msg.contains("SYNTH-AUTH-1"),
+        "authorisationId leaked: {msg}"
+    );
+    assert!(
+        !msg.contains("STRONG_AUTH_REQUIRED"),
+        "status leaked: {msg}"
+    );
+    assert!(!msg.contains("availableMethods"), "methods leaked: {msg}");
+}
+
+#[test]
+fn login_2xx_without_cookie_or_markers_stays_auth_required() {
+    // The plain wrong-password shape (2xx, no cookie, no SCA markers) must remain
+    // `auth_required` — the step-up heuristic must not swallow it.
+    let base = spawn_mock_fineco_login_no_cookie_no_markers();
+    let err = worker_for(&base)
+        .fetch_portfolio(NOW)
+        .expect_err("a cookieless 2xx with no markers must fail");
+    assert_eq!(err.code(), "auth_required");
+}
+
+#[test]
+fn read_time_451_sca_surfaces_step_up_required() {
+    // The movements >90d / PSD2 boundary: a 451 carrying the session-SCA reason
+    // becomes `step_up_required` on the refresh path, with no body leak.
+    let base = spawn_mock_fineco_read_step_up("/v2/private/accounts-and-cards/movements");
+    let err = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect_err("a 451 session-SCA must surface as step-up");
+    assert_eq!(err.code(), "step_up_required");
+    assert!(!err.retryable());
+    assert!(
+        !err.safe_message().contains("Sca di sessione"),
+        "upstream reason leaked: {}",
+        err.safe_message()
+    );
+}
+
+#[test]
+fn read_time_451_without_sca_marker_stays_upstream_error() {
+    // A 451 for a non-SCA legal reason must NOT be misread as step-up; it stays a
+    // plain (non-retryable) upstream error.
+    let base = spawn_mock_fineco_read_451_non_sca();
+    let err = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect_err("a non-SCA 451 must still fail");
+    assert_eq!(err.code(), "fineco_upstream_error");
+    assert_ne!(err.code(), "step_up_required");
+}
+
+#[test]
+fn market_read_451_sca_surfaces_market_step_up_required() {
+    // On the market path the same 451 session-SCA must surface as the market-coded
+    // `market_step_up_required` (translated via `market_login_error`), not the
+    // generic code and not a relogin-triggering auth error.
+    let base = spawn_mock_fineco_read_step_up("/v1/private/tol/stocklists/search/global");
+    let err = worker_for(&base)
+        .fetch_market_search(
+            &MarketSearchParams {
+                query: "VHYL".to_string(),
+                asset_type: Some(MarketAssetType::Etf),
+                limit: Some(5),
+            },
+            NOW,
+        )
+        .expect_err("a market 451 session-SCA must surface as market step-up");
+    assert_eq!(err.error.code(), "market_step_up_required");
+    assert!(!err.error.retryable());
 }
 
 #[test]

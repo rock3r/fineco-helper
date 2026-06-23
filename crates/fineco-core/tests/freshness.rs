@@ -40,6 +40,7 @@ fn freshness_state_strings_are_stable() {
     assert_eq!(FreshnessState::Refreshing.as_str(), "refreshing");
     assert_eq!(FreshnessState::RefreshFailed.as_str(), "refresh_failed");
     assert_eq!(FreshnessState::AuthRequired.as_str(), "auth_required");
+    assert_eq!(FreshnessState::StepUpRequired.as_str(), "step_up_required");
     assert_eq!(FreshnessState::Missing.as_str(), "missing");
 }
 

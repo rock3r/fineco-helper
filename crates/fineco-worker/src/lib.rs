@@ -289,7 +289,7 @@ impl FinecoWorker {
         if !login_cookie.is_empty() {
             request = request.header("Cookie", login_cookie.as_str());
         }
-        let response = request.send(&json[..]).map_err(map_transport_error)?;
+        let mut response = request.send(&json[..]).map_err(map_transport_error)?;
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
@@ -299,8 +299,23 @@ impl FinecoWorker {
         let session_expires_in_secs = session_expires_in_secs_from(response.headers());
         let session_cookie = cookie_header_from(response.headers());
         if session_cookie.is_empty() {
-            // A 200 with no session cookie is an auth failure, not a transport one.
-            return Err(SafeError::auth_required());
+            // A 2xx with no session cookie is either a step-up challenge (Fineco
+            // wants strong customer authentication) or a plain auth failure (e.g.
+            // a wrong password). Read the body — bounded, never surfaced — only to
+            // classify which; the happy cookie path above never touches it. A
+            // body-read failure degrades safely to `auth_required`.
+            let step_up = response
+                .body_mut()
+                .with_config()
+                .limit(MAX_JSON_BYTES)
+                .read_to_string()
+                .map(|body| login_body_signals_step_up(&body))
+                .unwrap_or(false);
+            return Err(if step_up {
+                SafeError::step_up_required()
+            } else {
+                SafeError::auth_required()
+            });
         }
         // The reads replay the full jar the browser would carry: the login
         // context (preflight or synthetic) plus the freshly minted session.
@@ -580,7 +595,7 @@ impl FinecoWorker {
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(map_status(status));
+            return Err(read_status_error(response.body_mut(), status, map_status));
         }
         // Read the body to a string FIRST, then parse — do NOT use `read_json`,
         // which would collapse a stalled body-read **timeout** into a generic
@@ -631,7 +646,7 @@ impl FinecoWorker {
         let mut response = request.send(&json).map_err(map_transport_error)?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(map_status(status));
+            return Err(read_status_error(response.body_mut(), status, map_status));
         }
         let body = response
             .body_mut()
@@ -1444,6 +1459,10 @@ fn is_market_retryable(error: &SafeError) -> bool {
 fn market_login_error(error: SafeError) -> SafeError {
     match error.code() {
         "auth_required" => SafeError::market_auth_required(),
+        // Read-time or login step-up on the market path: keep it market-coded and
+        // terminal. Not a 401-recovery trigger (re-login won't clear a session
+        // step-up), and `is_market_retryable` already excludes it.
+        "step_up_required" => SafeError::market_step_up_required(),
         "rate_limited" => SafeError::market_rate_limited(),
         "fineco_timeout" => SafeError::market_upstream_failure(),
         "fineco_upstream_error" if error.retryable() => SafeError::market_upstream_failure(),
@@ -1460,6 +1479,74 @@ fn market_status_error(status: u16) -> SafeError {
         500..=599 => SafeError::market_upstream_failure(),
         _ => SafeError::market_unexpected_response(),
     }
+}
+
+/// Lowercased substring markers that a *login* response demanded step-up (strong
+/// customer authentication). Scanned only when a 2xx login carried no session
+/// cookie. The exact web-login challenge envelope is UNVERIFIED (we have only the
+/// app's SCA shapes; see `.plans/sca-login-adaptation-plan.md` Part A), so this is
+/// a deliberately defensive heuristic: any marker present → step-up; none present
+/// → the cookieless-2xx stays a plain `auth_required` (today's behavior), so a
+/// wrong guess can never make a wrong-password worse. Refine on a real capture.
+const LOGIN_STEP_UP_MARKERS: &[&str] = &[
+    "authorisationid",
+    "availablemethods",
+    "strong_auth",
+    "strongauth",
+    "step_up",
+    "stepup",
+    "sca_required",
+    "scarequired",
+];
+
+/// The reason Fineco returns on a read requiring session step-up: HTTP 451 with
+/// `issues:[{reason:"Sca di sessione non valida"}]` (the PSD2 90-day boundary,
+/// live-confirmed 2026-06-23 on a >90-day movements window — see
+/// `.docs/cuj-10-movements.md`). Matched case-insensitively; the body is never
+/// surfaced.
+const READ_STEP_UP_MARKER: &str = "sca di sessione non valida";
+
+/// True if a cookieless 2xx login body looks like a step-up challenge rather than
+/// a plain auth failure. Scans for [`LOGIN_STEP_UP_MARKERS`] case-insensitively;
+/// the body is only classified, never surfaced.
+fn login_body_signals_step_up(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    LOGIN_STEP_UP_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// True if an HTTP 451 read-error body carries the session-SCA reason
+/// ([`READ_STEP_UP_MARKER`]). Only classifies; never surfaces the body.
+fn read_body_signals_step_up(body: &str) -> bool {
+    body.to_ascii_lowercase().contains(READ_STEP_UP_MARKER)
+}
+
+/// Map a non-2xx authenticated-read status to a safe error, detecting Fineco's
+/// read-time session step-up (HTTP 451 + the `Sca di sessione non valida` reason;
+/// the PSD2 90-day boundary) and surfacing it as the distinct `step_up_required`.
+/// Only a **451** body is inspected — every other status keeps the caller's
+/// `map_status` mapping untouched — and the body is scanned for the marker only,
+/// never surfaced. A body-read failure falls back to `map_status` so a definitive
+/// status is never lost to a stalled read. On the market path the generic
+/// `step_up_required` is later translated to `market_step_up_required` by
+/// `market_login_error` (via `with_market_retry`).
+fn read_status_error(
+    body: &mut ureq::Body,
+    status: u16,
+    map_status: fn(u16) -> SafeError,
+) -> SafeError {
+    if status == 451
+        && body
+            .with_config()
+            .limit(MAX_JSON_BYTES)
+            .read_to_string()
+            .map(|text| read_body_signals_step_up(&text))
+            .unwrap_or(false)
+    {
+        return SafeError::step_up_required();
+    }
+    map_status(status)
 }
 
 /// Apply a fixed set of `(name, value)` headers to a request builder.
@@ -1879,7 +1966,10 @@ mod tests {
         max_age_secs_from_set_cookie, reap_expired_market_session, resolve_market_candidate,
         session_expires_in_secs_from, ttl_secs_from_set_cookie_at, with_market_retry,
     };
-    use super::{market_login_error, synthetic_public_cookies};
+    use super::{
+        login_body_signals_step_up, market_login_error, read_body_signals_step_up,
+        synthetic_public_cookies,
+    };
     use fineco_core::SafeError;
     use fineco_ipc::{
         MarketAssetType, MarketDetailsParams, MarketSearchCandidate, MarketSearchGroup,
@@ -2461,6 +2551,33 @@ mod tests {
             market_login_error(SafeError::not_found()).code(),
             "market_unexpected_response"
         );
+        // A read-time/login step-up keeps its market coding and stays terminal.
+        let stepped = market_login_error(SafeError::step_up_required());
+        assert_eq!(stepped.code(), "market_step_up_required");
+        assert!(!stepped.retryable());
+    }
+
+    #[test]
+    fn step_up_markers_match_only_real_signals() {
+        // Login markers: present → step-up; absent → not (so wrong-password stays
+        // auth_required). Case-insensitive.
+        assert!(login_body_signals_step_up(
+            "{\"authorisationId\":\"x\",\"availableMethods\":[\"SMS\"]}"
+        ));
+        assert!(login_body_signals_step_up("{\"status\":\"STRONG_AUTH\"}"));
+        assert!(login_body_signals_step_up("{\"flow\":\"step_up\"}"));
+        assert!(!login_body_signals_step_up("{\"_fixture\":\"login ok\"}"));
+        assert!(!login_body_signals_step_up(""));
+
+        // Read marker: the exact PSD2 session-SCA reason, case-insensitive; an
+        // unrelated 451 body must not match.
+        assert!(read_body_signals_step_up(
+            "{\"issues\":[{\"reason\":\"Sca di sessione non valida\"}]}"
+        ));
+        assert!(read_body_signals_step_up("SCA DI SESSIONE NON VALIDA"));
+        assert!(!read_body_signals_step_up(
+            "{\"issues\":[{\"reason\":\"blocked in region\"}]}"
+        ));
     }
 
     #[test]
