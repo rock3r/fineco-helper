@@ -13,7 +13,7 @@ use fineco_ipc::{
     MarketIndexRegion, MarketIndicesLiveFetcher, MarketIndicesParams, MarketSearchLiveFetcher,
     MarketSearchParams,
 };
-use fineco_refresh::{PortfolioFetcher, RawOrdersFetcher, TaxFetcher};
+use fineco_refresh::{PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher, TaxFetcher};
 use fineco_worker::{FinecoEndpoints, FinecoWorker, StaticCredentialSource};
 
 const NOW: &str = "2026-06-03T12:00:00Z";
@@ -292,6 +292,28 @@ fn rejects_non_alphanumeric_instrument_kind() {
         .fetch_raw_orders("equity&days=999", 0)
         .expect_err("query-injecting kind must be rejected");
     assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
+fn paginates_movements_until_last_page() {
+    // The mock serves 23 synthetic movements 15 per page; the worker must page by
+    // offset until `lastPage` and accumulate ALL of them — never just the first
+    // page (the silent-truncation bug the date-only body had).
+    let base = spawn_mock_fineco();
+    let movements = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect("movements fetch should succeed");
+
+    assert_eq!(
+        movements.len(),
+        23,
+        "all pages accumulated, not just the first"
+    );
+    // Unique ids across pages — no drops, no duplicates.
+    let mut ids: Vec<&str> = movements.iter().map(|m| m.movement_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 23, "every movement id is distinct across pages");
 }
 
 #[test]

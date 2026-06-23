@@ -3391,19 +3391,24 @@ pub(crate) fn to_tax_minus(resp: TaxMinusResponse) -> Vec<NewTaxMinusByYear> {
 
 // ---- Bank account movements ------------------------------------------------
 
-/// The JSON body POSTed to the movements endpoint: `{ "dateFrom", "dateTo" }`.
+/// The JSON body POSTed to the movements endpoint:
+/// `{ "dateFrom", "dateTo", "offset", "limit", "keyword": "" }`.
 ///
-/// Only the date range is sent. Adding the app's other filter fields
-/// (`offset`/`limit`/`type`/`keyword`) makes the `private-api` host return a
-/// 500 "Service Internal Error"; the date-only body is what the Fineco web app
-/// sends, returns the full result set (`limitedResult: false`), and is
-/// confirmed working against the live endpoint. No `type` filter means all
+/// The endpoint is **paginated**: it returns at most `limit` movements starting
+/// at `offset`, with `lastPage` in the response signalling the final page. The
+/// worker walks the pages (see `fetch_raw_movements`). `keyword` must be an empty
+/// **string** and `limit` a **positive** integer — `keyword: null` or `limit: -1`
+/// make the `private-api` host return 500 (confirmed against the live endpoint and
+/// the Fineco web app's own request shape). No `type` filter is sent, so all
 /// movement types are returned.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MovementsApiRequest {
     pub date_from: String,
     pub date_to: String,
+    pub offset: i32,
+    pub limit: i32,
+    pub keyword: String,
 }
 
 /// Top-level response from the movements endpoint.
@@ -3411,6 +3416,9 @@ pub(crate) struct MovementsApiRequest {
 pub(crate) struct MovementsApiResponse {
     #[serde(default, rename = "movimenti")]
     pub movimenti: Vec<RawMovementItem>,
+    /// `true` on the final page of a date range; the worker pages until it sees it.
+    #[serde(default, rename = "lastPage")]
+    pub last_page: bool,
 }
 
 /// A single item as returned by Fineco (camelCase, all optional for resilience).

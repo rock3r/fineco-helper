@@ -738,17 +738,30 @@ impl TaxFetcher for FinecoWorker {
     }
 }
 
+/// Movements page size. The endpoint paginates; the worker pulls this many per
+/// request and walks pages until `lastPage`. Matches the Fineco web app's own
+/// page size (a value confirmed accepted by the live host).
+const MOVEMENTS_PAGE_SIZE: i32 = 15;
+
+/// Hard cap on movements pages per fetch — an infinite-loop guard, not a data
+/// limit. At [`MOVEMENTS_PAGE_SIZE`] this bounds one fetch to a generous number
+/// of movements; exceeding it within the 90-day window is treated as a fault and
+/// fails loudly rather than silently truncating.
+const MAX_MOVEMENTS_PAGES: u32 = 400;
+
 impl RawMovementsFetcher for FinecoWorker {
-    /// Fetch bank account movements for `date_from`..`date_to` (`YYYY-MM-DD`).
-    /// POSTs a date-only body (the Fineco web app's shape) and returns the full
-    /// result set in one call — the response carries `limitedResult: false`, so
-    /// no pagination is needed. No `type` filter means all movement types come
-    /// back. The controller caps the window at 90 days; beyond that Fineco
-    /// returns 451 "Sca di sessione non valida" (the PSD2 SCA boundary), which a
-    /// headless worker cannot satisfy.
+    /// Fetch ALL bank account movements for `date_from`..`date_to` (`YYYY-MM-DD`).
+    /// The endpoint is paginated, so the worker logs in once and then walks pages
+    /// (`offset` += [`MOVEMENTS_PAGE_SIZE`]) under that one session, accumulating
+    /// every page until the response's `lastPage` is set. No `type` filter is sent
+    /// (all movement types return). The controller caps the window at 90 days;
+    /// beyond that Fineco returns 451 "Sca di sessione non valida" (the PSD2 SCA
+    /// boundary), which a headless worker cannot satisfy.
     ///
     /// # Errors
-    /// Auth/upstream/internal envelopes on login, fetch, or parse failure.
+    /// Auth/upstream/internal envelopes on login, fetch, or parse failure; or
+    /// [`SafeError::internal`] if pagination exceeds [`MAX_MOVEMENTS_PAGES`] (fail
+    /// loud rather than return a silently-truncated history).
     fn fetch_raw_movements(
         &self,
         date_from: &str,
@@ -758,18 +771,37 @@ impl RawMovementsFetcher for FinecoWorker {
         validate_tax_range(date_from, date_to)?;
 
         let session = self.refresh_login()?;
-        let body = parse::MovementsApiRequest {
-            date_from: date_from.to_string(),
-            date_to: date_to.to_string(),
-        };
-        let response: parse::MovementsApiResponse = self.post_json_mapped(
-            &self.endpoints.movements,
-            &body,
-            &session.cookie,
-            MOVEMENTS_REFERER,
-            SafeError::from_upstream_status,
-        )?;
-        Ok(parse::to_raw_movements(response))
+        let mut all = Vec::new();
+        let mut offset: i32 = 0;
+        for _ in 0..MAX_MOVEMENTS_PAGES {
+            let body = parse::MovementsApiRequest {
+                date_from: date_from.to_string(),
+                date_to: date_to.to_string(),
+                offset,
+                limit: MOVEMENTS_PAGE_SIZE,
+                keyword: String::new(),
+            };
+            let response: parse::MovementsApiResponse = self.post_json_mapped(
+                &self.endpoints.movements,
+                &body,
+                &session.cookie,
+                MOVEMENTS_REFERER,
+                SafeError::from_upstream_status,
+            )?;
+            let last_page = response.last_page;
+            let page = parse::to_raw_movements(response);
+            let page_len = page.len();
+            all.extend(page);
+            // Stop on the final page; also stop defensively if a non-final page
+            // came back empty (a misbehaving upstream would otherwise loop).
+            if last_page || page_len == 0 {
+                return Ok(all);
+            }
+            offset = offset.saturating_add(MOVEMENTS_PAGE_SIZE);
+        }
+        // Ran past the page cap without a `lastPage`: fail loud rather than cache a
+        // partial history.
+        Err(SafeError::internal())
     }
 }
 
