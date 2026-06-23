@@ -98,6 +98,27 @@ fn auth_required_when_last_job_failed_auth_and_no_data() {
 }
 
 #[test]
+fn step_up_required_when_last_job_failed_step_up_and_no_data() {
+    let mut store = Store::open_in_memory().expect("open");
+    let id = store
+        .record_job_start("owner", "movements", "2026-01-01T00:00:00Z")
+        .expect("start");
+    store
+        .record_job_finish(
+            id,
+            "2026-01-01T00:00:05Z",
+            JobOutcome::Failed,
+            Some("step_up_required"),
+        )
+        .expect("finish");
+    let f = store
+        .freshness_for("movements", T_2026 + 100, 3600)
+        .expect("freshness");
+    assert_eq!(f.state, FreshnessState::StepUpRequired);
+    assert_eq!(f.captured_at, None);
+}
+
+#[test]
 fn refresh_failed_when_last_job_failed_other_and_no_data() {
     let mut store = Store::open_in_memory().expect("open");
     let id = store

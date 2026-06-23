@@ -118,6 +118,34 @@ impl SafeError {
         )
     }
 
+    /// Fineco demanded step-up (strong customer authentication) before serving a
+    /// login or a sensitive read. Distinct from [`SafeError::auth_required`]: a
+    /// re-login does not clear it — an owner-present approval (enrolled-device
+    /// push or an SMS code) is required, so an unattended op cannot complete.
+    /// Tier 1 only surfaces this; completing it is Tier 2.
+    #[must_use]
+    pub fn step_up_required() -> Self {
+        Self::new(
+            "step_up_required",
+            ErrorClass::Auth,
+            false,
+            "Fineco requires step-up authentication (strong customer authentication). An owner-present approval is needed; this request cannot complete unattended.",
+        )
+    }
+
+    /// Fineco demanded step-up on an authenticated market read (the market-path
+    /// sibling of [`SafeError::step_up_required`]). Not a 401-recovery trigger and
+    /// not retryable: re-login will not clear a session step-up.
+    #[must_use]
+    pub fn market_step_up_required() -> Self {
+        Self::new(
+            "market_step_up_required",
+            ErrorClass::Auth,
+            false,
+            "Fineco requires step-up authentication for this market read. An owner-present approval is needed; it cannot complete unattended.",
+        )
+    }
+
     /// An upstream request timed out; retryable.
     #[must_use]
     pub fn fineco_timeout() -> Self {

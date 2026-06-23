@@ -19,8 +19,8 @@ impl Store {
     ///
     /// Precedence: a running job → `Refreshing`; else usable cached data →
     /// `Fresh`/`Stale` by age; else the last refresh outcome → `AuthRequired`
-    /// (last job failed with `auth_required`) / `RefreshFailed` (any other
-    /// failure); else `Missing`.
+    /// (last job failed with `auth_required`) / `StepUpRequired` (failed with
+    /// `step_up_required`) / `RefreshFailed` (any other failure); else `Missing`.
     ///
     /// # Errors
     /// Returns an error if a query fails.
@@ -52,13 +52,14 @@ impl Store {
 
         // No cached data: reflect the last refresh attempt's outcome.
         let state = match self.latest_job_run(data_area)? {
-            Some(job) if job.status == "failed" => {
-                if job.safe_error_code.as_deref() == Some("auth_required") {
-                    FreshnessState::AuthRequired
-                } else {
-                    FreshnessState::RefreshFailed
-                }
-            }
+            Some(job) if job.status == "failed" => match job.safe_error_code.as_deref() {
+                Some("auth_required") => FreshnessState::AuthRequired,
+                // A read-time SCA step-up (e.g. movements >90d) is its own
+                // remediation state: distinct from auth_required because a
+                // re-login won't clear it (an owner-present approval is needed).
+                Some("step_up_required") => FreshnessState::StepUpRequired,
+                _ => FreshnessState::RefreshFailed,
+            },
             _ => FreshnessState::Missing,
         };
         Ok(DataAreaFreshness {

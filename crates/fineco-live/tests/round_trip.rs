@@ -615,6 +615,27 @@ fn a_retryable_worker_failure_keeps_its_code_and_retryable_bit() {
 }
 
 #[test]
+fn a_step_up_failure_keeps_its_code_across_the_socket() {
+    // A read-time SCA step-up at the worker must reach the controller as
+    // `step_up_required` (NOT collapse to `internal` through the DTO bridge) and
+    // stay non-retryable — re-login won't clear a session step-up.
+    let mut worker = FakeWorker::ok();
+    worker.orders = Err(SafeError::step_up_required());
+    let (client, path) = serve(worker);
+
+    let store = Store::open_in_memory().expect("open store");
+    let err = client
+        .fetch_orders(&store, "equity", 7)
+        .expect_err("a worker step-up must surface");
+    assert_eq!(err.code(), "step_up_required");
+    assert!(
+        !err.retryable(),
+        "step-up must not be retried (no automatic re-login)"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn an_auth_failure_is_not_retryable_across_the_socket() {
     let mut worker = FakeWorker::ok();
     worker.orders = Err(SafeError::auth_required());

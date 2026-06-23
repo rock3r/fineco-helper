@@ -661,6 +661,11 @@ impl TaxFetcher for LiveClient {
 fn safe_error_from_dto(dto: &SafeErrorDto) -> SafeError {
     match dto.code.as_str() {
         "auth_required" => SafeError::auth_required(),
+        // Tier 1 step-up: keep it distinct across the socket so the controller's
+        // freshness reporting and the client see the legible remediation state,
+        // not a generic `internal`. Non-retryable (re-login won't clear it).
+        "step_up_required" => SafeError::step_up_required(),
+        "market_step_up_required" => SafeError::market_step_up_required(),
         "fineco_timeout" => SafeError::fineco_timeout(),
         // The canonical retryable upstream error (the 5xx mapping). The circuit
         // breaker keys on this code; a rare non-retryable weird-status collapses

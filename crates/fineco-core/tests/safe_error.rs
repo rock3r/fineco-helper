@@ -74,6 +74,25 @@ fn named_constructors_are_stable() {
 }
 
 #[test]
+fn step_up_required_is_a_distinct_non_retryable_auth_error() {
+    // Tier 1: Fineco demands strong customer authentication. Distinct from
+    // auth_required (a re-login won't clear it), Auth class, never retried, and
+    // the message carries no payload.
+    let s = SafeError::step_up_required();
+    assert_eq!(s.code(), "step_up_required");
+    assert_eq!(s.class(), ErrorClass::Auth);
+    assert!(!s.retryable());
+    assert!(!s.safe_message().is_empty());
+    assert_ne!(s.code(), SafeError::auth_required().code());
+
+    let m = SafeError::market_step_up_required();
+    assert_eq!(m.code(), "market_step_up_required");
+    assert_eq!(m.class(), ErrorClass::Auth);
+    assert!(!m.retryable());
+    assert!(!m.safe_message().is_empty());
+}
+
+#[test]
 fn expected_isin_normalization_accepts_plain_and_dotted_suffixes() {
     assert_eq!(
         fineco_core::normalize_expected_isin("IE00B8GKDB10").expect("plain isin"),
