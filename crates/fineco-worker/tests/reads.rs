@@ -108,6 +108,28 @@ fn spawn_mock_fineco_search_only() -> String {
     format!("http://{addr}")
 }
 
+/// Like [`spawn_mock_fineco`], but the movements endpoint reports `limitedResult:
+/// true` (Fineco capped the statement) — so the worker must fail loud rather than
+/// cache a partial history.
+fn spawn_mock_fineco_limited_movements() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v2/private/accounts-and-cards/movements" {
+                return httptiny::Response::json(
+                    200,
+                    "{\"movimenti\":[{\"progressivoMovimento\":\"MOV-0\",\"importo\":1.0}],\
+                     \"lastPage\":true,\"limitedResult\":true,\"missingData\":[]}",
+                );
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
 fn worker_for(base: &str) -> FinecoWorker {
     FinecoWorker::new(
         FinecoEndpoints::for_base(base),
@@ -314,6 +336,18 @@ fn paginates_movements_until_last_page() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), 23, "every movement id is distinct across pages");
+}
+
+#[test]
+fn fails_loud_when_upstream_marks_result_limited() {
+    // `limitedResult: true` means Fineco capped/limited the statement; the worker
+    // must error rather than cache a partial history that would later read as
+    // complete via `movements_get_latest`.
+    let base = spawn_mock_fineco_limited_movements();
+    let err = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect_err("a limited/incomplete result must fail loud");
+    assert_eq!(err.code(), "internal");
 }
 
 #[test]

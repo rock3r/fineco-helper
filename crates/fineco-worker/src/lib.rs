@@ -790,12 +790,20 @@ impl RawMovementsFetcher for FinecoWorker {
                 SafeError::from_upstream_status,
             )?;
             let last_page = response.last_page;
+            // If Fineco signals an incomplete result (capped, or some source
+            // missing — e.g. an SCA-gated sub-account), fail loud rather than cache
+            // a partial statement that `movements_get_latest` would present as
+            // complete history.
+            let incomplete = response.limited_result || !response.missing_data.is_empty();
             // Use the RAW page size (before `to_raw_movements` filters id-less
             // items) for the defensive empty-page break — otherwise a page whose
             // items all lacked `progressivoMovimento` would look "empty" and stop
             // pagination, silently dropping later pages.
             let raw_page_len = response.movimenti.len();
             all.extend(parse::to_raw_movements(response));
+            if incomplete {
+                return Err(SafeError::internal());
+            }
             // Stop on the final page; also stop defensively if a non-final page
             // came back genuinely empty (a misbehaving upstream would otherwise loop).
             if last_page || raw_page_len == 0 {

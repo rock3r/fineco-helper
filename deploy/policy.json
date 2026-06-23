@@ -7,7 +7,8 @@
         "portfolio.cached.full_read",
         "portfolio.shareable.read",
         "orders.cached.read",
-        "tax.cached.read"
+        "tax.cached.read",
+        "movements.cached.read"
       ]
     }
   }

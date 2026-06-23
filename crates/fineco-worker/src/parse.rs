@@ -3419,6 +3419,14 @@ pub(crate) struct MovementsApiResponse {
     /// `true` on the final page of a date range; the worker pages until it sees it.
     #[serde(default, rename = "lastPage")]
     pub last_page: bool,
+    /// `true` when Fineco capped/limited the result set; the worker treats this as
+    /// an incomplete statement and fails loud rather than caching a partial one.
+    #[serde(default, rename = "limitedResult")]
+    pub limited_result: bool,
+    /// Non-empty when Fineco couldn't return some data (e.g. an SCA-gated source).
+    /// Elements are counted only (contents ignored) to detect an incomplete result.
+    #[serde(default, rename = "missingData")]
+    pub missing_data: Vec<serde::de::IgnoredAny>,
 }
 
 /// A single item as returned by Fineco (camelCase, all optional for resilience).
