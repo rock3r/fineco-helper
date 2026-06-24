@@ -146,6 +146,54 @@ impl SafeError {
         )
     }
 
+    /// A step-up code was not accepted but attempts remain; the owner can submit a
+    /// fresh code. Not *auto*-retryable (it needs new owner input), so the flag is
+    /// false; the distinct code signals the interactive resubmit. SCA Tier 2.
+    #[must_use]
+    pub fn step_up_retry() -> Self {
+        Self::new(
+            "step_up_retry",
+            ErrorClass::Auth,
+            false,
+            "The step-up code was not accepted; you can try again with a new code.",
+        )
+    }
+
+    /// The owner cancelled a pending step-up. A clean terminal (the original
+    /// operation is abandoned, not failed) — distinct from expired/locked. Tier 2.
+    #[must_use]
+    pub fn step_up_cancelled() -> Self {
+        Self::new(
+            "step_up_cancelled",
+            ErrorClass::Auth,
+            false,
+            "Step-up authentication was cancelled.",
+        )
+    }
+
+    /// Fineco locked the step-up after too many failed attempts; terminal. Tier 2.
+    #[must_use]
+    pub fn step_up_locked() -> Self {
+        Self::new(
+            "step_up_locked",
+            ErrorClass::Auth,
+            false,
+            "Step-up authentication is locked after too many attempts.",
+        )
+    }
+
+    /// The pending step-up challenge expired before it was completed; terminal,
+    /// the owner restarts the operation. SCA Tier 2.
+    #[must_use]
+    pub fn step_up_expired() -> Self {
+        Self::new(
+            "step_up_expired",
+            ErrorClass::Auth,
+            false,
+            "The step-up authentication request expired; start the operation again.",
+        )
+    }
+
     /// An upstream request timed out; retryable.
     #[must_use]
     pub fn fineco_timeout() -> Self {

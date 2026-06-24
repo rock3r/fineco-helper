@@ -666,6 +666,13 @@ fn safe_error_from_dto(dto: &SafeErrorDto) -> SafeError {
         // not a generic `internal`. Non-retryable (re-login won't clear it).
         "step_up_required" => SafeError::step_up_required(),
         "market_step_up_required" => SafeError::market_step_up_required(),
+        // SCA Tier 2 completion outcomes — keep them distinct across the socket so
+        // the model/CLI gets the right terminal/retry signal, not a generic
+        // `internal`. All non-retryable.
+        "step_up_retry" => SafeError::step_up_retry(),
+        "step_up_cancelled" => SafeError::step_up_cancelled(),
+        "step_up_locked" => SafeError::step_up_locked(),
+        "step_up_expired" => SafeError::step_up_expired(),
         "fineco_timeout" => SafeError::fineco_timeout(),
         // The canonical retryable upstream error (the 5xx mapping). The circuit
         // breaker keys on this code; a rare non-retryable weird-status collapses

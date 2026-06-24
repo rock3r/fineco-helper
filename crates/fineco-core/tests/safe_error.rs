@@ -93,6 +93,39 @@ fn step_up_required_is_a_distinct_non_retryable_auth_error() {
 }
 
 #[test]
+fn step_up_terminal_and_retry_codes_are_distinct_payload_free_auth_errors() {
+    // SCA Tier 2 completion outcomes (grounded in cuj-06's confirm statuses:
+    // wrongPin / expired / locked + an owner cancel). All Auth-class, all
+    // non-retryable (none is automatically retried — a wrong code needs fresh
+    // owner input; the rest are terminal), all payload-free.
+    for e in [
+        SafeError::step_up_retry(),
+        SafeError::step_up_cancelled(),
+        SafeError::step_up_locked(),
+        SafeError::step_up_expired(),
+    ] {
+        assert_eq!(e.class(), ErrorClass::Auth);
+        assert!(!e.retryable(), "{} must not be auto-retryable", e.code());
+        assert!(!e.safe_message().is_empty());
+    }
+    // Codes are stable and mutually distinct.
+    let codes = [
+        SafeError::step_up_retry().code().to_string(),
+        SafeError::step_up_cancelled().code().to_string(),
+        SafeError::step_up_locked().code().to_string(),
+        SafeError::step_up_expired().code().to_string(),
+    ];
+    assert_eq!(codes[0], "step_up_retry");
+    assert_eq!(codes[1], "step_up_cancelled");
+    assert_eq!(codes[2], "step_up_locked");
+    assert_eq!(codes[3], "step_up_expired");
+    let mut sorted = codes.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 4, "codes must be distinct");
+}
+
+#[test]
 fn expected_isin_normalization_accepts_plain_and_dotted_suffixes() {
     assert_eq!(
         fineco_core::normalize_expected_isin("IE00B8GKDB10").expect("plain isin"),
