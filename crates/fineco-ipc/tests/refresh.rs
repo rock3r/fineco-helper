@@ -135,9 +135,7 @@ fn out_of_bounds_refresh_params_are_rejected() {
         )
         .is_err()
     );
-    // an overlong (but alphanumeric) instrument kind: the cached IPC path caps
-    // client strings at 256, and the live path must too (else a multi-MB kind
-    // flows into the Fineco URL + frame allocations).
+    // an overlong (but alphanumeric) instrument kind.
     let overlong = "a".repeat(257);
     assert!(
         RefreshRequest::from_json(&format!(
@@ -145,14 +143,26 @@ fn out_of_bounds_refresh_params_are_rejected() {
         ))
         .is_err()
     );
-    // exactly the 256-char cap is allowed.
-    let at_cap = "a".repeat(256);
-    assert!(
-        RefreshRequest::from_json(&format!(
-            r#"{{"command":"orders_refresh_live","params":{{"instrument_kind":"{at_cap}","days":1}}}}"#
-        ))
-        .is_ok()
-    );
+    // A syntactically safe but unsupported monitor family must not reach Fineco.
+    for unsupported in [
+        "etf",
+        "bond",
+        "fund",
+        "certificate",
+        "funddecumulus",
+        "leverage",
+        "forex",
+        "cfd",
+        "future",
+    ] {
+        assert!(
+            RefreshRequest::from_json(&format!(
+                r#"{{"command":"orders_refresh_live","params":{{"instrument_kind":"{unsupported}","days":1}}}}"#
+            ))
+            .is_err(),
+            "{unsupported}"
+        );
+    }
     // an inverted / malformed tax range.
     assert!(
         RefreshRequest::from_json(
@@ -184,6 +194,19 @@ fn out_of_bounds_refresh_params_are_rejected() {
         RefreshRequest::from_json(r#"{"command":"movements_refresh_live","params":{"days":90}}"#)
             .is_ok()
     );
+}
+
+#[test]
+fn orders_refresh_accepts_only_transaction_monitor_kinds() {
+    for supported in ["equity", "fundpac"] {
+        assert!(
+            RefreshRequest::from_json(&format!(
+                r#"{{"command":"orders_refresh_live","params":{{"instrument_kind":"{supported}","days":0}}}}"#
+            ))
+            .is_ok(),
+            "{supported}"
+        );
+    }
 }
 
 #[test]

@@ -400,6 +400,14 @@ fn rejects_non_alphanumeric_instrument_kind() {
 }
 
 #[test]
+fn rejects_unsupported_order_monitor_kind() {
+    let err = worker_offline()
+        .fetch_raw_orders("etf", 0)
+        .expect_err("unsupported order monitor kind must be rejected before network");
+    assert_eq!(err.code(), "invalid_request");
+}
+
+#[test]
 fn paginates_movements_until_last_page() {
     // The mock serves 23 synthetic movements 15 per page; the worker must page by
     // offset until `lastPage` and accumulate ALL of them — never just the first

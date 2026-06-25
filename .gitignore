@@ -29,6 +29,7 @@ enrichment-reports/
 *.log
 
 .plans/
+.docs/
 
 # Cloudflare Access spike: the filled-in real-account config holds the
 # Tunnel connector token + service-token secret. Only the *.example template is

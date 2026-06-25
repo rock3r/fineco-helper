@@ -185,7 +185,9 @@ Product (`crates/`):
   and (M8+) the controller protocols: **refresh-control** for live refresh and
   **market-control** for authenticated Fineco market reads. `RefreshRequest`
   (command-enum, `deny_unknown_fields`, no forbidden field; bounds reuse
-  `validate_order_request`/`validate_tax_range`), `RefreshOutcome` (op/snapshot
+  `validate_order_request`/`validate_tax_range`; order refresh accepts only
+  transaction-monitor kinds that the `/tol/transactions` endpoint serves),
+  `RefreshOutcome` (op/snapshot
   **status only** — a row count, never a value), `serve_refresh_blocking`/
   `RefreshClient`, and the three `*.live.refresh` capabilities (owner-only; audit
   data class `credentialed_live`) cover refresh.

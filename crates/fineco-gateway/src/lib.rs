@@ -449,7 +449,7 @@ impl Gateway {
 
     #[tool(
         name = "private_orders_refresh_live_sensitive",
-        description = "HIGH-SENSITIVITY, owner-only: trigger a LIVE Fineco refresh of the order monitor for `instrument_kind` over the last `days` days (max 30). Logs in to Fineco; rate-limited. Returns operation/snapshot status only — read values via the cached orders tool afterward."
+        description = "HIGH-SENSITIVITY, owner-only: trigger a LIVE Fineco refresh of the order monitor for `instrument_kind` (`equity` or `fundpac`) over the last `days` days (max 30). Logs in to Fineco; rate-limited. Returns operation/snapshot status only — read values via the cached orders tool afterward."
     )]
     pub async fn private_orders_refresh_live_sensitive(
         &self,

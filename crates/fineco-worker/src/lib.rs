@@ -694,7 +694,7 @@ impl RawOrdersFetcher for FinecoWorker {
     ///
     /// # Errors
     /// - [`SafeError::invalid_request`] if `days` exceeds the cap or
-    ///   `instrument_kind` is not alphanumeric.
+    ///   `instrument_kind` is not one of the supported transaction monitor kinds.
     /// - Auth/upstream/internal envelopes on login, fetch, or parse failure.
     fn fetch_raw_orders(
         &self,

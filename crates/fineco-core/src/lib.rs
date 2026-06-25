@@ -492,12 +492,10 @@ pub const MAX_ORDER_DAYS: u32 = 30;
 /// Confirmed live (2026-06-23): a 90-day window returns 200; a 1-year window 451.
 pub const MAX_MOVEMENTS_DAYS: u32 = 90;
 
-/// Maximum length of a live-order `instrument_kind`. The cached snapshot-query IPC
-/// path caps every client string at 256 chars; the live-refresh path validates
-/// only through [`validate_order_request`], so it must bound the kind too — else a
-/// multi-megabyte (still-alphanumeric) value would pass, be serialized across the
-/// refresh/live sockets, and be interpolated into the worker-built Fineco URL.
-pub const MAX_INSTRUMENT_KIND_LEN: usize = 256;
+/// Order-monitor `transactions` endpoint kinds confirmed by the owner's browser
+/// HAR. Other monitor tabs use different endpoints or returned 404 for the
+/// transaction fetch, so this live-refresh tool must reject them before Fineco.
+pub const ORDER_TRANSACTION_KINDS: &[&str] = &["equity", "fundpac"];
 
 /// Validate an order-monitor refresh request's bounded parameters. Enforced by
 /// the controller **before** acquiring the refresh lock — so an invalid request
@@ -506,17 +504,14 @@ pub const MAX_INSTRUMENT_KIND_LEN: usize = 256;
 ///
 /// # Errors
 /// [`SafeError::invalid_request`] if `days` exceeds the cap or `instrument_kind`
-/// is empty, longer than [`MAX_INSTRUMENT_KIND_LEN`], or not ASCII-alphanumeric.
+/// is not one of [`ORDER_TRANSACTION_KINDS`].
 pub fn validate_order_request(instrument_kind: &str, days: u32) -> Result<(), SafeError> {
     if days > MAX_ORDER_DAYS {
         return Err(SafeError::invalid_request("days must be <= 30."));
     }
-    if instrument_kind.is_empty()
-        || instrument_kind.chars().count() > MAX_INSTRUMENT_KIND_LEN
-        || !instrument_kind.chars().all(|c| c.is_ascii_alphanumeric())
-    {
+    if !ORDER_TRANSACTION_KINDS.contains(&instrument_kind) {
         return Err(SafeError::invalid_request(
-            "instrument type must be 1-256 alphanumeric characters.",
+            "instrument type must be one of: equity, fundpac.",
         ));
     }
     Ok(())

@@ -1156,7 +1156,7 @@ mod tests {
             &mut store,
             &fetcher,
             "owner",
-            "shares",
+            "equity",
             7,
             "2026-01-01T00:00:00Z",
         )
@@ -1176,7 +1176,7 @@ mod tests {
             &mut store,
             &fetcher,
             "owner",
-            "shares",
+            "equity",
             7,
             "2026-01-01T00:00:00Z",
         )
@@ -1198,7 +1198,7 @@ mod tests {
             &mut store,
             &fetcher,
             "owner",
-            "shares",
+            "equity",
             7,
             "2026-01-01T00:01:00Z",
         )
