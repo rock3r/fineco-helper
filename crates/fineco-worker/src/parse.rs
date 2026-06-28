@@ -21,7 +21,7 @@ use fineco_ipc::{
 use fineco_store::{
     NewAsset, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward, NewTaxMinusByYear, RawOrder,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 
 /// Provenance label stamped on snapshots fetched by this worker.
@@ -3435,10 +3435,33 @@ pub(crate) struct MovementsApiResponse {
     pub balance_at_movement: Option<f64>,
     #[serde(default, rename = "balanceAccountAtSearchDate")]
     pub balance_at_search_date: Option<f64>,
-    #[serde(default, rename = "currentMonthCreditSpending")]
+    #[serde(
+        default,
+        rename = "currentMonthCreditSpending",
+        deserialize_with = "optional_amount_or_wrapped_amount"
+    )]
     pub current_month_credit_spending: Option<f64>,
-    #[serde(default, rename = "currentMonthDebtSpending")]
+    #[serde(
+        default,
+        rename = "currentMonthDebtSpending",
+        deserialize_with = "optional_amount_or_wrapped_amount"
+    )]
     pub current_month_debit_spending: Option<f64>,
+}
+
+fn optional_amount_or_wrapped_amount<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(number)) => number.as_f64(),
+        Some(serde_json::Value::Object(object)) => object
+            .values()
+            .find_map(|value| value.as_f64().filter(|amount| amount.is_finite())),
+        Some(_) => None,
+    })
 }
 
 /// A single item as returned by Fineco (camelCase, all optional for resilience).
@@ -3599,6 +3622,22 @@ mod tests {
         assert_eq!(s.balance_at_search_date, Some(1200.0));
         assert_eq!(s.current_month_credit_spending, Some(500.0));
         assert_eq!(s.current_month_debit_spending, Some(-321.0));
+    }
+
+    #[test]
+    fn movements_parse_accepts_wrapped_monthly_spending_values() {
+        // The live web response can wrap current-month spending in an object with
+        // an opaque key; an empty object means the amount is absent.
+        let json = r#"{
+            "movimenti": [],
+            "lastPage": true,
+            "currentMonthCreditSpending": { "opaque-key": 500.0 },
+            "currentMonthDebtSpending": {}
+        }"#;
+        let resp: MovementsApiResponse = serde_json::from_str(json).expect("parse");
+        let s = to_movements_summary(&resp);
+        assert_eq!(s.current_month_credit_spending, Some(500.0));
+        assert_eq!(s.current_month_debit_spending, None);
     }
 
     #[test]
