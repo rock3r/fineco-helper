@@ -1529,14 +1529,8 @@ impl fineco_refresh::RawMovementsFetcher for FakeLiveWorker {
         &self,
         _date_from: &str,
         _date_to: &str,
-    ) -> Result<
-        (
-            Vec<fineco_store::RawMovement>,
-            fineco_store::MovementsSummary,
-        ),
-        fineco_core::SafeError,
-    > {
-        Ok((vec![], fineco_store::MovementsSummary::default()))
+    ) -> Result<fineco_store::RawMovementsBundle, fineco_core::SafeError> {
+        Ok(fineco_store::RawMovementsBundle::default())
     }
 }
 

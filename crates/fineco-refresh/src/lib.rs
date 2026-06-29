@@ -10,8 +10,8 @@ use fineco_core::{
     validate_tax_range,
 };
 use fineco_store::{
-    JobOutcome, MovementsSummary, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward,
-    NewTaxMinusByYear, RawMovement, RawOrder, Store,
+    JobOutcome, MoneyMapCategory, MovementsSummary, NewMovement, NewOrder, NewPortfolioSnapshot,
+    NewTaxCarryForward, NewTaxMinusByYear, RawMovementsBundle, RawOrder, Store,
 };
 
 /// A running refresh older than this is presumed dead (e.g. its finish write
@@ -275,40 +275,54 @@ pub fn refresh_tax(
     }
 }
 
+/// Store-ready output of a controller-side movements fetch: hashed movements, the
+/// per-capture account summary, and the (best-effort, un-hashed) MoneyMap taxonomy
+/// captured in the same refresh. `categories` is `None` when the best-effort
+/// taxonomy fetch failed (leave the cached taxonomy untouched); `Some` replaces it.
+#[derive(Debug, Clone, Default)]
+pub struct MovementsCapture {
+    pub movements: Vec<NewMovement>,
+    pub summary: MovementsSummary,
+    pub categories: Option<Vec<MoneyMapCategory>>,
+}
+
 /// Source of fresh movements data, **controller-side**: yields store-ready
-/// [`NewMovement`]s, takes `store` for HMAC-hashing the raw movement ids.
-/// The fineco-live `LiveClient` implements this; fakes implement it in tests.
+/// [`NewMovement`]s (HMAC-hashed ids) plus the taxonomy, taking `store` to hash
+/// the raw movement ids. The fineco-live `LiveClient` implements this; fakes
+/// implement it in tests.
 pub trait MovementsFetcher {
     /// Fetch bank account movements for the last `days` days (`date_from` to
-    /// `date_to`, YYYY-MM-DD), mapped to store-ready [`NewMovement`]s plus the
-    /// per-capture account [`MovementsSummary`] read from the response envelope.
+    /// `date_to`, YYYY-MM-DD), mapped to store-ready [`NewMovement`]s, plus the
+    /// per-capture account [`MovementsSummary`] from the response envelope and the
+    /// MoneyMap taxonomy (best-effort; `None` when its fetch failed).
     ///
     /// # Errors
-    /// Returns a [`SafeError`] if the fetch fails (e.g. auth/timeout).
+    /// Returns a [`SafeError`] if the movements fetch fails (e.g. auth/timeout).
     fn fetch_movements(
         &self,
         store: &Store,
         date_from: &str,
         date_to: &str,
-    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError>;
+    ) -> Result<MovementsCapture, SafeError>;
 }
 
-/// Source of fresh movements data, **worker-side**: yields un-hashed
-/// [`RawMovement`]s with no DB key. The controller hashes them via
-/// [`fineco_store::Store::hash_raw_movement`].
+/// Source of fresh movements data, **worker-side**: yields a [`RawMovementsBundle`]
+/// (un-hashed movements + taxonomy) with no DB key. The controller hashes the
+/// movements via [`fineco_store::Store::hash_raw_movement`]; taxonomy names are
+/// not hashed.
 pub trait RawMovementsFetcher {
     /// Fetch bank account movements for the `date_from`..`date_to` date range
-    /// (`YYYY-MM-DD`), parsed to [`RawMovement`]s (raw ids, never hashed) plus the
-    /// per-capture account [`MovementsSummary`] from the response envelope (read from
-    /// the first page).
+    /// (`YYYY-MM-DD`), parsed to raw (never-hashed) movements, plus the per-capture
+    /// account [`MovementsSummary`] from the response envelope (first page) and the
+    /// best-effort MoneyMap taxonomy, all as a [`RawMovementsBundle`].
     ///
     /// # Errors
-    /// Returns a [`SafeError`] if the fetch fails.
+    /// Returns a [`SafeError`] if the movements fetch fails.
     fn fetch_raw_movements(
         &self,
         date_from: &str,
         date_to: &str,
-    ) -> Result<(Vec<RawMovement>, MovementsSummary), SafeError>;
+    ) -> Result<RawMovementsBundle, SafeError>;
 }
 
 /// Run a local movements refresh: acquire the per-area lock, record a job, fetch,
@@ -340,17 +354,27 @@ pub fn refresh_movements(
     };
 
     match fetcher.fetch_movements(store, date_from, date_to) {
-        Ok((movements, summary)) => {
+        Ok(capture) => {
             // An all-None summary means the fetch carried no account-level fields;
             // don't persist a row for it, so `movements_get_latest` omits
             // `account_summary` rather than emitting an empty object.
-            let summary_ref = (!summary.is_empty()).then_some(&summary);
-            match store.capture_movements(now_iso, &movements, summary_ref) {
+            let summary_ref = (!capture.summary.is_empty()).then_some(&capture.summary);
+            match store.capture_movements(now_iso, &capture.movements, summary_ref) {
                 Ok(()) => {
+                    // The MoneyMap taxonomy is resolved best-effort. Only capture it
+                    // when the worker actually fetched it (`Some`): a failed taxonomy
+                    // fetch yields `None` and must leave the previously-cached
+                    // taxonomy intact rather than wipe resolved names. A capture
+                    // write error here (near-impossible — the movements capture above
+                    // just succeeded on the same store) is swallowed so it can't fail
+                    // an otherwise-good refresh; the movements are already durable.
+                    if let Some(categories) = &capture.categories {
+                        let _ = store.capture_categories(now_iso, categories);
+                    }
                     store
                         .record_job_finish(job_id, now_iso, JobOutcome::Completed, None)
                         .map_err(|_| SafeError::internal())?;
-                    Ok(movements.len())
+                    Ok(capture.movements.len())
                 }
                 Err(_) => {
                     let _ = store.record_job_finish(
@@ -637,7 +661,7 @@ impl<F: MovementsFetcher + ?Sized> MovementsFetcher for Retrying<'_, F> {
         store: &Store,
         date_from: &str,
         date_to: &str,
-    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
+    ) -> Result<MovementsCapture, SafeError> {
         with_retry(&self.policy, || {
             self.inner.fetch_movements(store, date_from, date_to)
         })
@@ -647,14 +671,14 @@ impl<F: MovementsFetcher + ?Sized> MovementsFetcher for Retrying<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MovementsFetcher, OrdersFetcher, PortfolioFetcher, RefreshLimits, RetryPolicy, Retrying,
-        TaxFetcher, refresh_movements, refresh_orders, refresh_portfolio, refresh_preflight,
-        refresh_tax, with_retry,
+        MovementsCapture, MovementsFetcher, OrdersFetcher, PortfolioFetcher, RefreshLimits,
+        RetryPolicy, Retrying, TaxFetcher, refresh_movements, refresh_orders, refresh_portfolio,
+        refresh_preflight, refresh_tax, with_retry,
     };
     use fineco_core::SafeError;
     use fineco_store::{
-        JobOutcome, MovementsSummary, NewMovement, NewOrder, NewPortfolioSnapshot,
-        NewTaxCarryForward, NewTaxMinusByYear, Store,
+        JobOutcome, MoneyMapCategory, MovementsSummary, NewMovement, NewOrder,
+        NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, Store,
     };
     use std::cell::Cell;
 
@@ -1312,8 +1336,42 @@ mod tests {
             _store: &Store,
             _date_from: &str,
             _date_to: &str,
-        ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
-            self.0.clone()
+        ) -> Result<MovementsCapture, SafeError> {
+            self.0.clone().map(|(movements, summary)| MovementsCapture {
+                movements,
+                summary,
+                categories: None,
+            })
+        }
+    }
+
+    /// A movements fetcher that also returns a MoneyMap taxonomy (or `None` to
+    /// model a failed best-effort taxonomy fetch), to exercise category capture.
+    struct FakeMovementsWithCategories {
+        movements: Vec<NewMovement>,
+        categories: Option<Vec<MoneyMapCategory>>,
+    }
+    impl MovementsFetcher for FakeMovementsWithCategories {
+        fn fetch_movements(
+            &self,
+            _store: &Store,
+            _date_from: &str,
+            _date_to: &str,
+        ) -> Result<MovementsCapture, SafeError> {
+            Ok(MovementsCapture {
+                movements: self.movements.clone(),
+                summary: MovementsSummary::default(),
+                categories: self.categories.clone(),
+            })
+        }
+    }
+
+    fn a_category() -> MoneyMapCategory {
+        MoneyMapCategory {
+            category_id: "12".to_string(),
+            subcategory_id: None,
+            name: Some("Shopping".to_string()),
+            flag_spesa_ricavo: Some("S".to_string()),
         }
     }
 
@@ -1434,6 +1492,87 @@ mod tests {
         assert_eq!(err.code(), "invalid_request");
         // No job row created — the cap is a pre-lock gate.
         assert!(store.latest_job_run("movements").expect("q").is_none());
+    }
+
+    #[test]
+    fn movements_refresh_captures_the_taxonomy_alongside_movements() {
+        let mut store = Store::open_in_memory().expect("open");
+        let fetcher = FakeMovementsWithCategories {
+            movements: vec![a_movement()],
+            categories: Some(vec![a_category()]),
+        };
+        let count = refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            30,
+            "2025-12-02",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("refresh");
+        assert_eq!(count, 1);
+        // The taxonomy was captured and now resolves the movement's category id.
+        let lookup = store.latest_categories().expect("lookup");
+        assert_eq!(lookup.category_name("12"), Some("Shopping"));
+    }
+
+    #[test]
+    fn movements_refresh_keeps_prior_taxonomy_when_fetch_returns_none() {
+        // A prior refresh cached a taxonomy; a later refresh whose best-effort
+        // taxonomy fetch FAILED (categories: None) must leave it intact rather than
+        // wipe the resolved names. The movements refresh still completes.
+        let mut store = Store::open_in_memory().expect("open");
+        store
+            .capture_categories("2025-12-31T00:00:00Z", &[a_category()])
+            .expect("seed taxonomy");
+
+        let fetcher = FakeMovementsWithCategories {
+            movements: vec![a_movement()],
+            categories: None,
+        };
+        refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            30,
+            "2025-12-02",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("refresh");
+
+        let job = store.latest_job_run("movements").expect("q").expect("job");
+        assert_eq!(job.status, "completed");
+        // Names still resolve from the previously-cached taxonomy.
+        let lookup = store.latest_categories().expect("lookup");
+        assert_eq!(lookup.category_name("12"), Some("Shopping"));
+    }
+
+    #[test]
+    fn movements_refresh_empty_taxonomy_supersedes_when_fetched() {
+        // A successfully-fetched but empty taxonomy (`Some([])`) legitimately
+        // clears the cache (distinct from a failed fetch, which is `None`).
+        let mut store = Store::open_in_memory().expect("open");
+        store
+            .capture_categories("2025-12-31T00:00:00Z", &[a_category()])
+            .expect("seed taxonomy");
+        let fetcher = FakeMovementsWithCategories {
+            movements: vec![a_movement()],
+            categories: Some(vec![]),
+        };
+        refresh_movements(
+            &mut store,
+            &fetcher,
+            "owner",
+            30,
+            "2025-12-02",
+            "2026-01-01",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("refresh");
+        let lookup = store.latest_categories().expect("lookup");
+        assert_eq!(lookup.category_name("12"), None);
     }
 
     #[test]

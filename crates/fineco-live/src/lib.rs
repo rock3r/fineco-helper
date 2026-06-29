@@ -39,12 +39,12 @@ use fineco_ipc::{
     MarketIndicesParams, MarketLiveError, MarketSearchLiveResult, MarketSearchParams, SafeErrorDto,
 };
 use fineco_refresh::{
-    MovementsFetcher, OrdersFetcher, PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher,
-    TaxFetcher,
+    MovementsCapture, MovementsFetcher, OrdersFetcher, PortfolioFetcher, RawMovementsFetcher,
+    RawOrdersFetcher, TaxFetcher,
 };
 use fineco_store::{
-    MovementsSummary, NewMovement, NewOrder, NewPortfolioSnapshot, NewTaxCarryForward,
-    NewTaxMinusByYear, RawMovement, RawOrder, Store,
+    NewOrder, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear, RawMovementsBundle,
+    RawOrder, Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -182,10 +182,7 @@ pub enum LiveResponse {
     MarketSearch(MarketSearchLiveResult),
     MarketAssetDetails(Box<MarketAssetDetailsLiveResult>),
     MarketIndices(MarketIndicesLiveResult),
-    Movements {
-        movements: Vec<RawMovement>,
-        summary: MovementsSummary,
-    },
+    Movements(RawMovementsBundle),
 }
 
 /// The worker's reply: a typed result or the safe error envelope. Every worker
@@ -302,7 +299,7 @@ where
         LiveRequest::Movements(p) => fetcher
             .fetch_raw_movements(&p.date_from, &p.date_to)
             .map_err(LiveError::from)
-            .map(|(movements, summary)| LiveResponse::Movements { movements, summary }),
+            .map(LiveResponse::Movements),
     }
 }
 
@@ -589,7 +586,7 @@ impl RawMovementsFetcher for LiveClient {
         &self,
         date_from: &str,
         date_to: &str,
-    ) -> Result<(Vec<RawMovement>, MovementsSummary), SafeError> {
+    ) -> Result<RawMovementsBundle, SafeError> {
         match self
             .call(&LiveRequest::Movements(LiveMovementsParams {
                 date_from: date_from.to_string(),
@@ -597,7 +594,7 @@ impl RawMovementsFetcher for LiveClient {
             }))
             .map_err(LiveCallError::into_safe_error)?
         {
-            LiveResponse::Movements { movements, summary } => Ok((movements, summary)),
+            LiveResponse::Movements(bundle) => Ok(bundle),
             _ => Err(SafeError::internal()),
         }
     }
@@ -609,17 +606,24 @@ impl MovementsFetcher for LiveClient {
         store: &Store,
         date_from: &str,
         date_to: &str,
-    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
-        let (raw, summary) = self.fetch_raw_movements(date_from, date_to)?;
-        let hashed = raw
+    ) -> Result<MovementsCapture, SafeError> {
+        let bundle = self.fetch_raw_movements(date_from, date_to)?;
+        // Hash the movement ids controller-side (the worker holds no DB key); the
+        // account summary + taxonomy carry no ids to hash and pass through unchanged.
+        let movements = bundle
+            .movements
             .iter()
             .map(|r| {
                 store
                     .hash_raw_movement(r)
                     .map_err(|_| SafeError::internal())
             })
-            .collect::<Result<Vec<NewMovement>, SafeError>>()?;
-        Ok((hashed, summary))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MovementsCapture {
+            movements,
+            summary: bundle.summary,
+            categories: bundle.categories,
+        })
     }
 }
 

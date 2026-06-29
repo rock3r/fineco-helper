@@ -20,12 +20,12 @@ use fineco_ipc::{
 };
 use fineco_live::{LiveClient, MarketSearchLiveFetcher, serve_live_blocking};
 use fineco_refresh::{
-    MovementsFetcher, OrdersFetcher, PortfolioFetcher, RawMovementsFetcher, RawOrdersFetcher,
-    TaxFetcher,
+    MovementsCapture, MovementsFetcher, OrdersFetcher, PortfolioFetcher, RawMovementsFetcher,
+    RawOrdersFetcher, TaxFetcher,
 };
 use fineco_store::{
-    MovementsSummary, NewAsset, NewMovement, NewPortfolioSnapshot, NewTaxCarryForward,
-    NewTaxMinusByYear, RawMovement, RawOrder, Store,
+    MovementsSummary, NewAsset, NewPortfolioSnapshot, NewTaxCarryForward, NewTaxMinusByYear,
+    RawMovementsBundle, RawOrder, Store,
 };
 
 use fineco_core::SafeError;
@@ -203,8 +203,12 @@ impl RawMovementsFetcher for FakeWorker {
         &self,
         _date_from: &str,
         _date_to: &str,
-    ) -> Result<(Vec<RawMovement>, MovementsSummary), SafeError> {
-        Ok((vec![], fake_movements_summary()))
+    ) -> Result<RawMovementsBundle, SafeError> {
+        Ok(RawMovementsBundle {
+            movements: vec![],
+            summary: fake_movements_summary(),
+            categories: None,
+        })
     }
 }
 
@@ -214,17 +218,22 @@ impl MovementsFetcher for FakeWorker {
         store: &Store,
         date_from: &str,
         date_to: &str,
-    ) -> Result<(Vec<NewMovement>, MovementsSummary), SafeError> {
-        let (raw, summary) = self.fetch_raw_movements(date_from, date_to)?;
-        let hashed = raw
+    ) -> Result<MovementsCapture, SafeError> {
+        let bundle = self.fetch_raw_movements(date_from, date_to)?;
+        let movements = bundle
+            .movements
             .iter()
             .map(|r| {
                 store
                     .hash_raw_movement(r)
                     .map_err(|_| SafeError::internal())
             })
-            .collect::<Result<Vec<NewMovement>, SafeError>>()?;
-        Ok((hashed, summary))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MovementsCapture {
+            movements,
+            summary: bundle.summary,
+            categories: bundle.categories,
+        })
     }
 }
 
@@ -420,13 +429,13 @@ fn orders_cross_raw_and_are_hashed_controller_side() {
 fn movements_account_summary_survives_the_socket_round_trip() {
     let (client, path) = serve(FakeWorker::ok());
     let store = Store::open_in_memory().expect("open store");
-    let (movements, summary) = client
+    let capture = client
         .fetch_movements(&store, "2026-03-25", "2026-06-23")
         .expect("movements fetch");
     // The fake returns no rows but a populated account summary; the four envelope
     // fields must cross the socket intact (not silently dropped or zeroed).
-    assert!(movements.is_empty());
-    assert_eq!(summary, fake_movements_summary());
+    assert!(capture.movements.is_empty());
+    assert_eq!(capture.summary, fake_movements_summary());
     let _ = std::fs::remove_file(&path);
 }
 

@@ -242,6 +242,52 @@ fn tax_minus_returns_synthetic_shape() {
     assert!(r.body.contains("\"expirationDate\""));
 }
 
+/// An authenticated private POST (session cookie + account selector + Referer).
+fn post_authed(path: &str, body: &str) -> Response {
+    route(&Request {
+        method: "POST".to_string(),
+        path: path.to_string(),
+        headers: vec![
+            ("Cookie".to_string(), SESSION_COOKIE.to_string()),
+            ("X-Account-Index".to_string(), "0".to_string()),
+            (
+                "Referer".to_string(),
+                "https://finecobank.com/pvt/banking".to_string(),
+            ),
+        ],
+        body: body.to_string(),
+    })
+}
+
+const MONEYMAP_PATH: &str = "/conto-e-carte/bilancio-familiare/widget-home/preload-data";
+
+#[test]
+fn moneymap_categories_returns_synthetic_taxonomy() {
+    // The web MoneyMap taxonomy endpoint: a private POST (empty `{}` body) gated
+    // behind the session cookie, returning a map keyed by category id with the
+    // snake_case shape the worker flattens.
+    let r = post_authed(MONEYMAP_PATH, "{}");
+    assert_eq!(r.status, 200);
+    assert!(r.content_type.starts_with("application/json"));
+    assert!(r.body.contains("\"id_categoria\""));
+    assert!(r.body.contains("\"categoria\""));
+    assert!(r.body.contains("\"sottocategorie\""));
+    assert!(r.body.contains("\"id_sottocategoria\""));
+    assert!(r.body.contains("\"sottocategoria\""));
+}
+
+#[test]
+fn moneymap_categories_requires_the_session_cookie() {
+    // Like every other private read, it 401s without the session cookie.
+    let r = route(&Request {
+        method: "POST".to_string(),
+        path: MONEYMAP_PATH.to_string(),
+        headers: Vec::new(),
+        body: "{}".to_string(),
+    });
+    assert_eq!(r.status, 401);
+}
+
 #[test]
 fn zero_commission_etfs_is_a_public_list() {
     // The public ETF list needs no session cookie.

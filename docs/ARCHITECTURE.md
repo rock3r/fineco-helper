@@ -468,11 +468,14 @@ handle.
   `tax_carry_forward`, `tax_minus_by_year`) plus `store_meta` (schema v3,
   `src/schema_v3.sql`) holding the per-DB HMAC key, plus `data_captures` (schema
   v4) — a per-area `(data_area, captured_at)` capture marker — plus `movements`
-  (schema v5) and `movements_summary` (schema v6): bank-account movement lines
-  keyed by `(captured_at, movement_id_hash)`, and one per-capture account summary
-  row keyed by `captured_at` (balances + current-month spending, all nullable).
-  Column types/keys are chosen here (the plan lists columns): timestamps ISO-8601
-  UTC `TEXT`, values `REAL`, hashed ids stored as the hash `TEXT` only.
+  (schema v5), `movements_summary` (schema v6), and `moneymap_categories`
+  (schema v7): bank-account movement lines keyed by `(captured_at,
+  movement_id_hash)`; one per-capture account summary row keyed by `captured_at`
+  (balances + current-month spending, all nullable); and the cached MoneyMap
+  taxonomy (`category_id`, `''`-sentinel `subcategory_id`, `name`,
+  `flag_spesa_ricavo`) that resolves movements' raw category ids to names. Column
+  types/keys are chosen here (the plan lists columns): timestamps ISO-8601 UTC
+  `TEXT`, values `REAL`, hashed ids stored as the hash `TEXT` only.
 - **Empty-capture observability.** Orders/tax are flat tables keyed by
   `captured_at`, so a legitimately empty capture (no open orders, no carried
   losses) inserts no data row. `data_captures` records one marker per capture, so
@@ -487,10 +490,25 @@ handle.
   raw SQL. Reports come in **full** (owner-only, absolute values) and
   **shareable** (`ShareableRow` — structurally only names/symbols/ISINs, weights,
   percentage performance), with leakage tests (see [TESTING.md](TESTING.md)).
-- **Capture** covers portfolio (M1) plus **orders and tax** (M3). The store
-  stores whatever hash string it is given; the worker computes ids via the
-  store's HMAC hasher. **`trans_id_hash`** = `HMAC-SHA256(per-DB key, transId)`
+- **Capture** covers portfolio (M1) plus **orders and tax** (M3), **bank account
+  movements**, and the **MoneyMap taxonomy**. The store stores whatever hash string
+  it is given; the worker computes ids via the store's HMAC hasher.
+  **`trans_id_hash`** / **`movement_id_hash`** = `HMAC-SHA256(per-DB key, id)`
   (`Store::hash_id`, schema v3 `store_meta` holds a per-DB random key — joins,
   not confidentiality; DB-at-rest encryption is the confidentiality control).
   Positions keep an unhashed `(instr_id, venue_system)` asset key, so
   `position_key_hash` stays unused/`None` pending a multi-lot revisit.
+- **MoneyMap taxonomy (piggyback).** A movements refresh fetches the account's
+  category taxonomy **in the same worker login session, best-effort**: its failure
+  yields no taxonomy (`None`) so the previously-cached one is left intact and the
+  movements refresh still succeeds. The source is the web front door —
+  `POST conto-e-carte/bilancio-familiare/widget-home/preload-data` (empty `{}`
+  body) on the already-allowlisted `finecobank.com` host (so **no new egress
+  target**), returning a map keyed by category id (the same ids movements carry as
+  `bfCategoria`/`bfSottocategoria`); note this differs from the mobile APK's
+  `evl.../banking/moneymap` GET — the web-vs-mobile split also seen on movements.
+  Names are **not hashed** — they are the join key for the unhashed
+  `categoria_id`/`sottocategoria_id` on movements (sanitized text, no amounts).
+  `movements_get_latest` resolves them at read time (pure DB join, no credentials),
+  adding `categoria_name`/`sottocategoria_name` beside the raw ids; an unresolved
+  id keeps its raw value with no name.

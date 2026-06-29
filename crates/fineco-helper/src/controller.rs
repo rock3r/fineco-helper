@@ -696,11 +696,12 @@ mod tests {
         TaxRefreshParams,
     };
     use fineco_refresh::{
-        MovementsFetcher, OrdersFetcher, PortfolioFetcher, RefreshLimits, TaxFetcher,
+        MovementsCapture, MovementsFetcher, OrdersFetcher, PortfolioFetcher, RefreshLimits,
+        TaxFetcher,
     };
     use fineco_store::{
-        NewAsset, NewMovement, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward,
-        NewTaxMinusByYear, RawOrder, Store,
+        NewAsset, NewPortfolioSnapshot, NewPosition, NewTaxCarryForward, NewTaxMinusByYear,
+        RawOrder, Store,
     };
     use std::cell::Cell;
     use std::rc::Rc;
@@ -920,8 +921,8 @@ mod tests {
             _store: &Store,
             _date_from: &str,
             _date_to: &str,
-        ) -> Result<(Vec<NewMovement>, fineco_store::MovementsSummary), SafeError> {
-            Ok((vec![], fineco_store::MovementsSummary::default()))
+        ) -> Result<MovementsCapture, SafeError> {
+            Ok(MovementsCapture::default())
         }
     }
 

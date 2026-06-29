@@ -23,6 +23,9 @@ const TRANSACTIONS: &str = include_str!("../../fixtures/fineco/transactions.json
 const TAX_CARRY_FORWARD: &str = include_str!("../../fixtures/fineco/tax-carry-forward.json");
 /// Canned synthetic tax minus-by-year fixture.
 const TAX_MINUS: &str = include_str!("../../fixtures/fineco/tax-minus.json");
+/// Canned synthetic MoneyMap (bilancio familiare) taxonomy fixture — the web
+/// `widget-home/preload-data` shape: a map keyed by category id.
+const MONEYMAP_CATEGORIES: &str = include_str!("../../fixtures/fineco/moneymap-categories.json");
 /// Canned synthetic zero-commission ETF list (public_market data class).
 const ZERO_COMMISSION_ETFS: &str = include_str!("../../fixtures/fineco/zero-commission-etfs.json");
 /// Canned synthetic global instrument-search fixture.
@@ -259,6 +262,9 @@ pub fn route(req: &Request) -> Response {
         ("GET", "/v1/private/tax-carry-forward/search") => private(req, TAX_CARRY_FORWARD),
         ("GET", "/v1/private/tax-carry-forward/minus") => private(req, TAX_MINUS),
         ("POST", "/v2/private/accounts-and-cards/movements") => movements_page(req),
+        ("POST", "/conto-e-carte/bilancio-familiare/widget-home/preload-data") => {
+            private(req, MONEYMAP_CATEGORIES)
+        }
 
         // Public — no auth.
         ("GET", ZERO_COMMISSION_ETFS_PATH) => Response::json(200, ZERO_COMMISSION_ETFS),

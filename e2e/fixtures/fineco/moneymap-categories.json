@@ -1,0 +1,48 @@
+{
+  "003": {
+    "id_categoria": "003",
+    "categoria": "Shopping",
+    "flag_spesa_ricavo": "S",
+    "personalizzabile": false,
+    "icona": "bag",
+    "utilizzata": true,
+    "sottocategorie": {
+      "034": {
+        "id_categoria": "003",
+        "id_sottocategoria": "034",
+        "sottocategoria": "Clothes",
+        "flag_spesa_ricavo": "S",
+        "personalizzabile": false,
+        "sottocategoria_altro": false,
+        "utilizzata": true
+      },
+      "035": {
+        "id_categoria": "003",
+        "id_sottocategoria": "035",
+        "sottocategoria": "Electronics",
+        "flag_spesa_ricavo": "S",
+        "personalizzabile": true,
+        "sottocategoria_altro": false,
+        "utilizzata": false
+      }
+    }
+  },
+  "099": {
+    "id_categoria": "099",
+    "categoria": "Income",
+    "flag_spesa_ricavo": "R",
+    "personalizzabile": false,
+    "icona": "wallet",
+    "utilizzata": true,
+    "sottocategorie": {}
+  },
+  "999": {
+    "id_categoria": "999",
+    "categoria": "Cointestatari",
+    "flag_spesa_ricavo": "S",
+    "personalizzabile": false,
+    "icona": null,
+    "utilizzata": false,
+    "sottocategorie": null
+  }
+}
