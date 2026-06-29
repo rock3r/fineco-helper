@@ -103,3 +103,22 @@ fn rows_without_a_name_do_not_resolve() {
     let lookup = store.latest_categories().expect("lookup");
     assert_eq!(lookup.category_name("12"), None);
 }
+
+#[test]
+fn blank_names_do_not_resolve() {
+    let mut store = Store::open_in_memory().expect("open");
+    store
+        .capture_categories(
+            "2026-01-01T10:00:00Z",
+            &[
+                category("12", "", "S"),
+                subcategory("12", "34", "   "),
+                category("99", "Income", "R"),
+            ],
+        )
+        .expect("capture");
+    let lookup = store.latest_categories().expect("lookup");
+    assert_eq!(lookup.category_name("12"), None);
+    assert_eq!(lookup.subcategory_name("12", "34"), None);
+    assert_eq!(lookup.category_name("99"), Some("Income"));
+}

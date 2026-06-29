@@ -117,6 +117,9 @@ impl Store {
         for row in rows {
             let (category_id, subcategory_id, name) = row?;
             let Some(name) = name else { continue };
+            if name.trim().is_empty() {
+                continue;
+            }
             if subcategory_id.is_empty() {
                 lookup.categories.insert(category_id, name);
             } else {
