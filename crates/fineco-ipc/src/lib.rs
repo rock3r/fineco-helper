@@ -131,6 +131,7 @@ pub enum Request {
     PortfolioGetPositionHistory(PositionHistoryParams),
     MarketGetZeroCommissionEtfs(MarketEtfsParams),
     MovementsGetLatest,
+    MovementsGetDividends,
 }
 
 impl Request {
@@ -155,7 +156,9 @@ impl Request {
                 Capability::TaxCachedRead
             }
             Request::MarketGetZeroCommissionEtfs(_) => Capability::MarketRead,
-            Request::MovementsGetLatest => Capability::MovementsCachedRead,
+            Request::MovementsGetLatest | Request::MovementsGetDividends => {
+                Capability::MovementsCachedRead
+            }
         }
     }
 
@@ -176,6 +179,7 @@ impl Request {
             Request::PortfolioGetPositionHistory(_) => "portfolio_get_position_history",
             Request::MarketGetZeroCommissionEtfs(_) => "market_get_zero_commission_etfs",
             Request::MovementsGetLatest => "movements_get_latest",
+            Request::MovementsGetDividends => "movements_get_dividends",
         }
     }
 }
@@ -1315,6 +1319,8 @@ pub enum ResponseBody {
     PositionHistory(PositionHistoryDto),
     /// `movements_get_latest`: the latest bank account movements capture.
     Movements(MovementsDto),
+    /// `movements_get_dividends`: dividend legs paired into events.
+    Dividends(DividendsDto),
 }
 
 impl ResponseBody {
@@ -1334,6 +1340,7 @@ impl ResponseBody {
             ResponseBody::AllocationHistory(dto) => Some(dto.points.len()),
             ResponseBody::PositionHistory(dto) => Some(dto.points.len()),
             ResponseBody::Movements(dto) => Some(dto.movements.len()),
+            ResponseBody::Dividends(dto) => Some(dto.events.len()),
         }
     }
 }
@@ -1541,6 +1548,61 @@ pub struct MovementsDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_summary: Option<MovementsAccountSummaryDto>,
     pub movements: Vec<MovementDto>,
+}
+
+/// Dividend legs from the latest movements capture, paired into events.
+///
+/// Fineco posts a dividend as two movements — the gross credit and, usually the
+/// same day, the withholding debit. This is that pairing over already-captured
+/// rows; it reaches no upstream endpoint. Absolute € amounts, like the rest of
+/// the movements surface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DividendsDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<String>,
+    /// Sums over the events below, with any side whose amount the capture did
+    /// not carry left out of the total.
+    pub totals: DividendTotalsDto,
+    pub events: Vec<DividendEventDto>,
+}
+
+/// Totals across every paired event in the capture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DividendTotalsDto {
+    pub gross: f64,
+    pub withholding: f64,
+    pub net: f64,
+}
+
+/// One dividend: a security, an operation date, and both legs when the capture
+/// carried both.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DividendEventDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pay_date: Option<String>,
+    /// The security label read from the movement description. Absent when the
+    /// description carried no known prefix — the raw description is never used
+    /// as a fallback, because that would merge unrelated securities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<String>,
+    /// `dividend`, or `remunerated_portfolio` for interest on the remunerated
+    /// portfolio.
+    pub kind: String,
+    /// Signed: a reversal stays negative rather than reading as income.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross: Option<f64>,
+    /// Positive for an ordinary withholding; a refund stays negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withholding: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<f64>,
+    /// Names the leg that is MISSING: `withholding` is a gross whose withholding
+    /// was not found, `gross` a withholding with no gross. Absent when both legs
+    /// were captured. An unpaired gross is either an instrument that withholds
+    /// nothing or a window that clipped the second leg; this cannot tell them
+    /// apart, and says so rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpaired: Option<String>,
 }
 
 /// Account-level fields the movements endpoint returns once per fetch (not per

@@ -243,6 +243,108 @@ fn latest_orders_and_tax_are_served() {
     }
 }
 
+/// A dividend leg: only the fields the pairing reads vary.
+fn dividend_leg(id_hash: &str, code: &str, description: &str, amount: f64) -> NewMovement {
+    NewMovement {
+        movement_id_hash: id_hash.to_string(),
+        causale: Some("DIVIDENDO".to_string()),
+        descrizione: Some(description.to_string()),
+        descrizione_breve: None,
+        importo: Some(amount),
+        tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
+        data_operazione: Some("2026-02-10".to_string()),
+        data_registrazione: None,
+        data_valuta: None,
+        causale_movimento: Some(code.to_string()),
+        categoria_id: None,
+        sottocategoria_id: None,
+    }
+}
+
+#[test]
+fn dividends_pair_the_legs_of_the_latest_capture() {
+    let mut store = Store::open_in_memory().expect("open");
+    store
+        .capture_movements(
+            "2026-06-03T10:00:00Z",
+            &[
+                dividend_leg("a", "DII", "Div.su 100 EXAMPLE SPA", 147.73),
+                dividend_leg("b", "DIR", "Rit.div.su 100 EXAMPLE SPA", -38.41),
+                // An unrelated movement must not appear in the report at all.
+                movement_with_ids("c", None, None),
+            ],
+            None,
+        )
+        .expect("capture");
+
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), owner_policy());
+    match handler
+        .handle(Request::MovementsGetDividends, 0)
+        .expect("dividends served")
+    {
+        ResponseBody::Dividends(dto) => {
+            assert_eq!(dto.events.len(), 1);
+            let event = &dto.events[0];
+            assert_eq!(event.security.as_deref(), Some("100 EXAMPLE SPA"));
+            assert_eq!(event.kind, "dividend");
+            assert_eq!(event.gross, Some(147.73));
+            assert_eq!(event.withholding, Some(38.41));
+            assert_eq!(event.net, Some(109.32));
+            assert_eq!(event.unpaired, None);
+            assert_eq!(dto.totals.net, 109.32);
+            assert_eq!(dto.captured_at.as_deref(), Some("2026-06-03T10:00:00Z"));
+        }
+        other => panic!("expected dividends, got {other:?}"),
+    }
+}
+
+#[test]
+fn dividends_name_the_missing_leg_and_still_total_the_gross() {
+    // A gross with no withholding is either an instrument that withholds nothing
+    // or a window that clipped the second leg. The report says which leg is
+    // absent rather than implying the pair was complete.
+    let mut store = Store::open_in_memory().expect("open");
+    store
+        .capture_movements(
+            "2026-06-03T10:00:00Z",
+            &[dividend_leg("a", "DII", "Div.su AAA", 10.0)],
+            None,
+        )
+        .expect("capture");
+
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), owner_policy());
+    match handler
+        .handle(Request::MovementsGetDividends, 0)
+        .expect("dividends served")
+    {
+        ResponseBody::Dividends(dto) => {
+            assert_eq!(dto.events.len(), 1);
+            assert_eq!(dto.events[0].unpaired.as_deref(), Some("withholding"));
+            assert_eq!(dto.events[0].net, Some(10.0));
+            assert_eq!(dto.totals.gross, 10.0);
+            assert_eq!(dto.totals.withholding, 0.0);
+        }
+        other => panic!("expected dividends, got {other:?}"),
+    }
+}
+
+#[test]
+fn dividends_are_denied_without_the_movements_capability() {
+    // The report is computed from movements, so it carries the movements
+    // capability: a policy without it must not reach the data by another name.
+    let store = Store::open_in_memory().expect("open");
+    let policy = Policy::from_json(
+        r#"{"version":1,"auth_ids":{"owner":{"capabilities":["tax.cached.read"]}}}"#,
+    )
+    .expect("valid policy");
+
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), policy);
+    let error = handler
+        .handle(Request::MovementsGetDividends, 0)
+        .expect_err("a policy without movements.cached.read must be refused");
+    assert_eq!(error.code(), "invalid_request");
+}
+
 fn movement_with_ids(
     id_hash: &str,
     categoria_id: Option<&str>,

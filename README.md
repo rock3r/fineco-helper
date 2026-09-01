@@ -42,6 +42,9 @@ Cached reads (instant, from the local store):
   `portfolio_get_position_history`
 - `orders_get_latest_monitor`
 - `tax_get_latest_carry_forward`, `tax_get_latest_minus_by_year`
+- `movements_get_latest`, `movements_get_dividends` (the dividend legs of the
+  latest movements capture, each gross paired to its withholding). Both are
+  outside the default connector allowlist — they carry raw transaction amounts.
 
 Public/credential-free market reads (not from the store):
 
