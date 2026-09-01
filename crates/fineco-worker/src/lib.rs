@@ -769,7 +769,7 @@ const MAX_MOVEMENTS_PAGES: u32 = 400;
 impl RawMovementsFetcher for FinecoWorker {
     /// Fetch ALL bank account movements for `date_from`..`date_to` (`YYYY-MM-DD`).
     /// The endpoint is paginated, so the worker logs in once and then walks pages
-    /// (`offset` += [`MOVEMENTS_PAGE_SIZE`]) under that one session, accumulating
+    /// (`offset` += the rows each page returned) under that one session, accumulating
     /// every page until the response's `lastPage` is set. No `type` filter is sent
     /// (all movement types return). The per-fetch account summary (balances +
     /// current-month spending, at the response top level) is read from the first
@@ -864,7 +864,15 @@ impl FinecoWorker {
             if last_page || raw_page_len == 0 {
                 return Ok((all, summary));
             }
-            offset = offset.saturating_add(MOVEMENTS_PAGE_SIZE);
+            // Advance by the rows the page actually returned, not by the size that
+            // was asked for. `lastPage` is `#[serde(default)]`, so a response that
+            // omits it reads as `false`: a short page would then leave the next
+            // request starting past every row the endpoint did not send, and those
+            // rows would be missing from the statement with nothing to show for it.
+            // A short page that really was the last one costs one extra request,
+            // which comes back empty and ends the walk on the check above.
+            let advance = i32::try_from(raw_page_len).unwrap_or(MOVEMENTS_PAGE_SIZE);
+            offset = offset.saturating_add(advance);
         }
         // Ran past the page cap without a `lastPage`: fail loud rather than cache a
         // partial history.

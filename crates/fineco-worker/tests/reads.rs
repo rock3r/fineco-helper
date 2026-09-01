@@ -56,6 +56,72 @@ fn spawn_mock_fineco_with_broken_quote_snapshot() -> String {
     format!("http://{addr}")
 }
 
+/// Like [`spawn_mock_fineco`], but every movements page comes back SHORT — fewer
+/// rows than the requested `limit` — and without `lastPage` until the window is
+/// exhausted. The live endpoint's `lastPage` is optional (`#[serde(default)]`),
+/// and a walk that advances the offset by the requested page size rather than by
+/// the rows it received would step straight over the rows a short page did not
+/// carry.
+fn spawn_mock_fineco_with_short_movements_pages() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = httptiny::serve_listener(listener, |req| {
+            let path = req.path.split('?').next().unwrap_or(&req.path);
+            if req.method == "POST" && path == "/v2/private/accounts-and-cards/movements" {
+                return short_movements_page(&req.body);
+            }
+            mock_fineco::route(req)
+        });
+    });
+    format!("http://{addr}")
+}
+
+/// Serve at most [`SHORT_PAGE`] rows per request out of [`SHORT_TOTAL`], honouring
+/// `offset`, and set `lastPage` only once the window is exhausted.
+fn short_movements_page(body: &str) -> httptiny::Response {
+    const SHORT_TOTAL: i64 = 23;
+    const SHORT_PAGE: i64 = 10;
+
+    let offset = json_int_field(body, "offset").unwrap_or(0).max(0);
+    let end = (offset + SHORT_PAGE).min(SHORT_TOTAL);
+    let items: Vec<String> = (offset..end)
+        .map(|i| {
+            format!(
+                "{{\"progressivoMovimento\":\"MOV-{i}\",\"importo\":1.0,\
+                 \"descrizione\":\"synthetic\",\"tipoMovimento\":\"MOVIMENTO_CONTO\"}}"
+            )
+        })
+        .collect();
+    let last_page = end >= SHORT_TOTAL;
+    let summary = if offset == 0 {
+        ",\"balanceAccountAtMovement\":1234.56,\"balanceAccountAtSearchDate\":1200.0"
+    } else {
+        ""
+    };
+    httptiny::Response::json(
+        200,
+        format!(
+            "{{\"movimenti\":[{}],\"lastPage\":{last_page},\
+             \"limitedResult\":false,\"missingData\":[]{summary}}}",
+            items.join(",")
+        ),
+    )
+}
+
+/// Read a flat integer field out of a request body (test-local helper — the
+/// worker's bodies are flat objects).
+fn json_int_field(body: &str, key: &str) -> Option<i64> {
+    let pat = format!("\"{key}\":");
+    let start = body.find(&pat)? + pat.len();
+    let rest = body[start..].trim_start();
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
 fn spawn_mock_fineco_with_broken_etf_detail_snapshot() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
@@ -494,6 +560,32 @@ fn movements_fetch_piggybacks_the_moneymap_taxonomy() {
         "subcategory carries its parent id"
     );
     assert_eq!(clothes.name.as_deref(), Some("Clothes"));
+}
+
+#[test]
+fn movements_walk_keeps_every_row_when_pages_come_back_short() {
+    // A page shorter than the requested limit does not mean the window is over:
+    // `lastPage` is optional in the response. Advancing the offset by the page
+    // size rather than by the rows received drops whatever the short page did not
+    // carry — here MOV-10..MOV-14, silently missing from the statement.
+    let base = spawn_mock_fineco_with_short_movements_pages();
+    let bundle = worker_for(&base)
+        .fetch_raw_movements("2026-03-25", "2026-06-23")
+        .expect("movements fetch should succeed");
+
+    assert_eq!(bundle.movements.len(), 23);
+    let ids: Vec<&str> = bundle
+        .movements
+        .iter()
+        .map(|movement| movement.movement_id.as_str())
+        .collect();
+    for row in 0..23 {
+        let expected = format!("MOV-{row}");
+        assert!(
+            ids.contains(&expected.as_str()),
+            "movement {expected} missing from the walk: {ids:?}"
+        );
+    }
 }
 
 #[test]
