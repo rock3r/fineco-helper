@@ -7,15 +7,56 @@ use std::thread;
 use fineco_gateway::Gateway;
 use fineco_ipc::{HistoryParams, Policy, PositionHistoryParams, serve_blocking};
 use fineco_query::{FreshnessMaxAge, QueryHandler};
-use fineco_store::{NewAsset, NewPortfolioSnapshot, NewPosition, Store};
+use fineco_store::{NewAsset, NewMovement, NewPortfolioSnapshot, NewPosition, Store};
 use rmcp::handler::server::wrapper::Parameters;
+
+/// Bind a socket and serve a worker whose store holds one dividend's two legs.
+fn spawn_worker_with_dividend_legs(tag: &str) -> std::path::PathBuf {
+    let leg = |id: &str, code: &str, description: &str, amount: f64| NewMovement {
+        movement_id_hash: id.to_string(),
+        causale: Some("DIVIDENDO".to_string()),
+        descrizione: Some(description.to_string()),
+        descrizione_breve: None,
+        importo: Some(amount),
+        tipo_movimento: Some("MOVIMENTO_CONTO".to_string()),
+        data_operazione: Some("2026-02-10".to_string()),
+        data_registrazione: None,
+        data_valuta: None,
+        causale_movimento: Some(code.to_string()),
+        categoria_id: None,
+        sottocategoria_id: None,
+    };
+
+    let mut store = Store::open_in_memory().expect("open");
+    store
+        .capture_movements(
+            "2026-06-03T12:00:00Z",
+            &[
+                leg("a", "DII", "Div.su 100 EXAMPLE SPA", 147.73),
+                leg("b", "DIR", "Rit.div.su 100 EXAMPLE SPA", -38.41),
+            ],
+            None,
+        )
+        .expect("capture");
+    let handler = QueryHandler::new(store, FreshnessMaxAge::default(), owner_policy());
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("fineco-gateway-{}-{tag}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind");
+    let now = fineco_core::parse_iso8601_utc("2026-06-03T12:01:00Z").expect("epoch");
+    thread::spawn(move || {
+        let _ = serve_blocking(&listener, move |request| handler.handle(request, now));
+    });
+    path
+}
 
 /// A policy granting the owner every M4 capability (so tools are authorized).
 fn owner_policy() -> Policy {
     Policy::from_json(
         r#"{"version":1,"auth_ids":{"owner":{"capabilities":[
             "market.read","portfolio.cached.full_read","portfolio.shareable.read",
-            "orders.cached.read","tax.cached.read"]}}}"#,
+            "orders.cached.read","tax.cached.read","movements.cached.read"]}}}"#,
     )
     .expect("valid owner policy")
 }
@@ -305,7 +346,30 @@ fn default_connector_allowlist_is_valid_and_excludes_default_blocked_tools() {
     // absent from the resolved allowlist is hidden), so the posture is fail-safe.
     assert_eq!(
         DEFAULT_CONNECTOR_TOOLS.len(),
-        all.len() - 9,
+        all.len() - 10,
         "the default allowlist should be every tool except the default-blocked tools"
     );
+}
+
+#[tokio::test]
+async fn dividends_tool_pairs_the_legs_from_the_worker() {
+    let path = spawn_worker_with_dividend_legs("dividends");
+    let gateway = Gateway::new(&path).with_policy(owner_policy());
+
+    let dividends = gateway
+        .movements_get_dividends()
+        .await
+        .expect("dividends tool")
+        .0;
+
+    assert_eq!(dividends.events.len(), 1);
+    let event = &dividends.events[0];
+    assert_eq!(event.security.as_deref(), Some("100 EXAMPLE SPA"));
+    assert_eq!(event.gross, Some(147.73));
+    assert_eq!(event.withholding, Some(38.41));
+    assert_eq!(event.net, Some(109.32));
+    assert_eq!(event.unpaired, None);
+    assert_eq!(dividends.totals.net, 109.32);
+
+    let _ = std::fs::remove_file(&path);
 }

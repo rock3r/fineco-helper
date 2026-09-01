@@ -6,14 +6,17 @@
 //! only over the socket, so the "gateway never reads the DB directly" invariant
 //! is structural.
 
+pub mod dividends;
+
 use fineco_core::SafeError;
 use fineco_ipc::{
-    AllocationHistoryDto, AllocationPointDto, FreshnessDto, FreshnessReportDto, FullSnapshotDto,
-    HistoryParams, MovementDto, MovementsAccountSummaryDto, MovementsDto, OWNER_AUTH_ID, OrderDto,
-    OrdersDto, Policy, PortfolioHistoryDto, PortfolioHistoryPointDto, PortfolioSummaryDto,
-    PositionDto, PositionHistoryDto, PositionHistoryParams, PositionHistoryPointDto, Request,
-    ResponseBody, ShareableReportDto, ShareableRowDto, TaxCarryForwardDto, TaxCarryForwardListDto,
-    TaxMinusDto, TaxMinusListDto,
+    AllocationHistoryDto, AllocationPointDto, DividendEventDto, DividendTotalsDto, DividendsDto,
+    FreshnessDto, FreshnessReportDto, FullSnapshotDto, HistoryParams, MovementDto,
+    MovementsAccountSummaryDto, MovementsDto, OWNER_AUTH_ID, OrderDto, OrdersDto, Policy,
+    PortfolioHistoryDto, PortfolioHistoryPointDto, PortfolioSummaryDto, PositionDto,
+    PositionHistoryDto, PositionHistoryParams, PositionHistoryPointDto, Request, ResponseBody,
+    ShareableReportDto, ShareableRowDto, TaxCarryForwardDto, TaxCarryForwardListDto, TaxMinusDto,
+    TaxMinusListDto,
 };
 use fineco_store::{
     AllocationPoint, PortfolioSnapshotRow, PositionHistoryPoint, PositionRow, ShareableRow, Store,
@@ -91,6 +94,7 @@ impl QueryHandler {
             Request::TaxGetLatestCarryForward => self.latest_tax_carry_forward(),
             Request::TaxGetLatestMinusByYear => self.latest_tax_minus_by_year(),
             Request::MovementsGetLatest => self.latest_movements(),
+            Request::MovementsGetDividends => self.latest_dividends(),
             Request::PortfolioGetLatestSnapshotSummary => self.latest_summary(),
             Request::PortfolioGetLatestFullSnapshot => self.latest_full_snapshot(),
             Request::PortfolioGetLatestShareableReport => self.latest_shareable_report(),
@@ -180,6 +184,56 @@ impl QueryHandler {
         Ok(ResponseBody::TaxMinus(TaxMinusListDto {
             captured_at,
             entries,
+        }))
+    }
+
+    /// The dividend legs of the latest movements capture, paired into events.
+    ///
+    /// Pure post-processing over rows already in the store: no request reaches
+    /// Fineco, and the capability is the movements one, because the data class is
+    /// the same raw transaction data seen from a different angle.
+    fn latest_dividends(&self) -> Result<ResponseBody, SafeError> {
+        let rows = self
+            .store
+            .latest_movements()
+            .map_err(|_| SafeError::internal())?;
+        let captured_at = self
+            .store
+            .latest_capture_at("movements")
+            .map_err(|_| SafeError::internal())?;
+
+        let events = crate::dividends::pair_dividends(&rows);
+        // Summed as integer cents and converted once, so a long run of events
+        // cannot drift the way repeated float addition would. A side the capture
+        // did not carry is left out rather than counted as zero.
+        let gross_cents: i64 = events.iter().filter_map(|event| event.gross_cents).sum();
+        let withholding_cents: i64 = events
+            .iter()
+            .filter_map(|event| event.withholding_cents)
+            .sum();
+        let totals = DividendTotalsDto {
+            gross: cents_to_euros(gross_cents),
+            withholding: cents_to_euros(withholding_cents),
+            net: cents_to_euros(gross_cents - withholding_cents),
+        };
+
+        let events = events
+            .into_iter()
+            .map(|event| DividendEventDto {
+                pay_date: event.pay_date,
+                security: event.security,
+                kind: event.kind.as_str().to_string(),
+                gross: event.gross_cents.map(cents_to_euros),
+                withholding: event.withholding_cents.map(cents_to_euros),
+                net: event.net_cents.map(cents_to_euros),
+                unpaired: event.unpaired.map(|leg| leg.as_str().to_string()),
+            })
+            .collect();
+
+        Ok(ResponseBody::Dividends(DividendsDto {
+            captured_at,
+            totals,
+            events,
         }))
     }
 
@@ -434,4 +488,13 @@ fn shareable_row_dto(row: ShareableRow) -> ShareableRowDto {
         weight_perc: row.weight_perc,
         profit_loss_perc: row.profit_loss_perc,
     }
+}
+
+/// Integer cents to the € amounts the movements surface uses elsewhere.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "cent counts on a retail account are far inside f64's exact integer range"
+)]
+fn cents_to_euros(cents: i64) -> f64 {
+    cents as f64 / 100.0
 }

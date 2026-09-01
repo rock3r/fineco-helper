@@ -81,7 +81,7 @@ echo "$names" | sed 's/^/    /'
 n="$(printf '%s\n' "$names" | grep -c .)"
 # The full registered tool surface (crates/fineco-gateway/src/lib.rs). The guard
 # test mcp_validator_expected_tools_match_the_gateway keeps this list in sync.
-EXPECTED="market_get_asset_details market_get_indices market_get_zero_commission_etfs market_search_asset movements_get_latest orders_get_latest_monitor portfolio_get_allocation_history portfolio_get_freshness portfolio_get_history portfolio_get_latest_full_snapshot portfolio_get_latest_shareable_report portfolio_get_latest_snapshot_summary portfolio_get_position_history private_movements_refresh_live_sensitive private_orders_refresh_live_sensitive private_portfolio_refresh_live_sensitive private_tax_refresh_live_sensitive tax_get_latest_carry_forward tax_get_latest_minus_by_year"
+EXPECTED="market_get_asset_details market_get_indices market_get_zero_commission_etfs market_search_asset movements_get_dividends movements_get_latest orders_get_latest_monitor portfolio_get_allocation_history portfolio_get_freshness portfolio_get_history portfolio_get_latest_full_snapshot portfolio_get_latest_shareable_report portfolio_get_latest_snapshot_summary portfolio_get_position_history private_movements_refresh_live_sensitive private_orders_refresh_live_sensitive private_portfolio_refresh_live_sensitive private_tax_refresh_live_sensitive tax_get_latest_carry_forward tax_get_latest_minus_by_year"
 # The remote set must EXACTLY equal EXPECTED — a MISSING tool is a regression, and
 # an EXTRA tool (e.g. a mutation/proxy tool that slipped in) is a security one.
 missing="" extra=""

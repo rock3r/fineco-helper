@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use crate::access::AuthChannel;
 use fineco_ipc::{
-    AllocationHistoryDto, Capability, Client, FreshnessReportDto, FullSnapshotDto, HistoryParams,
-    MarketAssetDetailsResult, MarketControlClient, MarketControlOutcome, MarketControlRequest,
-    MarketDetailsParams, MarketDetailsSection, MarketEtfExternalEnrichment, MarketEtfsParams,
-    MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketField,
+    AllocationHistoryDto, Capability, Client, DividendsDto, FreshnessReportDto, FullSnapshotDto,
+    HistoryParams, MarketAssetDetailsResult, MarketControlClient, MarketControlOutcome,
+    MarketControlRequest, MarketDetailsParams, MarketDetailsSection, MarketEtfExternalEnrichment,
+    MarketEtfsParams, MarketExternalCompanyOverview, MarketExternalEnrichmentSection, MarketField,
     MarketIndicesParams, MarketIndicesResult, MarketSearchParams, MarketSearchResult, MarketSource,
     MarketWarning, MovementsDto, MovementsRefreshParams, OWNER_AUTH_ID, OrdersDto,
     OrdersRefreshParams, Policy, PortfolioHistoryDto, PortfolioSummaryDto, PositionHistoryDto,
@@ -282,6 +282,18 @@ impl Gateway {
     pub async fn tax_get_latest_minus_by_year(&self) -> Result<Json<TaxMinusListDto>, ErrorData> {
         self.call(Request::TaxGetLatestMinusByYear, |body| match body {
             ResponseBody::TaxMinus(tax) => Ok(Json(tax)),
+            _ => Err(unexpected()),
+        })
+        .await
+    }
+
+    #[tool(
+        name = "movements_get_dividends",
+        description = "Dividends from the latest bank account movements capture (owner-only cached private data), with each gross leg paired to its withholding. Fineco posts a dividend as two separate movements — the gross credit and, usually the same day, the withholding debit — so this pairs them by security and operation date and returns gross, withholding and net per event, plus totals. An event carrying `unpaired` names the leg that is MISSING. Computed from already-captured rows; it reaches no upstream endpoint."
+    )]
+    pub async fn movements_get_dividends(&self) -> Result<Json<DividendsDto>, ErrorData> {
+        self.call(Request::MovementsGetDividends, |body| match body {
+            ResponseBody::Dividends(dto) => Ok(Json(dto)),
             _ => Err(unexpected()),
         })
         .await
