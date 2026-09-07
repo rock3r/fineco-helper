@@ -42,6 +42,9 @@ Cached reads (instant, from the local store):
   `portfolio_get_position_history`
 - `orders_get_latest_monitor`
 - `tax_get_latest_carry_forward`, `tax_get_latest_minus_by_year`
+- `movements_get_latest`, `movements_get_dividends` (the dividend legs of the
+  latest movements capture, each gross paired to its withholding). Both are
+  outside the default connector allowlist — they carry raw transaction amounts.
 
 Public/credential-free market reads (not from the store):
 
@@ -76,7 +79,7 @@ Gated live refresh (a real, rate-limited Fineco login; returns status only — r
 refreshed values via the cached tools afterward):
 
 - `private_portfolio_refresh_live_sensitive`, `private_orders_refresh_live_sensitive`,
-  `private_tax_refresh_live_sensitive`
+  `private_tax_refresh_live_sensitive`, `private_movements_refresh_live_sensitive`
 
 ## Run it / deploy it
 
