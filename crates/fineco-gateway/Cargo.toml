@@ -18,7 +18,7 @@ fineco-core = { path = "../fineco-core" }
 fineco-ipc = { path = "../fineco-ipc" }
 fineco-market = { path = "../fineco-market" }
 fineco-tls = { path = "../fineco-tls" }
-rmcp = { version = "1", default-features = false, features = [
+rmcp = { version = "2", default-features = false, features = [
     "server",
     "macros",
     "transport-streamable-http-server",
