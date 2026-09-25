@@ -124,19 +124,31 @@ class RetryEligibilityTests(unittest.TestCase):
 
         self.assertFalse(ready)
 
-    def test_is_blocking_review_item_ignores_stale_comments(self):
-        created_at = "2026-01-01T00:00:00Z"
-        created_at_seconds = watch.datetime.fromisoformat("2026-01-01T00:00:00+00:00").timestamp()
-        stale_now = created_at_seconds + watch.BLOCKING_REVIEW_ITEM_FRESH_SECONDS + 1
-        item = {
-            "kind": "review_comment",
-            "commit_id": "abc123",
-            "created_at": created_at,
-        }
-
-        self.assertFalse(
-            watch.is_blocking_review_item(item, head_sha="abc123", now_seconds=stale_now)
+    def test_is_pr_ready_to_merge_blocks_while_codex_gate_is_unknown(self):
+        # A failed reactions lookup must not be read as "Codex is done".
+        ready = watch.is_pr_ready_to_merge(
+            pr=self._base_pr(),
+            checks_summary={
+                "all_terminal": True,
+                "failed_count": 0,
+                "pending_count": 0,
+                "passed_count": 1,
+            },
+            new_review_items=[],
+            checks_terminal_elapsed=120,
+            blocking_review_items=[],
+            codex_gate={"reviewing": False, "status": "unknown"},
         )
+
+        self.assertFalse(ready)
+
+    def test_summarize_checks_counts_cancelled_as_failed(self):
+        checks = [{"name": "check", "workflow": "CI", "bucket": "cancel", "state": "CANCELLED"}]
+
+        summary = watch.summarize_checks(checks)
+
+        self.assertEqual(summary["failed_count"], 1)
+        self.assertEqual(summary["skipping_count"], 0)
 
     def test_recommend_actions_surfaces_merge_conflict(self):
         pr = self._base_pr()
@@ -580,6 +592,125 @@ class RetryEligibilityTests(unittest.TestCase):
 
         self.assertEqual(new_items, [])
 
+    def _own_review_comment_payload(self):
+        return [
+            {
+                "id": 7,
+                "user": {"login": "octocat"},
+                "author_association": "OWNER",
+                "created_at": "2025-01-01T00:00:00Z",
+                "body": "Rename this before merging.",
+                "path": "main.go",
+                "line": 1,
+                "commit_id": "abc123",
+                "html_url": "https://example.invalid/comment",
+            }
+        ]
+
+    def test_fetch_new_review_items_blocks_on_own_unresolved_threads(self):
+        # The agent usually authenticates as the owner, so the owner's own open
+        # threads must still block even though they are not surfaced as new items.
+        pr = {"repo": "rock3r/fineco-helper", "number": 716, "head_sha": "abc123"}
+        state = {
+            "seen_issue_comment_ids": [],
+            "seen_review_comment_ids": [],
+            "seen_review_ids": [],
+            "last_review_poll_at": None,
+        }
+
+        with patch.object(
+            watch,
+            "gh_api_list_paginated",
+            side_effect=[[], self._own_review_comment_payload(), []],
+        ), patch.object(
+            watch,
+            "get_unresolved_review_comment_ids",
+            return_value={"ids": {"7"}, "truncated": False},
+        ):
+            new_items, blocking_items = watch.fetch_new_review_items(
+                pr,
+                state,
+                fresh_state=True,
+                authenticated_login="octocat",
+            )
+
+        self.assertEqual(new_items, [])
+        self.assertEqual([item["id"] for item in blocking_items], ["7"])
+
+    def test_fetch_new_review_items_does_not_block_on_own_resolved_threads(self):
+        pr = {"repo": "rock3r/fineco-helper", "number": 716, "head_sha": "abc123"}
+        state = {
+            "seen_issue_comment_ids": [],
+            "seen_review_comment_ids": [],
+            "seen_review_ids": [],
+            "last_review_poll_at": None,
+        }
+
+        with patch.object(
+            watch,
+            "gh_api_list_paginated",
+            side_effect=[[], self._own_review_comment_payload(), []],
+        ), patch.object(
+            watch,
+            "get_unresolved_review_comment_ids",
+            return_value={"ids": set(), "truncated": False},
+        ):
+            new_items, blocking_items = watch.fetch_new_review_items(
+                pr,
+                state,
+                fresh_state=True,
+                authenticated_login="octocat",
+            )
+
+        self.assertEqual(new_items, [])
+        self.assertEqual(blocking_items, [])
+
+    def test_fetch_new_review_items_ignores_codex_review_summary_status_comment(self):
+        # Codex edits this status table on every review. It never carries a
+        # finding, so it must not resurface as a new or blocking item.
+        pr = {"repo": "rock3r/fineco-helper", "number": 716, "head_sha": "abc123"}
+        state = {
+            "seen_issue_comment_ids": [],
+            "seen_review_comment_ids": [],
+            "seen_review_ids": [],
+            "last_review_poll_at": None,
+        }
+        issue_payload = [
+            {
+                "id": 3,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "author_association": "NONE",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T01:00:00Z",
+                "body": "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n",
+                "html_url": "https://example.invalid/issue-comment",
+            },
+            {
+                "id": 4,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "author_association": "NONE",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "body": "**P2** Close the socket on the error path.",
+                "html_url": "https://example.invalid/issue-comment-2",
+            },
+        ]
+
+        with patch.object(
+            watch,
+            "gh_api_list_paginated",
+            side_effect=[issue_payload, [], []],
+        ):
+            new_items, blocking_items = watch.fetch_new_review_items(
+                pr,
+                state,
+                fresh_state=True,
+                authenticated_login="octocat",
+            )
+
+        self.assertEqual([item["id"] for item in new_items], ["4"])
+        self.assertEqual([item["id"] for item in blocking_items], ["4"])
+
     def test_fetch_new_review_items_keeps_seen_issue_comment_blocking(self):
         pr = {
             "repo": "rock3r/fineco-helper",
@@ -751,7 +882,7 @@ class RetryEligibilityTests(unittest.TestCase):
         self.assertTrue(gate["reviewing"])
         self.assertEqual(gate["status"], "unknown")
 
-    def test_fetch_new_review_items_fallback_heuristic_when_unresolved_lookup_errors(self):
+    def test_fetch_new_review_items_fails_closed_when_unresolved_lookup_errors(self):
         pr = {
             "repo": "rock3r/fineco-helper",
             "number": 716,
@@ -794,7 +925,8 @@ class RetryEligibilityTests(unittest.TestCase):
                 authenticated_login="octocat",
             )
 
-        self.assertEqual(blocking_items, [])
+        # Without thread state an old comment may still be open: block rather than guess.
+        self.assertEqual([item["id"] for item in blocking_items], ["42"])
 
     def test_hung_checks_from_checks_flags_never_started_pending_checks(self):
         checks = [
@@ -1130,6 +1262,39 @@ class GhTextTests(unittest.TestCase):
 
         self.assertIn("timed out", str(context.exception))
 
+    @staticmethod
+    def _fake_gh_run(returncode, stdout, stderr=""):
+        # Behaves like subprocess.run, including check=True raising on a nonzero exit.
+        def run(cmd, check=False, **_kwargs):
+            if check and returncode != 0:
+                raise watch.subprocess.CalledProcessError(
+                    returncode, cmd, output=stdout, stderr=stderr
+                )
+            return watch.subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
+
+        return run
+
+    def test_get_pr_checks_reads_json_when_checks_are_pending_or_failing(self):
+        # `gh pr checks` exits 8 while checks are pending and 1 when one failed,
+        # but still prints the requested JSON in both cases.
+        payload = '[{"name": "check", "bucket": "pending", "state": "IN_PROGRESS"}]'
+        for code in (1, 8):
+            with patch.object(watch.subprocess, "run", side_effect=self._fake_gh_run(code, payload)):
+                checks = watch.get_pr_checks("21", repo="rock3r/fineco-helper")
+            self.assertEqual(checks[0]["bucket"], "pending", f"exit code {code}")
+
+    def test_get_pr_checks_still_fails_without_json(self):
+        fake = self._fake_gh_run(1, "", stderr="no pull requests found")
+        with patch.object(watch.subprocess, "run", side_effect=fake):
+            with self.assertRaises(watch.GhCommandError):
+                watch.get_pr_checks("21", repo="rock3r/fineco-helper")
+
+    def test_gh_text_still_fails_on_other_exit_codes_with_output(self):
+        fake = self._fake_gh_run(4, '{"message": "auth required"}')
+        with patch.object(watch.subprocess, "run", side_effect=fake):
+            with self.assertRaises(watch.GhCommandError):
+                watch.get_pr_checks("21", repo="rock3r/fineco-helper")
+
 
 class RunOnceTests(unittest.TestCase):
     def _idle_snapshot(self):
@@ -1388,11 +1553,10 @@ class SkippingChecksTests(unittest.TestCase):
             {"bucket": "pass", "state": "SUCCESS"},
             {"bucket": "skipping", "state": "SKIPPING"},
             {"bucket": "neutral", "state": "NEUTRAL"},
-            {"bucket": "cancel", "state": "CANCELLED"},
         ]
         summary = watch.summarize_checks(checks)
         self.assertEqual(summary["passed_count"], 1)
-        self.assertEqual(summary["skipping_count"], 3)
+        self.assertEqual(summary["skipping_count"], 2)
         self.assertTrue(summary["all_terminal"])
 
     def test_recommend_actions_surfaces_branch_behind(self):

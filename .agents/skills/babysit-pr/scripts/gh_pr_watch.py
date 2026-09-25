@@ -79,13 +79,6 @@ GH_COMMAND_TIMEOUT_SECONDS = 60
 # the bot's findings are ever seen.
 CHECKS_TERMINAL_GRACE_PERIOD_SECONDS = 60
 
-# Actionable inline review comments on the current head SHA block merge
-# readiness for a bounded freshness window. This catches the race where review
-# feedback arrives shortly after checks complete, while avoiding a permanent
-# merge block for comments that were already handled/resolved without a new
-# commit.
-BLOCKING_REVIEW_ITEM_FRESH_SECONDS = 30 * 60
-
 # Per-check-name hung thresholds: if a check has been IN_PROGRESS longer than
 # this many seconds without completing, surface a diagnose_hung_check action.
 # Matched by substring of the lowercased check name; "default" is the fallback.
@@ -102,6 +95,12 @@ HUNG_CHECK_THRESHOLDS_SECONDS = {
 RETRY_ELIGIBLE_WORKFLOW_KEYWORDS = {
     "e2e",
 }
+# Codex keeps one "Codex Review Summary" status table on the PR and edits it on
+# every review. It never carries a finding, so it must not surface as a review item.
+STATUS_ONLY_BOT_COMMENT_MARKER = "<!-- codex-pull-request-review-summary -->"
+# `gh pr checks` exits 1 when a check failed and 8 while checks are pending, and
+# still prints the requested JSON. Those exit codes are states, not failures.
+GH_PR_CHECKS_STATE_EXIT_CODES = (0, 1, 8)
 # Login keyword fragments for Codex bot, used for emoji reaction gate detection.
 # Codex signals it is reviewing a PR by adding a 👀 reaction; it either posts a
 # review with comments (issues found) or removes the reaction silently (clean).
@@ -201,7 +200,7 @@ def _format_gh_error(cmd, err):
     return "\n".join(parts)
 
 
-def gh_text(args, repo=None):
+def gh_text(args, repo=None, ok_exit_codes=(0,)):
     cmd = ["gh"]
     # `gh api` does not accept `-R/--repo` on all gh versions. The watcher's
     # API calls use explicit endpoints (e.g. repos/{owner}/{repo}/...), so the
@@ -222,12 +221,14 @@ def gh_text(args, repo=None):
     except subprocess.TimeoutExpired as err:
         raise GhCommandError(f"GitHub CLI command timed out: {' '.join(cmd)}") from err
     except subprocess.CalledProcessError as err:
+        if err.returncode in ok_exit_codes and (err.stdout or "").strip():
+            return err.stdout
         raise GhCommandError(_format_gh_error(cmd, err)) from err
     return proc.stdout
 
 
-def gh_json(args, repo=None):
-    raw = gh_text(args, repo=repo).strip()
+def gh_json(args, repo=None, ok_exit_codes=(0,)):
+    raw = gh_text(args, repo=repo, ok_exit_codes=ok_exit_codes).strip()
     if not raw:
         return None
     try:
@@ -418,7 +419,7 @@ def get_pr_checks(pr_spec, repo):
     if parsed["value"] is not None:
         cmd.append(parsed["value"])
     cmd.extend(["--json", checks_fields()])
-    data = gh_json(cmd, repo=repo)
+    data = gh_json(cmd, repo=repo, ok_exit_codes=GH_PR_CHECKS_STATE_EXIT_CODES)
     if data is None:
         return []
     if not isinstance(data, list):
@@ -441,11 +442,11 @@ def summarize_checks(checks):
         bucket = str(check.get("bucket") or "").lower()
         if is_pending_check(check):
             pending_count += 1
-        elif bucket == "fail":
+        elif bucket in ("fail", "cancel"):
             failed_count += 1
         elif bucket == "pass":
             passed_count += 1
-        elif bucket in ("cancel", "neutral", "skipping"):
+        elif bucket in ("neutral", "skipping"):
             skipping_count += 1
     return {
         "pending_count": pending_count,
@@ -939,6 +940,10 @@ def is_actionable_review_bot_login(login):
     return any(keyword in lower_login for keyword in REVIEW_BOT_LOGIN_KEYWORDS)
 
 
+def is_status_only_bot_comment(item):
+    return STATUS_ONLY_BOT_COMMENT_MARKER in str(item.get("body") or "")
+
+
 def is_trusted_human_review_author(item, authenticated_login):
     _ = authenticated_login
     author = str(item.get("author") or "")
@@ -948,40 +953,9 @@ def is_trusted_human_review_author(item, authenticated_login):
     return association in TRUSTED_AUTHOR_ASSOCIATIONS
 
 
-def item_age_seconds(item, now_seconds=None, timestamp_field="created_at"):
-    timestamp_value = str(item.get(timestamp_field) or item.get("created_at") or "")
-    if not timestamp_value:
-        return None
-    try:
-        timestamp_seconds = datetime.fromisoformat(
-            timestamp_value.replace("Z", "+00:00")
-        ).timestamp()
-    except ValueError:
-        return None
-
-    now = float(now_seconds) if now_seconds is not None else time.time()
-    return max(0, now - timestamp_seconds)
-
-
-def is_blocking_review_item(item, head_sha, now_seconds=None):
-    if not isinstance(item, dict):
-        return False
-    if str(item.get("kind") or "") != "review_comment":
-        return False
-    commit_id = str(item.get("commit_id") or "")
-    if not commit_id or not head_sha or commit_id != head_sha:
-        return False
-
-    age_seconds = item_age_seconds(item, now_seconds=now_seconds)
-    if age_seconds is None:
-        return True
-    return age_seconds <= BLOCKING_REVIEW_ITEM_FRESH_SECONDS
-
-
 def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
     repo = pr["repo"]
     pr_number = pr["number"]
-    head_sha = str(pr.get("head_sha") or "")
     endpoints = comment_endpoints(repo, pr_number)
 
     if fresh_state:
@@ -1048,7 +1022,6 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
 
     new_items = []
     blocking_items = []
-    now_seconds = time.time()
     for item in all_items:
         item_id = item.get("id")
         if not item_id:
@@ -1056,17 +1029,27 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
         author = item.get("author") or ""
         if not author:
             continue
+        is_review_comment = str(item.get("kind") or "") == "review_comment"
         if authenticated_login and author == authenticated_login:
+            # The agent usually authenticates as the owner. Never surface its own
+            # comments as new items, but an owner's inline thread that is still
+            # open must keep blocking.
+            if is_review_comment and (
+                unresolved_review_comment_ids is None
+                or item_id in unresolved_review_comment_ids
+            ):
+                blocking_items.append(item)
             continue
         if is_bot_login(author):
             if not is_actionable_review_bot_login(author):
+                continue
+            if is_status_only_bot_comment(item):
                 continue
         elif not is_trusted_human_review_author(item, authenticated_login):
             continue
 
         is_blocking = False
         kind = item["kind"]
-        is_review_comment = str(item.get("kind") or "") == "review_comment"
         if unresolved_review_comment_ids is not None:
             # Block on any inline comment whose thread is known to be unresolved,
             # regardless of which commit it was posted on. If the GraphQL lookup
@@ -1074,8 +1057,10 @@ def fetch_new_review_items(pr, state, fresh_state, authenticated_login=None):
             # instead of treating every inline comment as blocking.
             is_blocking = is_review_comment and item_id in unresolved_review_comment_ids
         else:
-            # Fallback heuristic when unresolved-thread lookup is unavailable.
-            is_blocking = is_blocking_review_item(item, head_sha=head_sha, now_seconds=now_seconds)
+            # Without thread state, an inline comment of any age may still be
+            # open. Fail closed: block on every inline comment until the lookup
+            # works again.
+            is_blocking = is_review_comment
 
         item_updated_at = str(item.get("updated_at") or item.get("created_at") or "")
         issue_comment_is_new_or_edited = (
@@ -1212,6 +1197,9 @@ def is_pr_ready_to_merge(
     if bugbot_gate and bool(bugbot_gate.get("required")) and not bool(bugbot_gate.get("is_success")):
         return False
     if codex_gate and bool(codex_gate.get("reviewing")):
+        return False
+    # A failed reactions lookup means we cannot tell whether Codex is still reviewing.
+    if codex_gate and str(codex_gate.get("status") or "") == "unknown":
         return False
     # Enforce a grace period after checks go terminal.  Review bots complete
     # their CI check run first and post inline PR review comments a few seconds

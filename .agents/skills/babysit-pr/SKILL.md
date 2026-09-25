@@ -68,7 +68,7 @@ python3 .agents/skills/babysit-pr/scripts/gh_pr_watch.py --pr https://github.com
 | `stop_session_timeout` | `--max-session-minutes` elapsed (default 90 min) — stop and report |
 | `diagnose_hung_check` | A pending check has exceeded its hung threshold (Bugbot: 20 min, CI/E2E: 30 min) — stop and report |
 | `diagnose_merge_conflict` | PR is merge-conflicted (`CONFLICTING` / `DIRTY`) — resolve conflicts before waiting on checks |
-| `diagnose_branch_behind` | PR is behind the base branch (`BEHIND`) — rebase/update the branch before declaring it ready |
+| `diagnose_branch_behind` | PR is behind the base branch (`BEHIND`) — merge `origin/main` into the branch before declaring it ready |
 | `diagnose_skipping_checks` | One or more checks completed with `neutral`/`skipping` — investigate why |
 | `wait_codex` | Codex is still reviewing (👀 reaction present on the PR) — do not push or merge |
 
@@ -78,27 +78,29 @@ or when CI is green but the PR is awaiting approval.
 
 ## Post-merge cleanup (when `stop_pr_closed` and PR is merged)
 
-After a PR is merged, clean up the local environment automatically:
+`stop_pr_closed` also fires for a PR that was closed without merging. Clean up only when the PR was merged: check
+`pr.merged` in the snapshot, or run `gh pr view <n> --json mergedAt` and confirm that `mergedAt` is set. For a PR
+that was closed without merging, keep everything and tell the owner.
 
-1. **If currently on the PR branch, switch away first** (for example to `main`):
-   ```bash
-   git checkout main
-   ```
+Run every step from the main checkout, never from inside the PR's worktree. If the current working directory is the
+worktree, `cd` to the main checkout first.
 
-2. **Delete the local branch** (squash merges leave it unmerged by default):
+1. **Remove the git worktree**, if the branch is checked out in one. Run `git worktree list` and look for an entry
+   whose branch matches the PR's `head_branch`. Remove the worktree before deleting the branch, because Git does not
+   delete a branch that a worktree still uses:
    ```bash
-   git branch -D <head_branch>
-   ```
-
-3. **Remove the git worktree**, if the branch was checked out in one:
-   ```bash
-   # Find worktrees for this branch
-   git worktree list
-   # Remove if found (adjust path as needed)
    git worktree remove /path/to/worktree
    ```
+   Git refuses when the worktree has uncommitted changes. Do not force it; tell the owner instead.
 
-**How to detect a worktree:** run `git worktree list` and check if any entry's branch matches the PR's `head_branch`. If the current working directory IS the worktree, `cd` to the main checkout first before removing it.
+2. **Delete the local branch only when nothing would be lost.** Squash merges leave the branch looking unmerged, so
+   `git branch -D` is needed. Force-deleting is destructive, so first check that the local tip is exactly the head
+   that was merged:
+   ```bash
+   merged_head=$(gh pr view <n> --json headRefOid --jq .headRefOid)
+   test "$(git rev-parse <head_branch>)" = "$merged_head" && git branch -D <head_branch>
+   ```
+   If the local tip differs, it has commits that were never merged. Keep the branch and tell the owner.
 
 **Only delete the local branch and worktree** — never touch remote branches (the remote is already deleted by GitHub's "delete branch on merge" setting or the `--delete-branch` flag used at merge time).
 
@@ -129,10 +131,12 @@ When GitHub reports merge conflicts while Bugbot/Codex/CI is still running:
 
 1. **Do not push immediately.** Wait until neither Bugbot nor Codex is `IN_PROGRESS`.
 2. Snapshot latest status/comments.
-3. If conflict remains, rebase branch onto `origin/main` (or merge main if repo policy prefers).
+3. If the conflict remains, merge `origin/main` into the PR branch. A merge keeps the branch history.
 4. Resolve conflicts and **in the same fix cycle** apply all actionable Bugbot/Codex comments.
 5. Run `cargo nextest run` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo fmt --check` + `cargo build`.
-6. Push once.
+6. Push once. Pushing follows the approval rules in `AGENTS.md`.
+
+Rebase only when the owner asks for it: a rebase rewrites the branch history and needs a force push.
 
 Rationale: this avoids paying for multiple Bugbot/Codex reruns and prevents a ping-pong where a conflict-fix push is immediately followed by a second bot-fix push.
 
@@ -160,6 +164,10 @@ Codex does **not** use a CI check. Instead it uses emoji reactions on the PR:
 - **👀 reaction removed, review comments posted** → Codex found issues. Fix them the same way as Bugbot comments (see push discipline).
 
 The watcher automatically detects the 👀 reaction via the PR reactions API and surfaces `codex_gate` in the snapshot.
+If the reactions lookup fails, `codex_gate.status` is `unknown` and the watcher does not emit `stop_ready_to_merge`.
+
+Codex also keeps a "Codex Review Summary" status table as a PR comment and edits it on every review. It is not a
+finding, so the watcher ignores it.
 
 ## Decision rules
 
@@ -218,14 +226,20 @@ Use `--snapshot` for an instant point-in-time view with no waiting.
 
 All modes emit newline-delimited JSON.
 
-- `--once` / `--snapshot` / `--retry-failed-now`: emit a top-level snapshot/result object where `actions` is directly available.
-- `--watch`: emits event envelopes:
-  - `{"event":"snapshot","payload":{"snapshot":{...},"state_file":"...","next_poll_seconds":30}}`
-  - `{"event":"stop","payload":{...}}`
+Where the `actions` list is depends on the mode:
 
-In `--watch`, read actions from `payload.snapshot.actions` for `snapshot` events and `payload.actions` for `stop` events.
+| Mode | Read the actions from |
+|---|---|
+| `--once`, `--snapshot` | top-level `actions` |
+| `--retry-failed-now` | `snapshot.actions`. The top level reports the rerun: `rerun_attempted`, `rerun_count`, `reason`. |
+| `--watch` | `payload.snapshot.actions` on `snapshot` events, `payload.actions` on `stop` events |
 
-`blocking_review_items` contains actionable unresolved inline review comments. When thread-resolution lookup is unavailable, inline blocking falls back to a 30-minute freshness heuristic. While non-empty, `stop_ready_to_merge` is not emitted.
+`--watch` emits event envelopes:
+
+- `{"event":"snapshot","payload":{"snapshot":{...},"state_file":"...","next_poll_seconds":30}}`
+- `{"event":"stop","payload":{...}}`
+
+`blocking_review_items` contains actionable unresolved inline review comments, including the authenticated account's own unresolved threads (those are never listed in `new_review_items`). When the thread-resolution lookup is unavailable, every actionable inline comment blocks. While non-empty, `stop_ready_to_merge` is not emitted.
 
 Example snapshot payload shape (`--once` / `--snapshot`, or `--watch` under `payload.snapshot`):
 
