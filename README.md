@@ -46,40 +46,15 @@ Cached reads (instant, from the local store):
   latest movements capture, each gross paired to its withholding). Both are
   outside the default connector allowlist — they carry raw transaction amounts.
 
-Public/credential-free market reads (not from the store):
+Market reads and gated live refresh:
 
-- `market_get_zero_commission_etfs` (the public ETF list). Third-party stock
-  enrichment (parse-not-execute) is no longer a standalone tool; it is reachable
-  only through the authenticated `market_get_asset_details` `external_enrichment`
-  section described below.
-
-Authenticated Fineco market reads (controller-mediated live Fineco login):
-
-- `market_search_asset` (Fineco instrument search by ticker, ISIN, or name;
-  implemented as a typed controller path, but intentionally not granted by the
-  checked-in deployment policy until the market live-session gate has been
-  reviewed clean and the owner intentionally enables it)
-- `market_get_asset_details` (Fineco stock/ETF details for a venue-qualified
-  identifier, with source-wrapped identity/listing/quote/profile/core
-  stock-or-ETF data and explicit heavy holdings/exposures/returns/risk/ratios
-  sections; stocks can also request an explicit `external_enrichment` section,
-  which is fetched by the credential-free market client after Fineco resolution;
-  enrichment-only requests resolve Fineco identity only before that external
-  fetch, and the section is source/audit-attributed as `external_enrichment`;
-  implemented as a typed controller path, but intentionally not granted by the
-  checked-in deployment policy until the market live-session gate has been
-  reviewed clean and the owner intentionally enables it)
-- `market_get_indices` (Fineco headline indices-bar cards, not a complete index
-  universe or venue registry; implemented as a typed controller path, but
-  intentionally not granted by the checked-in deployment policy until the market
-  live-session gate has been reviewed clean and the owner intentionally enables
-  it)
-
-Gated live refresh (a real, rate-limited Fineco login; returns status only — read the
-refreshed values via the cached tools afterward):
-
-- `private_portfolio_refresh_live_sensitive`, `private_orders_refresh_live_sensitive`,
-  `private_tax_refresh_live_sensitive`, `private_movements_refresh_live_sensitive`
+| Tool | Purpose | Live-refresh / enrichment notes |
+| --- | --- | --- |
+| `market_get_zero_commission_etfs` | Read the public ETF list. | Uses a credential-free market client. Reads outside the store. |
+| `market_search_asset` | Search Fineco instruments by ticker, ISIN, or name. | Uses a typed controller path and a live Fineco login. Disabled in the checked-in deployment policy pending a clean market live-session gate review and explicit owner approval. |
+| `market_get_asset_details` | Read Fineco stock/ETF details for a venue-qualified identifier. Returns source-wrapped identity, listing, quote, profile, and core stock-or-ETF data. Supports explicit holdings, exposures, returns, risk, and ratios sections. | Uses the same controller and policy gate as `market_search_asset`. Stocks can request `external_enrichment`, fetched by the credential-free market client after Fineco resolution. Enrichment-only requests resolve only the Fineco identity before the external fetch. Source and audit records label this section `external_enrichment`. No standalone enrichment tool exists; fetched content is parsed and never executed. |
+| `market_get_indices` | Read Fineco headline indices-bar cards. Does not list every index or venue. | Uses the same controller and policy gate as `market_search_asset`. |
+| `private_portfolio_refresh_live_sensitive`, `private_orders_refresh_live_sensitive`, `private_tax_refresh_live_sensitive`, `private_movements_refresh_live_sensitive` | Refresh the corresponding cached data through a real Fineco login. | Rate-limited and gated. Returns status only. Read refreshed values through the cached tools afterward. |
 
 ## Run it / deploy it
 

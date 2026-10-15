@@ -31,7 +31,7 @@ per-client steps.
   Use `/mcp` for connectors; existing CLI clients that point at the bare host
   keep working unchanged.
 
-## Auth model — OAuth via Cloudflare Access (the important part)
+## Auth model — OAuth via Cloudflare Access
 
 ChatGPT and Claude connectors authenticate with **OAuth** (the MCP authorization
 spec). They do **not** send custom headers — so the
