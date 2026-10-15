@@ -1,10 +1,11 @@
 # Deployment (LXC)
 
 Cached-only deployments run two roles: `gateway` and `store-server`. Live refresh
-and authenticated market reads add `private-worker` as a third process. The
-controller runs inside `store-server` in both configurations. This document
-describes the deployment; the private design spec records the threat model,
-egress reasoning, and gates.
+and authenticated market reads add `private-worker` as a third process. When
+either live capability is configured, its controller runs inside `store-server`.
+Cached-only deployments do not start the controller. This document describes the
+deployment; the private design spec records the threat model, egress reasoning,
+and gates.
 
 Artifacts live under [`deploy/`](../deploy/): a reproducible build kit in
 `deploy/build/`, systemd units in `deploy/systemd/`, the applied egress/inbound
