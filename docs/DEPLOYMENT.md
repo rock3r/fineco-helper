@@ -1,8 +1,11 @@
 # Deployment (LXC)
 
-How the binary is deployed as the hardened two-process topology. The *why*
-(threat model, egress reasoning, gates) lives in the project's private design
-spec; this doc records the as-built deployment shape, not the rationale.
+Cached-only deployments run two roles: `gateway` and `store-server`. Live refresh
+and authenticated market reads add `private-worker` as a third process. When
+either live capability is configured, its controller runs inside `store-server`.
+Cached-only deployments do not start the controller. This document describes the
+deployment; the private design spec records the threat model, egress reasoning,
+and gates.
 
 Artifacts live under [`deploy/`](../deploy/): a reproducible build kit in
 `deploy/build/`, systemd units in `deploy/systemd/`, the applied egress/inbound
@@ -505,15 +508,14 @@ renewal.
 > flushed without LAN access. The previous ruleset is backed up at
 > `/etc/nftables.conf.orig`.
 
-**Residual (egress, owner-ratified).** The gateway egress pin is **IP-level, not
-SNI/host-level**: the JWKS + ETF targets are CDN-fronted, so the allowlisted edge
-IPs may also serve other hostnames — a hijacked gateway could in principle
-exfiltrate to a different site sharing those IPs. Airtight host-level egress would
-need an L7 hostname-policy proxy; the plan weighed that against the timer-refreshed
-nftables address set and chose the IP-set (a real reduction — arbitrary non-CDN
-exfil is blocked — without an L7 proxy in the credentialed path). Outbound market
-fetches are also globally timed out (`MARKET_FETCH_TIMEOUT`) so a stalled upstream
-can't pin a worker.
+**Remaining egress risk accepted by the owner.** The gateway filters by IP address.
+It does not filter by SNI or hostname. The JWKS + ETF targets use CDNs, whose
+allowlisted edge IPs may also serve other hostnames. A hijacked gateway could send
+data to a different site sharing those IPs. Host-level filtering would need an L7
+hostname-policy proxy. The owner chose a timer-refreshed nftables address set to
+block arbitrary non-CDN destinations without adding an L7 proxy to the
+credentialed path. Outbound market fetches have a global timeout
+(`MARKET_FETCH_TIMEOUT`) so a stalled upstream cannot keep a worker occupied.
 
 **Management SSH (off by default).** Inbound SSH is denied by default — primary
 management is Proxmox `pct exec` (out-of-band). To allow SSH from a trusted admin
